@@ -150,10 +150,11 @@ class MainMenu:
             console.print("  [cyan]7[/] API 設定")
             if COIN_SELECTION_AVAILABLE:
                 console.print("  [cyan]8[/] 選幣分析")
+            console.print("  [cyan]9[/] Telegram 通知")
             console.print("  [cyan]0[/] 退出")
             console.print()
 
-            valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7"]
+            valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7", "9"]
             if COIN_SELECTION_AVAILABLE:
                 valid_choices.append("8")
             if self._trading_active:
@@ -189,6 +190,69 @@ class MainMenu:
                 self.setup_api()
             elif choice == "8" and COIN_SELECTION_AVAILABLE:
                 self.coin_selection_menu()
+            elif choice == "9":
+                self.setup_telegram()
+
+    def setup_telegram(self):
+        """設定 Telegram 通知"""
+        self.show_banner()
+        console.print("[bold]Telegram 通知設定[/]\n")
+
+        if self.config.telegram_bot_token:
+            console.print(f"[dim]當前 Bot Token: {self.config.telegram_bot_token[:10]}...[/]")
+        if self.config.telegram_chat_id:
+            console.print(f"[dim]當前 Chat ID: {self.config.telegram_chat_id}[/]")
+        console.print()
+
+        console.print("[dim]設定步驟:[/]")
+        console.print("[dim]1. 在 Telegram 搜尋 @BotFather，發送 /newbot 建立機器人[/]")
+        console.print("[dim]2. 複製 Bot Token (格式: 123456:ABC-DEF...)[/]")
+        console.print("[dim]3. 搜尋 @userinfobot 獲取你的 Chat ID[/]")
+        console.print()
+
+        console.print("  [cyan]1[/] 設定 Bot Token")
+        console.print("  [cyan]2[/] 設定 Chat ID")
+        console.print("  [cyan]3[/] 發送測試訊息")
+        console.print("  [cyan]4[/] 清除設定")
+        console.print("  [cyan]0[/] 返回")
+        console.print()
+
+        choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4"], default="0")
+
+        if choice == "1":
+            token = Prompt.ask("Bot Token").strip()
+            if token:
+                self.config.telegram_bot_token = token
+                self.config.save()
+        elif choice == "2":
+            chat_id = Prompt.ask("Chat ID").strip()
+            if chat_id:
+                self.config.telegram_chat_id = chat_id
+                self.config.save()
+        elif choice == "3":
+            if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
+                console.print("[red]請先設定 Bot Token 和 Chat ID[/]")
+            else:
+                from grid_engine.notifier import TelegramNotifier
+                notifier = TelegramNotifier(
+                    self.config.telegram_bot_token,
+                    self.config.telegram_chat_id,
+                )
+                try:
+                    result = asyncio.run(notifier.send("✅ AS Grid Bot 測試訊息 — 連線成功！"))
+                    if result:
+                        console.print("[green]✓ 測試訊息發送成功！[/]")
+                    else:
+                        console.print("[red]✗ 發送失敗，請檢查 Token 和 Chat ID[/]")
+                except Exception as e:
+                    console.print(f"[red]發送錯誤: {e}[/]")
+        elif choice == "4":
+            if Confirm.ask("[yellow]確定清除 Telegram 設定？[/]"):
+                self.config.telegram_bot_token = ""
+                self.config.telegram_chat_id = ""
+                self.config.save()
+
+        Prompt.ask("按 Enter 繼續")
 
     def quick_backtest(self):
         """快速回測"""
