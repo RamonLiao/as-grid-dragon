@@ -119,6 +119,8 @@ class GlobalConfig:
     dgt: DGTConfig = field(default_factory=DGTConfig)
     leading_indicator: LeadingIndicatorConfig = field(default_factory=LeadingIndicatorConfig)
     legacy_api_detected: bool = field(default=False, repr=False)
+    telegram_bot_token: str = ""
+    telegram_chat_id: str = ""
 
     def to_dict(self) -> dict:
         return {
@@ -135,7 +137,9 @@ class GlobalConfig:
             "max_enhancement": self.max_enhancement.to_dict(),
             "bandit": self.bandit.to_dict(),
             "dgt": self.dgt.to_dict(),
-            "leading_indicator": self.leading_indicator.to_dict()
+            "leading_indicator": self.leading_indicator.to_dict(),
+            "telegram_bot_token": self.telegram_bot_token,
+            "telegram_chat_id": self.telegram_chat_id,
         }
 
     @classmethod
@@ -149,7 +153,9 @@ class GlobalConfig:
             api_url_override=data.get("api_url_override", ""),
             websocket_url=data.get("websocket_url", "wss://fstream.binance.com/ws"),
             sync_interval=data.get("sync_interval", 30.0),
-            legacy_api_detected=False
+            legacy_api_detected=False,
+            telegram_bot_token=data.get("telegram_bot_token", ""),
+            telegram_chat_id=data.get("telegram_chat_id", ""),
         )
         for k, v in data.get("symbols", {}).items():
             config.symbols[k] = SymbolConfig.from_dict(v)

@@ -89,3 +89,36 @@ class TestTelegramNotifier:
         notifier.send.assert_called_once()
         msg = notifier.send.call_args[0][0]
         assert "保證金率過低" in msg
+
+
+class TestConfigTelegram:
+    """Config 整合 Telegram 欄位測試"""
+
+    def test_default_telegram_fields(self):
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig()
+        assert config.telegram_bot_token == ""
+        assert config.telegram_chat_id == ""
+
+    def test_telegram_serialization(self):
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig()
+        config.telegram_bot_token = "123:ABC"
+        config.telegram_chat_id = "456"
+        d = config.to_dict()
+        assert d["telegram_bot_token"] == "123:ABC"
+        assert d["telegram_chat_id"] == "456"
+
+    def test_telegram_deserialization(self):
+        from grid_engine.config import GlobalConfig
+        data = {"telegram_bot_token": "123:ABC", "telegram_chat_id": "456"}
+        config = GlobalConfig.from_dict(data)
+        assert config.telegram_bot_token == "123:ABC"
+        assert config.telegram_chat_id == "456"
+
+    def test_backward_compat_no_telegram(self):
+        """舊 config 沒有 telegram 欄位不應 crash"""
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig.from_dict({})
+        assert config.telegram_bot_token == ""
+        assert config.telegram_chat_id == ""
