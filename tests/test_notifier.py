@@ -122,3 +122,72 @@ class TestConfigTelegram:
         config = GlobalConfig.from_dict({})
         assert config.telegram_bot_token == ""
         assert config.telegram_chat_id == ""
+
+
+class TestNotifierMonkey:
+    """極端測試 — 故意把 notifier 玩壞"""
+
+    @pytest.mark.asyncio
+    async def test_send_huge_message(self):
+        """超長訊息不應 crash"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        huge_msg = "x" * 100000
+        await notifier.notify_crash(huge_msg)
+        # notify_crash 會截斷到 500 字
+        msg = notifier.send.call_args[0][0]
+        assert len(msg) < 1000
+
+    @pytest.mark.asyncio
+    async def test_send_with_html_injection(self):
+        """HTML 特殊字元不應破壞訊息格式"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_crash("<script>alert('xss')</script>")
+        msg = notifier.send.call_args[0][0]
+        assert "script" in msg
+
+    @pytest.mark.asyncio
+    async def test_send_with_unicode(self):
+        """Unicode 字元不應 crash"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_crash("錯誤: 🔥💀 崩潰了 émojis")
+        assert notifier.send.called
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_with_empty_data(self):
+        """空數據不應 crash"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({})
+        assert notifier.send.called
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_with_negative_values(self):
+        """負數值正常處理"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        pnl_data = {
+            "total_pnl": -999.99,
+            "total_equity": -100,
+            "positions": {},
+            "running_hours": 0,
+        }
+        await notifier.notify_daily_pnl(pnl_data)
+        msg = notifier.send.call_args[0][0]
+        assert "-999.99" in msg
+
+    @pytest.mark.asyncio
+    async def test_concurrent_sends(self):
+        """並發發送不應 crash"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        tasks = [notifier.notify_risk_alert(f"alert {i}") for i in range(50)]
+        await asyncio.gather(*tasks)
+        assert notifier.send.call_count == 50
+
+    def test_notifier_with_none_values(self):
+        """None 值不應 crash"""
+        notifier = TelegramNotifier(bot_token=None, chat_id=None)
+        assert notifier.enabled is False
