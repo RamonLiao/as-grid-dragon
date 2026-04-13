@@ -22,6 +22,7 @@ from .enhancements import (
 )
 from .config import GlobalConfig, SymbolConfig
 from .state import GlobalState, SymbolState
+from .notifier import TelegramNotifier
 
 
 def _create_exchange(exchange_id: str, config: dict):
@@ -60,6 +61,12 @@ class MaxGridBot:
         self.listen_key: Optional[str] = None
         self.tasks: List[asyncio.Task] = []
         self._stop_event = asyncio.Event()
+
+        # Telegram 通知
+        self.notifier = TelegramNotifier(
+            bot_token=config.telegram_bot_token,
+            chat_id=config.telegram_chat_id,
+        )
         self.precisions: Dict[str, dict] = {}
         self.last_sync_time = 0
         self.last_order_times: Dict[str, float] = {}
@@ -224,6 +231,10 @@ class MaxGridBot:
                 acc.unrealized_pnl = unrealized
 
             self.state.update_totals()
+
+            # 風控通知
+            if self.notifier.enabled:
+                asyncio.create_task(self._check_risk_and_notify())
 
             self._check_trailing_stop()
         except Exception as e:
@@ -849,6 +860,53 @@ class MaxGridBot:
             except Exception as e:
                 logger.error(f"更新 listenKey 失敗: {e}")
 
+    async def _daily_pnl_loop(self):
+        """每日 20:00 (Asia/Taipei, UTC+8) 發送損益摘要"""
+        while not self._stop_event.is_set():
+            try:
+                now = datetime.utcnow()
+                # UTC 12:00 = Asia/Taipei 20:00
+                target = now.replace(hour=12, minute=0, second=0, microsecond=0)
+                if now >= target:
+                    from datetime import timedelta
+                    target += timedelta(days=1)
+                wait_seconds = (target - now).total_seconds()
+                await asyncio.sleep(wait_seconds)
+
+                if self._stop_event.is_set():
+                    break
+
+                positions = {}
+                for sym, sym_state in self.state.symbols.items():
+                    net = sym_state.long_position - sym_state.short_position
+                    if net != 0:
+                        positions[sym] = net
+
+                running_hours = 0
+                if self.state.start_time:
+                    running_hours = (datetime.now() - self.state.start_time).total_seconds() / 3600
+
+                pnl_data = {
+                    "total_pnl": self.state.total_unrealized_pnl,
+                    "total_equity": self.state.total_equity,
+                    "positions": positions,
+                    "running_hours": running_hours,
+                }
+                await self.notifier.notify_daily_pnl(pnl_data)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.warning(f"每日摘要發送失敗: {e}")
+                await asyncio.sleep(60)
+
+    async def _check_risk_and_notify(self):
+        """檢查風控狀態並通知"""
+        if not self.notifier.enabled or not self.config.risk.enabled:
+            return
+        if self.state.margin_usage > self.config.risk.margin_threshold:
+            alert = f"保證金使用率過高: {self.state.margin_usage:.1%} (閾值: {self.config.risk.margin_threshold:.1%})"
+            await self.notifier.notify_risk_alert(alert)
+
     async def run(self):
         try:
             self._init_exchange()
@@ -861,21 +919,33 @@ class MaxGridBot:
             self.sync_all()
         except Exception as e:
             logger.error(f"[MAX] 初始化失敗: {e}")
+            await self.notifier.notify_crash(f"初始化失敗: {e}")
             self.state.running = False
             return
 
         self.tasks = [
             asyncio.create_task(self._websocket_loop()),
-            asyncio.create_task(self._keep_alive_loop())
+            asyncio.create_task(self._keep_alive_loop()),
         ]
+        if self.notifier.enabled:
+            self.tasks.append(asyncio.create_task(self._daily_pnl_loop()))
 
         try:
             while not self._stop_event.is_set():
                 await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.error(f"[MAX] Bot 意外崩潰: {e}")
+            await self.notifier.notify_crash(str(e))
         finally:
             await self.stop()
 
     async def stop(self):
+        # 發送停止通知
+        try:
+            await self.notifier.notify_stop()
+        except Exception:
+            pass
+
         self._stop_event.set()
         self.state.running = False
 

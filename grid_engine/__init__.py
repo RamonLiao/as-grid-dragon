@@ -14,6 +14,7 @@ from .config import SymbolConfig, RiskConfig, GlobalConfig
 from .state import SymbolState, AccountBalance, GlobalState
 from .backtest import BacktestManager
 from .bot import CustomExchange, MaxGridBot
+from .notifier import TelegramNotifier
 from .ui import TerminalUI
 
 # 選幣模組 (從 coin_selection 包導入)
@@ -46,6 +47,8 @@ __all__ = [
     'BacktestManager',
     # bot
     'CustomExchange', 'MaxGridBot',
+    # notifier
+    'TelegramNotifier',
     # ui
     'TerminalUI',
     # coin selection
