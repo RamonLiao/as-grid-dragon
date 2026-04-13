@@ -1,0 +1,34 @@
+# AS 網格交易系統 - Terminal TUI 模式
+# 使用方式:
+#   啟動: docker compose -f docker-compose.terminal.yml up
+#   斷開: Ctrl+P, Ctrl+Q
+#   接回: docker attach as-grid
+#   停止: docker compose -f docker-compose.terminal.yml stop
+
+services:
+  as-grid:
+    build:
+      context: .
+      dockerfile: Dockerfile.terminal
+    container_name: as-grid
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./config:/app/config
+      - ./data:/app/data
+      - ./log:/app/log
+    environment:
+      - TZ=Asia/Taipei
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

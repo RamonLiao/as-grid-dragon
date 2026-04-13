@@ -1,0 +1,30 @@
+# AS 網格交易系統 - Terminal TUI 版本
+FROM python:3.11-slim
+
+# 系統依賴
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc \
+    libffi-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 建立非 root 使用者
+RUN useradd -m -s /bin/bash trader
+WORKDIR /app
+
+# 安裝 Python 依賴
+COPY requirements-terminal.txt .
+RUN pip install --no-cache-dir -r requirements-terminal.txt
+
+# 複製程式碼
+COPY . .
+
+# 建立必要目錄並設定權限
+RUN mkdir -p /app/config /app/data /app/log \
+    && chown -R trader:trader /app
+
+USER trader
+
+ENV PYTHONUNBUFFERED=1
+ENV TZ=Asia/Taipei
+
+CMD ["python", "as_terminal_max.py"]

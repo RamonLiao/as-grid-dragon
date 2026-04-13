@@ -37,8 +37,16 @@ env/
 *.swo
 *~
 
-# 本地配置 (Docker 會掛載 volume)
-# config/trading_config_max.json
+# 敏感配置 (Docker 會掛載 volume，不 bake 進 image)
+config/
+.claude/
+.env
+.env.*
+
+# 數據目錄
+data/
+asBack/
+log/
 
 # 測試和文檔
 tests/
