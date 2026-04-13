@@ -18,9 +18,12 @@ python as_terminal_max.py
 """
 
 import asyncio
+import signal
+import sys
 import time
 import threading
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Optional, List
 
 from rich.console import Console
@@ -66,6 +69,44 @@ class MainMenu:
         self.bot_thread: Optional[threading.Thread] = None
         self.bot_loop: Optional[asyncio.AbstractEventLoop] = None
         self._trading_active = False
+
+        # 註冊信號處理
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+
+        # Restart 偵測與通知
+        self._marker_file = Path("/tmp/.as-grid-running")
+        self._check_restart()
+
+    def _handle_shutdown(self, signum, frame):
+        """Graceful shutdown on SIGTERM/SIGINT"""
+        console.print(f"\n[yellow]收到信號 {signum}，正在關閉...[/]")
+        if self._trading_active and self.bot and self.bot_loop and self.bot_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(self.bot.stop(), self.bot_loop)
+            try:
+                future.result(timeout=10)
+            except Exception:
+                pass
+            if self.bot_thread and self.bot_thread.is_alive():
+                self.bot_thread.join(timeout=5)
+        sys.exit(0)
+
+    def _check_restart(self):
+        """偵測 container restart 並發送 Telegram 通知"""
+        is_restart = self._marker_file.exists()
+        self._marker_file.touch()
+
+        if is_restart and self.config.telegram_bot_token and self.config.telegram_chat_id:
+            from grid_engine.notifier import TelegramNotifier
+            notifier = TelegramNotifier(
+                self.config.telegram_bot_token,
+                self.config.telegram_chat_id,
+            )
+            try:
+                asyncio.run(notifier.notify_restart())
+                console.print("[yellow]已發送重啟通知到 Telegram[/]")
+            except Exception as e:
+                console.print(f"[dim]重啟通知發送失敗: {e}[/]")
 
     def show_banner(self):
         console.clear()
