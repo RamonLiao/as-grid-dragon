@@ -21,15 +21,20 @@ GCE VM (e2-small, 固定外部 IP)
 ### 操作方式
 
 ```bash
-# 啟動
-docker compose -f docker-compose.terminal.yml run -it as-grid
+# 首次啟動（前景，自動 attach）
+docker compose -f docker-compose.terminal.yml up
 
 # 斷開但保持運行
 Ctrl+P, Ctrl+Q
 
 # 重新接回
-docker attach <container_name>
+docker attach as-grid
+
+# 停止
+docker compose -f docker-compose.terminal.yml stop
 ```
+
+> **注意：** 使用 `up` 而非 `run`，因為 `run` 不會套用 `restart: unless-stopped` policy。
 
 ## 改動清單
 
@@ -48,7 +53,7 @@ docker attach <container_name>
 | 檔案 | 改動 |
 |------|------|
 | `grid_engine/bot.py` | 加 SIGTERM handler、接入 notifier、每日摘要定時任務 |
-| `as_terminal_max.py` | 加 signal handling、Telegram 設定選單（選項 9） |
+| `as_terminal_max.py` | 加 signal handling、Telegram 設定選單、restart 偵測 |
 | `grid_engine/__init__.py` | export TelegramNotifier |
 | `grid_engine/config.py` | GlobalConfig 加 telegram_bot_token、telegram_chat_id 欄位 |
 
@@ -68,15 +73,24 @@ class TelegramNotifier:
 
 - 使用 Telegram Bot API（HTTP POST via `aiohttp`，不需額外套件）
 - `bot_token` + `chat_id` 存在 `config/trading_config_max.json`
-- TUI 選單內設定（新增選項 9: Telegram 設定）
+- TUI 選單內設定（新增 Telegram 設定選項，排在現有選單最後、退出之前）
 - 未設定時靜默跳過，不影響交易功能
 
 ### SIGTERM Handler
 
+Signal handler 必須註冊在 main thread（Python 限制）。因為 bot 跑在 daemon thread，架構如下：
+
 ```python
-# 在 bot.run() 開始時註冊
-loop.add_signal_handler(signal.SIGTERM, lambda: asyncio.ensure_future(bot.stop()))
-loop.add_signal_handler(signal.SIGINT, lambda: asyncio.ensure_future(bot.stop()))
+# as_terminal_max.py main thread 註冊
+signal.signal(signal.SIGTERM, self._handle_shutdown)
+signal.signal(signal.SIGINT, self._handle_shutdown)
+
+def _handle_shutdown(self, signum, frame):
+    """Main thread 收到信號，轉發給 bot thread"""
+    if self._trading_active and self.bot:
+        asyncio.run_coroutine_threadsafe(self.bot.stop(), self.bot_loop)
+        self.bot_thread.join(timeout=10)
+    sys.exit(0)
 ```
 
 ### Graceful Shutdown 流程
@@ -91,8 +105,9 @@ Docker stop → SIGTERM
 
 Docker restart policy (unless-stopped)
   → Container 重起
-  → 停在主選單
-  → Telegram 通知 "Bot 已重啟，等待手動操作"
+  → MainMenu.__init__() 偵測 restart（檢查 /tmp/.as-grid-running 標記檔）
+  → 載入 config 中的 Telegram 設定，發送 "Bot 已重啟，等待手動操作"
+  → 停在主選單等待 attach
 ```
 
 ### 每日損益摘要
