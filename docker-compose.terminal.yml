@@ -1,9 +1,14 @@
 # AS 網格交易系統 - Terminal TUI 模式
+#
 # 使用方式:
-#   啟動: docker compose -f docker-compose.terminal.yml up
-#   斷開: Ctrl+P, Ctrl+Q
-#   接回: docker attach as-grid
-#   停止: docker compose -f docker-compose.terminal.yml stop
+#   首次啟動/日常使用 (互動模式):
+#     docker compose -f docker-compose.terminal.yml run --rm as-grid
+#
+#   斷開但保持運行: Ctrl+P, Ctrl+Q
+#   重新接回:        docker attach as-grid
+#   停止:            docker compose -f docker-compose.terminal.yml down
+#
+# 注意: 使用 run 而非 up，因為 up 不會轉發 stdin，TUI 無法互動
 
 services:
   as-grid:
