@@ -147,14 +147,13 @@ class MainMenu:
             console.print("  [cyan]4[/] MAX 增強設定")
             console.print("  [cyan]5[/] 學習模組 (Bandit/DGT)")
             console.print("  [cyan]6[/] 風控設定")
-            console.print("  [cyan]7[/] API 設定")
+            console.print("  [cyan]7[/] 連線設定")
             if COIN_SELECTION_AVAILABLE:
                 console.print("  [cyan]8[/] 選幣分析")
-            console.print("  [cyan]9[/] Telegram 通知")
             console.print("  [cyan]0[/] 退出")
             console.print()
 
-            valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7", "9"]
+            valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7"]
             if COIN_SELECTION_AVAILABLE:
                 valid_choices.append("8")
             if self._trading_active:
@@ -187,72 +186,81 @@ class MainMenu:
             elif choice == "6":
                 self.setup_risk()
             elif choice == "7":
-                self.setup_api()
+                self.setup_connection()
             elif choice == "8" and COIN_SELECTION_AVAILABLE:
                 self.coin_selection_menu()
-            elif choice == "9":
-                self.setup_telegram()
 
     def setup_telegram(self):
         """設定 Telegram 通知"""
         self.show_banner()
-        console.print("[bold]Telegram 通知設定[/]\n")
+        while True:
+            self.show_banner()
+            console.print("[bold]Telegram 通知設定[/]\n")
 
-        if self.config.telegram_bot_token:
-            console.print(f"[dim]當前 Bot Token: {self.config.telegram_bot_token[:10]}...[/]")
-        if self.config.telegram_chat_id:
-            console.print(f"[dim]當前 Chat ID: {self.config.telegram_chat_id}[/]")
-        console.print()
-
-        console.print("[dim]設定步驟:[/]")
-        console.print("[dim]1. 在 Telegram 搜尋 @BotFather，發送 /newbot 建立機器人[/]")
-        console.print("[dim]2. 複製 Bot Token (格式: 123456:ABC-DEF...)[/]")
-        console.print("[dim]3. 搜尋 @userinfobot 獲取你的 Chat ID[/]")
-        console.print()
-
-        console.print("  [cyan]1[/] 設定 Bot Token")
-        console.print("  [cyan]2[/] 設定 Chat ID")
-        console.print("  [cyan]3[/] 發送測試訊息")
-        console.print("  [cyan]4[/] 清除設定")
-        console.print("  [cyan]0[/] 返回")
-        console.print()
-
-        choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4"], default="0")
-
-        if choice == "1":
-            token = Prompt.ask("Bot Token").strip()
-            if token:
-                self.config.telegram_bot_token = token
-                self.config.save()
-        elif choice == "2":
-            chat_id = Prompt.ask("Chat ID").strip()
-            if chat_id:
-                self.config.telegram_chat_id = chat_id
-                self.config.save()
-        elif choice == "3":
-            if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
-                console.print("[red]請先設定 Bot Token 和 Chat ID[/]")
+            if self.config.telegram_bot_token:
+                console.print(f"[dim]當前 Bot Token: {self.config.telegram_bot_token[:10]}...[/]")
             else:
-                from grid_engine.notifier import TelegramNotifier
-                notifier = TelegramNotifier(
-                    self.config.telegram_bot_token,
-                    self.config.telegram_chat_id,
-                )
-                try:
-                    result = asyncio.run(notifier.send("✅ AS Grid Bot 測試訊息 — 連線成功！"))
-                    if result:
-                        console.print("[green]✓ 測試訊息發送成功！[/]")
-                    else:
-                        console.print("[red]✗ 發送失敗，請檢查 Token 和 Chat ID[/]")
-                except Exception as e:
-                    console.print(f"[red]發送錯誤: {e}[/]")
-        elif choice == "4":
-            if Confirm.ask("[yellow]確定清除 Telegram 設定？[/]"):
-                self.config.telegram_bot_token = ""
-                self.config.telegram_chat_id = ""
-                self.config.save()
+                console.print("[dim]當前 Bot Token: 未設定[/]")
+            if self.config.telegram_chat_id:
+                console.print(f"[dim]當前 Chat ID: {self.config.telegram_chat_id}[/]")
+            else:
+                console.print("[dim]當前 Chat ID: 未設定[/]")
+            console.print()
 
-        Prompt.ask("按 Enter 繼續")
+            console.print("[dim]設定步驟:[/]")
+            console.print("[dim]1. 在 Telegram 搜尋 @BotFather，發送 /newbot 建立機器人[/]")
+            console.print("[dim]2. 複製 Bot Token (格式: 123456:ABC-DEF...)[/]")
+            console.print("[dim]3. 搜尋 @userinfobot 獲取你的 Chat ID[/]")
+            console.print()
+
+            console.print("  [cyan]1[/] 設定 Bot Token")
+            console.print("  [cyan]2[/] 設定 Chat ID")
+            console.print("  [cyan]3[/] 發送測試訊息")
+            console.print("  [cyan]4[/] 清除設定")
+            console.print("  [cyan]0[/] 返回")
+            console.print()
+
+            choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4"], default="0")
+
+            if choice == "0":
+                return
+            elif choice == "1":
+                token = Prompt.ask("Bot Token").strip()
+                if token:
+                    self.config.telegram_bot_token = token
+                    self.config.save()
+                    console.print("[green]✓ Bot Token 已儲存[/]")
+            elif choice == "2":
+                chat_id = Prompt.ask("Chat ID").strip()
+                if chat_id:
+                    self.config.telegram_chat_id = chat_id
+                    self.config.save()
+                    console.print("[green]✓ Chat ID 已儲存[/]")
+            elif choice == "3":
+                if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
+                    console.print("[red]請先設定 Bot Token 和 Chat ID[/]")
+                else:
+                    from grid_engine.notifier import TelegramNotifier
+                    notifier = TelegramNotifier(
+                        self.config.telegram_bot_token,
+                        self.config.telegram_chat_id,
+                    )
+                    try:
+                        result = asyncio.run(notifier.send("✅ AS Grid Bot 測試訊息 — 連線成功！"))
+                        if result:
+                            console.print("[green]✓ 測試訊息發送成功！[/]")
+                        else:
+                            console.print("[red]✗ 發送失敗，請檢查 Token 和 Chat ID[/]")
+                    except Exception as e:
+                        console.print(f"[red]發送錯誤: {e}[/]")
+            elif choice == "4":
+                if Confirm.ask("[yellow]確定清除 Telegram 設定？[/]"):
+                    self.config.telegram_bot_token = ""
+                    self.config.telegram_chat_id = ""
+                    self.config.save()
+                    console.print("[green]✓ 已清除[/]")
+
+            Prompt.ask("按 Enter 繼續")
 
     def quick_backtest(self):
         """快速回測"""
@@ -546,9 +554,38 @@ class MainMenu:
 
         Prompt.ask("按 Enter 繼續")
 
+    def setup_connection(self):
+        """連線設定子選單：交易所 API + Telegram 通知"""
+        while True:
+            self.show_banner()
+            console.print("[bold]連線設定[/]\n")
+
+            # 顯示當前狀態
+            if self.config.api_key:
+                console.print(f"[dim]交易所 API: {self.config.api_key[:8]}...{self.config.api_key[-4:]}[/]")
+            else:
+                console.print("[dim]交易所 API: 未設定[/]")
+            tg_status = "已設定" if self.config.telegram_bot_token and self.config.telegram_chat_id else "未設定"
+            console.print(f"[dim]Telegram 通知: {tg_status}[/]")
+            console.print()
+
+            console.print("  [cyan]1[/] 交易所 API 設定")
+            console.print("  [cyan]2[/] Telegram 通知設定")
+            console.print("  [cyan]0[/] 返回")
+            console.print()
+
+            choice = Prompt.ask("選擇", choices=["0", "1", "2"], default="0")
+
+            if choice == "0":
+                return
+            elif choice == "1":
+                self.setup_api()
+            elif choice == "2":
+                self.setup_telegram()
+
     def setup_api(self):
         self.show_banner()
-        console.print("[bold]API 設定[/]\n")
+        console.print("[bold]交易所 API 設定[/]\n")
 
         if self.config.api_key:
             console.print(f"[dim]當前 API Key: {self.config.api_key[:8]}...{self.config.api_key[-4:]}[/]")
@@ -1238,6 +1275,9 @@ class MainMenu:
 
         console.print("[dim]按 Ctrl+C 返回主選單 (交易會繼續運行)[/]\n")
 
+        # 暫時恢復預設 SIGINT，讓 KeyboardInterrupt 能被 catch（而非觸發 shutdown）
+        original_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
         try:
             with Live(ui.create_layout(), console=console, refresh_per_second=2) as live:
                 while self._trading_active and self.bot.state.running:
@@ -1245,6 +1285,8 @@ class MainMenu:
                     time.sleep(0.5)
         except KeyboardInterrupt:
             pass
+        finally:
+            signal.signal(signal.SIGINT, original_handler)
 
         console.print("\n[dim]返回主選單...[/]")
 

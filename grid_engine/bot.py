@@ -552,6 +552,10 @@ class MaxGridBot:
 
         self.dynamic_grid_manager.update_price(ccxt_symbol, price)
 
+        # 即時更新面板顯示用的動態間距（無倉位時也要刷新）
+        sym_state.dynamic_take_profit = sym_config.take_profit_spacing
+        sym_state.dynamic_grid_spacing = sym_config.grid_spacing
+
         self._check_and_reduce_positions(sym_config, sym_state)
 
         # 多頭
