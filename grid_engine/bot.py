@@ -24,6 +24,9 @@ from .config import GlobalConfig, SymbolConfig
 from .state import GlobalState, SymbolState
 from .notifier import TelegramNotifier
 
+# 風控警報冷卻秒數，避免高頻 ticker 重複轟炸 Telegram
+RISK_ALERT_COOLDOWN = 300
+
 
 def _create_exchange(exchange_id: str, config: dict):
     """動態建立 ccxt exchange 實例"""
@@ -70,6 +73,7 @@ class MaxGridBot:
         self.precisions: Dict[str, dict] = {}
         self.last_sync_time = 0
         self.last_order_times: Dict[str, float] = {}
+        self.last_risk_alert_time = 0.0
 
         # MAX 增強模組
         self.funding_manager: Optional[FundingRateManager] = None
@@ -908,6 +912,10 @@ class MaxGridBot:
         if not self.notifier.enabled or not self.config.risk.enabled:
             return
         if self.state.margin_usage > self.config.risk.margin_threshold:
+            # 冷卻：避免每個 ticker tick 重複轟炸 Telegram
+            if time.time() - self.last_risk_alert_time < RISK_ALERT_COOLDOWN:
+                return
+            self.last_risk_alert_time = time.time()
             alert = f"保證金使用率過高: {self.state.margin_usage:.1%} (閾值: {self.config.risk.margin_threshold:.1%})"
             await self.notifier.notify_risk_alert(alert)
 
