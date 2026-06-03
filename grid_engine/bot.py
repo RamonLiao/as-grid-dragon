@@ -698,13 +698,14 @@ class MaxGridBot:
                 asset = bal.get('a', '')
                 if asset in ['USDC', 'USDT']:
                     wallet_balance = float(bal.get('wb', 0) or 0)
-                    cross_wallet = float(bal.get('cw', 0) or 0)
 
                     acc = self.state.get_account(asset)
                     acc.wallet_balance = wallet_balance
-                    acc.available_balance = cross_wallet
+                    # 注意: ACCOUNT_UPDATE 只帶 wb(錢包)/cw(全倉錢包)，不含
+                    # 可用餘額與已用保證金。available_balance / margin_used
+                    # 由週期性 REST _sync_account 維護為交易所真值，此處不可覆寫。
 
-                    logger.info(f"[userData] {asset} 餘額更新: 錢包={wallet_balance:.2f}, 可用={cross_wallet:.2f}")
+                    logger.info(f"[userData] {asset} 錢包餘額更新: {wallet_balance:.2f}")
 
             for sym_state in self.state.symbols.values():
                 sym_state.unrealized_pnl = 0

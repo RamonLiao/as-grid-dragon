@@ -111,7 +111,7 @@ class GlobalConfig:
     sandbox_mode: bool = False           # ccxt set_sandbox_mode
     api_url_override: str = ""           # 手動覆蓋 REST API URL (e.g. Bybit demo)
     websocket_url: str = "wss://fstream.binance.com/ws"
-    sync_interval: float = 30.0
+    sync_interval: float = 10.0
     symbols: Dict[str, SymbolConfig] = field(default_factory=dict)
     risk: RiskConfig = field(default_factory=RiskConfig)
     max_enhancement: MaxEnhancement = field(default_factory=MaxEnhancement)
@@ -152,7 +152,7 @@ class GlobalConfig:
             sandbox_mode=data.get("sandbox_mode", False),
             api_url_override=data.get("api_url_override", ""),
             websocket_url=data.get("websocket_url", "wss://fstream.binance.com/ws"),
-            sync_interval=data.get("sync_interval", 30.0),
+            sync_interval=data.get("sync_interval", 10.0),
             legacy_api_detected=False,
             telegram_bot_token=data.get("telegram_bot_token", ""),
             telegram_chat_id=data.get("telegram_chat_id", ""),
