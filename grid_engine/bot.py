@@ -219,20 +219,31 @@ class MaxGridBot:
         try:
             balance = self.exchange.fetch_balance({'type': 'future'})
 
+            # ccxt 頂層 total=marginBalance(已含浮盈)、free=availableBalance、used=initialMargin，
+            # 語意對不上面板欄位，且 equity 公式會重複加浮盈。改從 info.assets 取幣安原值。
+            assets = balance.get('info', {}).get('assets', []) or []
+            asset_map = {a.get('asset'): a for a in assets}
+
             for currency in ['USDC', 'USDT']:
-                total = float(balance.get('total', {}).get(currency, 0) or 0)
-                free = float(balance.get('free', {}).get(currency, 0) or 0)
-
                 acc = self.state.get_account(currency)
-                acc.wallet_balance = total
-                acc.available_balance = free
-                acc.margin_used = total - free if total > free else 0
+                info = asset_map.get(currency)
 
-                unrealized = 0
-                for sym_state in self.state.symbols.values():
-                    if currency in sym_state.symbol:
-                        unrealized += sym_state.unrealized_pnl
-                acc.unrealized_pnl = unrealized
+                if info:
+                    # walletBalance 為真實錢包餘額(不含浮盈)；equity = wallet + unrealized 才正確
+                    acc.wallet_balance = float(info.get('walletBalance', 0) or 0)
+                    acc.available_balance = float(info.get('availableBalance', 0) or 0)
+                    acc.margin_used = float(info.get('initialMargin', 0) or 0)
+                    acc.unrealized_pnl = float(info.get('unrealizedProfit', 0) or 0)
+                else:
+                    # fallback：info 缺該資產時退回 ccxt 頂層(total=marginBalance，不再額外加浮盈)
+                    margin_balance = float(balance.get('total', {}).get(currency, 0) or 0)
+                    free = float(balance.get('free', {}).get(currency, 0) or 0)
+                    upnl = sum(s.unrealized_pnl for s in self.state.symbols.values()
+                               if currency in s.symbol)
+                    acc.wallet_balance = margin_balance - upnl  # 還原成錢包餘額
+                    acc.available_balance = free
+                    acc.margin_used = margin_balance - free if margin_balance > free else 0
+                    acc.unrealized_pnl = upnl
 
             self.state.update_totals()
 

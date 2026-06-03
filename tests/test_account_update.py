@@ -31,6 +31,18 @@ def _fake_exchange(total, free):
     return ex
 
 
+def _fake_exchange_info(assets, total=None, free=None):
+    """模擬幣安合約 fetch_balance：info.assets 帶原值，頂層 total=marginBalance。"""
+    ex = MagicMock()
+    payload = {"info": {"assets": assets}}
+    if total is not None:
+        payload["total"] = {"USDC": total}
+    if free is not None:
+        payload["free"] = {"USDC": free}
+    ex.fetch_balance.return_value = payload
+    return ex
+
+
 # ──────────────────────────── 核心 regression ────────────────────────────
 
 class TestRESTOwnsAvailableAndMargin:
@@ -145,3 +157,97 @@ class TestAccountUpdateMonkey:
         acc = bot.state.get_account("USDC")
         assert acc.available_balance == 80.0
         assert acc.margin_used == 20.0
+
+
+# ─────────────── 核心 regression: REST 不得重複計算浮盈 ───────────────
+
+class TestRESTNoDoubleCountUnrealized:
+    """2026-06-xx bug: ccxt 頂層 total=marginBalance(已含浮盈)，
+    舊碼 wallet_balance=total 後又 equity=wallet+upnl → 浮盈算兩次，權益失真。
+    正解：從 info.assets 取 walletBalance(不含浮盈)，equity=wallet+upnl 才對。"""
+
+    def test_equity_matches_binance_margin_balance(self):
+        # 重現截圖：錢包 125.55、浮盈 -31.06 → 權益應為保證金餘額 94.49
+        bot = _make_bot()
+        bot.exchange = _fake_exchange_info([{
+            "asset": "USDC",
+            "walletBalance": "125.5485",
+            "unrealizedProfit": "-31.0574",
+            "availableBalance": "15.50",
+            "initialMargin": "78.99",
+        }])
+        bot._sync_account()
+        acc = bot.state.get_account("USDC")
+        assert acc.wallet_balance == pytest.approx(125.5485)
+        assert acc.unrealized_pnl == pytest.approx(-31.0574)
+        # 關鍵：權益 = wallet + upnl = marginBalance，不是 64
+        assert acc.equity == pytest.approx(94.4911)
+        assert acc.available_balance == pytest.approx(15.50)
+        assert acc.margin_used == pytest.approx(78.99)
+        # 保證金率 = 倉位保證金 / 權益
+        assert acc.margin_ratio == pytest.approx(78.99 / 94.4911)
+
+    def test_does_not_use_top_level_total(self):
+        # 即使頂層 total(marginBalance) 同時存在，也該以 info.assets 為準，不重複加浮盈
+        bot = _make_bot()
+        bot.exchange = _fake_exchange_info(
+            [{"asset": "USDC", "walletBalance": "100",
+              "unrealizedProfit": "-10", "availableBalance": "50", "initialMargin": "40"}],
+            total=90.0, free=50.0,
+        )
+        bot._sync_account()
+        acc = bot.state.get_account("USDC")
+        assert acc.equity == pytest.approx(90.0)  # 100 + (-10)，非 90 + (-10)
+
+    def test_fallback_when_asset_missing_in_info(self):
+        # info.assets 沒有該幣 → fallback：total 視為 marginBalance，還原錢包餘額，equity 不雙算
+        bot = _make_bot()
+        bot.exchange = _fake_exchange_info([], total=94.49, free=15.50)
+        bot._sync_account()
+        acc = bot.state.get_account("USDC")
+        # 無持倉 upnl=0 → wallet=94.49, equity=94.49（不會變 188）
+        assert acc.equity == pytest.approx(94.49)
+
+
+class TestSyncAccountInfoMonkey:
+    def test_info_missing_fields_default_zero(self):
+        bot = _make_bot()
+        bot.exchange = _fake_exchange_info([{"asset": "USDC"}])  # 啥欄位都沒
+        bot._sync_account()
+        acc = bot.state.get_account("USDC")
+        assert acc.wallet_balance == 0
+        assert acc.unrealized_pnl == 0
+        assert acc.margin_used == 0
+        assert acc.equity == 0
+
+    def test_info_none_values(self):
+        bot = _make_bot()
+        bot.exchange = _fake_exchange_info([{
+            "asset": "USDC", "walletBalance": None,
+            "unrealizedProfit": None, "availableBalance": None, "initialMargin": None,
+        }])
+        bot._sync_account()
+        assert bot.state.get_account("USDC").equity == 0
+
+    def test_assets_is_none_no_crash(self):
+        bot = _make_bot()
+        ex = MagicMock()
+        ex.fetch_balance.return_value = {"info": {"assets": None}, "total": {}, "free": {}}
+        bot.exchange = ex
+        bot._sync_account()  # assets=None → `or []` → fallback，不崩
+        assert bot.state.get_account("USDC").equity == 0
+
+    def test_garbage_wallet_balance_caught(self):
+        bot = _make_bot()
+        bot.exchange = _fake_exchange_info([{"asset": "USDC", "walletBalance": "garbage"}])
+        bot._sync_account()  # float('garbage') 拋 → 被 _sync_account except 吞，不污染
+        assert bot.state.get_account("USDC").equity == 0
+
+    def test_huge_and_negative_equity(self):
+        bot = _make_bot()
+        bot.exchange = _fake_exchange_info([{
+            "asset": "USDC", "walletBalance": "1e18", "unrealizedProfit": "-5e17",
+            "availableBalance": "0", "initialMargin": "0",
+        }])
+        bot._sync_account()
+        assert bot.state.get_account("USDC").equity == pytest.approx(5e17)
