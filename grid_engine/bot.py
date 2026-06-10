@@ -930,6 +930,8 @@ class MaxGridBot:
         """檢查風控狀態並通知"""
         if not self.notifier.enabled or not self.config.risk.enabled:
             return
+        if not getattr(self.config, "telegram_risk_alert_enabled", True):
+            return
         if self.state.margin_usage > self.config.risk.margin_threshold:
             # 冷卻：避免每個 ticker tick 重複轟炸 Telegram
             if time.time() - self.last_risk_alert_time < RISK_ALERT_COOLDOWN:

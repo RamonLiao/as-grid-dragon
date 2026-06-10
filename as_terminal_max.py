@@ -207,6 +207,8 @@ class MainMenu:
             console.print(f"  Bot Token: {'已設定' if self.config.telegram_bot_token else '[red]未設定[/]'}")
             console.print(f"  Chat ID: {self.config.telegram_chat_id or '[red]未設定[/]'}")
             console.print(f"  每日摘要時間: {self.config.telegram_daily_pnl_hour:02d}:00 (Asia/Taipei)")
+            risk_state = "[green]開[/]" if self.config.telegram_risk_alert_enabled else "[yellow]關[/]"
+            console.print(f"  風控警報: {risk_state}")
             console.print()
 
             console.print("[dim]設定步驟:[/]")
@@ -220,11 +222,12 @@ class MainMenu:
             console.print("  [cyan]3[/] 開關通知")
             console.print("  [cyan]4[/] 發送測試訊息")
             console.print("  [cyan]5[/] 每日摘要時間")
-            console.print("  [cyan]6[/] 清除設定")
+            console.print("  [cyan]6[/] 開關風控警報")
+            console.print("  [cyan]7[/] 清除設定")
             console.print("  [cyan]0[/] 返回")
             console.print()
 
-            choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4", "5", "6"], default="0")
+            choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="0")
 
             if choice == "0":
                 return
@@ -273,6 +276,10 @@ class MainMenu:
                 else:
                     console.print("[red]請輸入 0-23 之間的整數[/]")
             elif choice == "6":
+                self.config.telegram_risk_alert_enabled = not self.config.telegram_risk_alert_enabled
+                self.config.save()
+                console.print(f"[green]✓ 風控警報{'已開啟' if self.config.telegram_risk_alert_enabled else '已關閉'}[/]")
+            elif choice == "7":
                 if Confirm.ask("[yellow]確定清除 Telegram 設定？[/]"):
                     self.config.telegram_bot_token = ""
                     self.config.telegram_chat_id = ""

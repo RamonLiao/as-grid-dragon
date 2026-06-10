@@ -159,6 +159,32 @@ class TestConfigTelegram:
         assert config2.telegram_enabled is False
         assert config2.telegram_daily_pnl_hour == 8
 
+    def test_risk_alert_enabled_roundtrip(self):
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig()
+        assert config.telegram_risk_alert_enabled is True
+        config.telegram_risk_alert_enabled = False
+        config2 = GlobalConfig.from_dict(config.to_dict())
+        assert config2.telegram_risk_alert_enabled is False
+
+    @pytest.mark.parametrize("bad,expected", [
+        (None, False),     # bool(None) → False
+        ("yes", True),     # 非空字串 → True
+        (0, False),
+        (1, True),
+    ])
+    def test_risk_alert_enabled_monkey(self, bad, expected):
+        """手改 config 塞垃圾值不應炸掉，bool() 正規化"""
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig.from_dict({"telegram_risk_alert_enabled": bad})
+        assert config.telegram_risk_alert_enabled is expected
+
+    def test_risk_alert_backward_compat(self):
+        """舊 config 沒有此欄位 → 預設開"""
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig.from_dict({})
+        assert config.telegram_risk_alert_enabled is True
+
 
 class TestNotifierSwitch:
     """telegram_enabled 總開關測試"""

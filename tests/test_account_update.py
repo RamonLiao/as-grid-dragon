@@ -251,3 +251,45 @@ class TestSyncAccountInfoMonkey:
         }])
         bot._sync_account()
         assert bot.state.get_account("USDC").equity == pytest.approx(5e17)
+
+
+class TestRiskAlertSwitch:
+    """telegram_risk_alert_enabled 風控警報獨立開關"""
+
+    def _make_risky_bot(self, risk_alert_enabled):
+        bot = _make_bot()
+        bot.config.telegram_risk_alert_enabled = risk_alert_enabled
+        bot.config.risk.enabled = True
+        bot.config.risk.margin_threshold = 0.5
+        bot.notifier = MagicMock()
+        bot.notifier.enabled = True
+        bot.state.margin_usage = 0.9  # 超標
+        return bot
+
+    @pytest.mark.asyncio
+    async def test_alert_sent_when_enabled(self):
+        bot = self._make_risky_bot(True)
+        from unittest.mock import AsyncMock
+        bot.notifier.notify_risk_alert = AsyncMock()
+        await bot._check_risk_and_notify()
+        bot.notifier.notify_risk_alert.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_alert_suppressed_when_disabled(self):
+        bot = self._make_risky_bot(False)
+        from unittest.mock import AsyncMock
+        bot.notifier.notify_risk_alert = AsyncMock()
+        await bot._check_risk_and_notify()
+        bot.notifier.notify_risk_alert.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_disabled_does_not_consume_cooldown(self):
+        """關閉期間不更新冷卻計時，重開後立即可發"""
+        bot = self._make_risky_bot(False)
+        from unittest.mock import AsyncMock
+        bot.notifier.notify_risk_alert = AsyncMock()
+        await bot._check_risk_and_notify()
+        assert bot.last_risk_alert_time == 0
+        bot.config.telegram_risk_alert_enabled = True
+        await bot._check_risk_and_notify()
+        bot.notifier.notify_risk_alert.assert_awaited_once()

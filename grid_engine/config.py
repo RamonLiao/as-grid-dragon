@@ -122,6 +122,7 @@ class GlobalConfig:
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
     telegram_enabled: bool = True
+    telegram_risk_alert_enabled: bool = True
     telegram_daily_pnl_hour: int = 20  # Asia/Taipei (UTC+8) 整點
 
     def to_dict(self) -> dict:
@@ -143,6 +144,7 @@ class GlobalConfig:
             "telegram_bot_token": self.telegram_bot_token,
             "telegram_chat_id": self.telegram_chat_id,
             "telegram_enabled": self.telegram_enabled,
+            "telegram_risk_alert_enabled": self.telegram_risk_alert_enabled,
             "telegram_daily_pnl_hour": self.telegram_daily_pnl_hour,
         }
 
@@ -170,6 +172,7 @@ class GlobalConfig:
             telegram_bot_token=data.get("telegram_bot_token", ""),
             telegram_chat_id=data.get("telegram_chat_id", ""),
             telegram_enabled=bool(data.get("telegram_enabled", True)),
+            telegram_risk_alert_enabled=bool(data.get("telegram_risk_alert_enabled", True)),
             telegram_daily_pnl_hour=cls._parse_daily_pnl_hour(data.get("telegram_daily_pnl_hour")),
         )
         for k, v in data.get("symbols", {}).items():
