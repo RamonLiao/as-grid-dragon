@@ -293,3 +293,18 @@ class TestRiskAlertSwitch:
         bot.config.telegram_risk_alert_enabled = True
         await bot._check_risk_and_notify()
         bot.notifier.notify_risk_alert.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_cooldown_from_config(self):
+        """冷卻秒數讀 config：第二次超標在冷卻內不發、過冷卻後再發"""
+        import time as _time
+        from unittest.mock import AsyncMock
+        bot = self._make_risky_bot(True)
+        bot.config.telegram_risk_alert_cooldown = 60
+        bot.notifier.notify_risk_alert = AsyncMock()
+        await bot._check_risk_and_notify()
+        await bot._check_risk_and_notify()  # 冷卻內 → 不發
+        assert bot.notifier.notify_risk_alert.await_count == 1
+        bot.last_risk_alert_time = _time.time() - 61  # 模擬冷卻已過
+        await bot._check_risk_and_notify()
+        assert bot.notifier.notify_risk_alert.await_count == 2

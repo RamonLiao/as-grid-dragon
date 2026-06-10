@@ -24,7 +24,7 @@ from .config import GlobalConfig, SymbolConfig
 from .state import GlobalState, SymbolState
 from .notifier import TelegramNotifier
 
-# 風控警報冷卻秒數，避免高頻 ticker 重複轟炸 Telegram
+# 風控警報冷卻秒數預設值（可由 config telegram_risk_alert_cooldown 覆寫）
 RISK_ALERT_COOLDOWN = 300
 
 
@@ -934,7 +934,8 @@ class MaxGridBot:
             return
         if self.state.margin_usage > self.config.risk.margin_threshold:
             # 冷卻：避免每個 ticker tick 重複轟炸 Telegram
-            if time.time() - self.last_risk_alert_time < RISK_ALERT_COOLDOWN:
+            cooldown = getattr(self.config, "telegram_risk_alert_cooldown", RISK_ALERT_COOLDOWN)
+            if time.time() - self.last_risk_alert_time < cooldown:
                 return
             self.last_risk_alert_time = time.time()
             alert = f"保證金使用率過高: {self.state.margin_usage:.1%} (閾值: {self.config.risk.margin_threshold:.1%})"

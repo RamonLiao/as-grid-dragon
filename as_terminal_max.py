@@ -208,7 +208,8 @@ class MainMenu:
             console.print(f"  Chat ID: {self.config.telegram_chat_id or '[red]未設定[/]'}")
             console.print(f"  每日摘要時間: {self.config.telegram_daily_pnl_hour:02d}:00 (Asia/Taipei)")
             risk_state = "[green]開[/]" if self.config.telegram_risk_alert_enabled else "[yellow]關[/]"
-            console.print(f"  風控警報: {risk_state}")
+            cd_min = self.config.telegram_risk_alert_cooldown / 60
+            console.print(f"  風控警報: {risk_state}  (冷卻 {cd_min:g} 分鐘)")
             console.print()
 
             console.print("[dim]設定步驟:[/]")
@@ -223,11 +224,12 @@ class MainMenu:
             console.print("  [cyan]4[/] 發送測試訊息")
             console.print("  [cyan]5[/] 每日摘要時間")
             console.print("  [cyan]6[/] 開關風控警報")
-            console.print("  [cyan]7[/] 清除設定")
+            console.print("  [cyan]7[/] 風控警報頻率")
+            console.print("  [cyan]8[/] 清除設定")
             console.print("  [cyan]0[/] 返回")
             console.print()
 
-            choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4", "5", "6", "7"], default="0")
+            choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4", "5", "6", "7", "8"], default="0")
 
             if choice == "0":
                 return
@@ -280,6 +282,17 @@ class MainMenu:
                 self.config.save()
                 console.print(f"[green]✓ 風控警報{'已開啟' if self.config.telegram_risk_alert_enabled else '已關閉'}[/]")
             elif choice == "7":
+                m = IntPrompt.ask(
+                    "風控警報冷卻（分鐘, ≥1）",
+                    default=max(1, round(self.config.telegram_risk_alert_cooldown / 60)),
+                )
+                if m >= 1:
+                    self.config.telegram_risk_alert_cooldown = m * 60
+                    self.config.save()
+                    console.print(f"[green]✓ 風控警報冷卻設為 {m} 分鐘[/]")
+                else:
+                    console.print("[red]請輸入 ≥1 的整數分鐘[/]")
+            elif choice == "8":
                 if Confirm.ask("[yellow]確定清除 Telegram 設定？[/]"):
                     self.config.telegram_bot_token = ""
                     self.config.telegram_chat_id = ""

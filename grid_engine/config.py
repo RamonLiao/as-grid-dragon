@@ -123,6 +123,7 @@ class GlobalConfig:
     telegram_chat_id: str = ""
     telegram_enabled: bool = True
     telegram_risk_alert_enabled: bool = True
+    telegram_risk_alert_cooldown: int = 300  # 風控警報冷卻秒數
     telegram_daily_pnl_hour: int = 20  # Asia/Taipei (UTC+8) 整點
 
     def to_dict(self) -> dict:
@@ -145,6 +146,7 @@ class GlobalConfig:
             "telegram_chat_id": self.telegram_chat_id,
             "telegram_enabled": self.telegram_enabled,
             "telegram_risk_alert_enabled": self.telegram_risk_alert_enabled,
+            "telegram_risk_alert_cooldown": self.telegram_risk_alert_cooldown,
             "telegram_daily_pnl_hour": self.telegram_daily_pnl_hour,
         }
 
@@ -156,6 +158,15 @@ class GlobalConfig:
         except (TypeError, ValueError):
             return 20
         return hour if 0 <= hour <= 23 else 20
+
+    @staticmethod
+    def _parse_risk_alert_cooldown(value) -> int:
+        """正規化風控警報冷卻秒數，非法值 fallback 到 300"""
+        try:
+            cooldown = int(value)
+        except (TypeError, ValueError):
+            return 300
+        return cooldown if cooldown > 0 else 300
 
     @classmethod
     def from_dict(cls, data: dict) -> 'GlobalConfig':
@@ -173,6 +184,7 @@ class GlobalConfig:
             telegram_chat_id=data.get("telegram_chat_id", ""),
             telegram_enabled=bool(data.get("telegram_enabled", True)),
             telegram_risk_alert_enabled=bool(data.get("telegram_risk_alert_enabled", True)),
+            telegram_risk_alert_cooldown=cls._parse_risk_alert_cooldown(data.get("telegram_risk_alert_cooldown")),
             telegram_daily_pnl_hour=cls._parse_daily_pnl_hour(data.get("telegram_daily_pnl_hour")),
         )
         for k, v in data.get("symbols", {}).items():

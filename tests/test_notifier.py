@@ -179,6 +179,27 @@ class TestConfigTelegram:
         config = GlobalConfig.from_dict({"telegram_risk_alert_enabled": bad})
         assert config.telegram_risk_alert_enabled is expected
 
+    def test_risk_alert_cooldown_roundtrip(self):
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig()
+        assert config.telegram_risk_alert_cooldown == 300
+        config.telegram_risk_alert_cooldown = 1800
+        config2 = GlobalConfig.from_dict(config.to_dict())
+        assert config2.telegram_risk_alert_cooldown == 1800
+
+    @pytest.mark.parametrize("bad,expected", [
+        ("600", 600),      # 字串數字 → 轉 int
+        ("abc", 300),      # 垃圾字串 → fallback
+        (None, 300),
+        (0, 300),          # 非正數 → fallback
+        (-60, 300),
+        (90.7, 90),        # float → 截斷
+    ])
+    def test_risk_alert_cooldown_monkey(self, bad, expected):
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig.from_dict({"telegram_risk_alert_cooldown": bad})
+        assert config.telegram_risk_alert_cooldown == expected
+
     def test_risk_alert_backward_compat(self):
         """舊 config 沒有此欄位 → 預設開"""
         from grid_engine.config import GlobalConfig
