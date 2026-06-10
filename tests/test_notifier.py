@@ -58,6 +58,15 @@ class TestTelegramNotifier:
         assert "重啟" in msg
 
     @pytest.mark.asyncio
+    async def test_notify_start(self):
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_start()
+        notifier.send.assert_called_once()
+        msg = notifier.send.call_args[0][0]
+        assert "啟動" in msg
+
+    @pytest.mark.asyncio
     async def test_notify_stop(self):
         notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
         notifier.send = AsyncMock(return_value=True)
@@ -122,6 +131,84 @@ class TestConfigTelegram:
         config = GlobalConfig.from_dict({})
         assert config.telegram_bot_token == ""
         assert config.telegram_chat_id == ""
+        assert config.telegram_enabled is True
+        assert config.telegram_daily_pnl_hour == 20
+
+    @pytest.mark.parametrize("bad,expected", [
+        ("8", 8),          # 字串數字 → 轉 int
+        ("abc", 20),       # 垃圾字串 → fallback
+        (None, 20),
+        (12.7, 12),        # float → 截斷
+        (-1, 20),          # 超出範圍 → fallback
+        (24, 20),
+        (99999, 20),
+    ])
+    def test_daily_pnl_hour_monkey(self, bad, expected):
+        """手改 config 塞垃圾值不應炸掉 daily loop"""
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig.from_dict({"telegram_daily_pnl_hour": bad})
+        assert config.telegram_daily_pnl_hour == expected
+
+    def test_new_telegram_fields_roundtrip(self):
+        from grid_engine.config import GlobalConfig
+        config = GlobalConfig()
+        config.telegram_enabled = False
+        config.telegram_daily_pnl_hour = 8
+        d = config.to_dict()
+        config2 = GlobalConfig.from_dict(d)
+        assert config2.telegram_enabled is False
+        assert config2.telegram_daily_pnl_hour == 8
+
+
+class TestNotifierSwitch:
+    """telegram_enabled 總開關測試"""
+
+    def test_switch_off_disables(self):
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456", switch_on=False)
+        assert notifier.enabled is False
+
+    def test_switch_on_with_cred(self):
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456", switch_on=True)
+        assert notifier.enabled is True
+
+    def test_switch_on_without_cred(self):
+        notifier = TelegramNotifier(switch_on=True)
+        assert notifier.enabled is False
+
+    @pytest.mark.asyncio
+    async def test_notify_start_with_symbols(self):
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_start(symbols=["BNB/USDC:USDC"], daily_pnl_hour=8)
+        msg = notifier.send.call_args[0][0]
+        assert "BNB/USDC:USDC" in msg
+        assert "08:00" in msg
+
+    @pytest.mark.asyncio
+    async def test_notify_daily_pnl_new_format(self):
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({
+            "total_pnl": 1.5,
+            "total_equity": 94.49,
+            "margin_usage": 0.193,
+            "total_profit": 12.3,
+            "positions": {"BNB/USDC:USDC": {"long": 0.5, "short": 0, "pnl": 1.5}},
+            "running_hours": 24,
+        })
+        msg = notifier.send.call_args[0][0]
+        assert "94.49" in msg
+        assert "19.3%" in msg
+        assert "+12.30" in msg
+        assert "BNB" in msg and "L:0.5" in msg
+
+    @pytest.mark.asyncio
+    async def test_notify_daily_pnl_no_positions(self):
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({})
+        msg = notifier.send.call_args[0][0]
+        assert "(無持倉)" in msg
 
 
 class TestNotifierMonkey:

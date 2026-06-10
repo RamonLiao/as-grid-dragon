@@ -197,14 +197,16 @@ class MainMenu:
             self.show_banner()
             console.print("[bold]Telegram 通知設定[/]\n")
 
-            if self.config.telegram_bot_token:
-                console.print(f"[dim]當前 Bot Token: {self.config.telegram_bot_token[:10]}...[/]")
+            has_cred = bool(self.config.telegram_bot_token and self.config.telegram_chat_id)
+            if has_cred and self.config.telegram_enabled:
+                console.print("  狀態: [green]已啟用[/]")
+            elif has_cred:
+                console.print("  狀態: [yellow]已關閉[/]")
             else:
-                console.print("[dim]當前 Bot Token: 未設定[/]")
-            if self.config.telegram_chat_id:
-                console.print(f"[dim]當前 Chat ID: {self.config.telegram_chat_id}[/]")
-            else:
-                console.print("[dim]當前 Chat ID: 未設定[/]")
+                console.print("  狀態: [red]未設定[/]")
+            console.print(f"  Bot Token: {'已設定' if self.config.telegram_bot_token else '[red]未設定[/]'}")
+            console.print(f"  Chat ID: {self.config.telegram_chat_id or '[red]未設定[/]'}")
+            console.print(f"  每日摘要時間: {self.config.telegram_daily_pnl_hour:02d}:00 (Asia/Taipei)")
             console.print()
 
             console.print("[dim]設定步驟:[/]")
@@ -215,12 +217,14 @@ class MainMenu:
 
             console.print("  [cyan]1[/] 設定 Bot Token")
             console.print("  [cyan]2[/] 設定 Chat ID")
-            console.print("  [cyan]3[/] 發送測試訊息")
-            console.print("  [cyan]4[/] 清除設定")
+            console.print("  [cyan]3[/] 開關通知")
+            console.print("  [cyan]4[/] 發送測試訊息")
+            console.print("  [cyan]5[/] 每日摘要時間")
+            console.print("  [cyan]6[/] 清除設定")
             console.print("  [cyan]0[/] 返回")
             console.print()
 
-            choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4"], default="0")
+            choice = Prompt.ask("選擇", choices=["0", "1", "2", "3", "4", "5", "6"], default="0")
 
             if choice == "0":
                 return
@@ -237,6 +241,10 @@ class MainMenu:
                     self.config.save()
                     console.print("[green]✓ Chat ID 已儲存[/]")
             elif choice == "3":
+                self.config.telegram_enabled = not self.config.telegram_enabled
+                self.config.save()
+                console.print(f"[green]✓ 通知{'已啟用' if self.config.telegram_enabled else '已關閉'}[/]")
+            elif choice == "4":
                 if not self.config.telegram_bot_token or not self.config.telegram_chat_id:
                     console.print("[red]請先設定 Bot Token 和 Chat ID[/]")
                 else:
@@ -253,7 +261,18 @@ class MainMenu:
                             console.print("[red]✗ 發送失敗，請檢查 Token 和 Chat ID[/]")
                     except Exception as e:
                         console.print(f"[red]發送錯誤: {e}[/]")
-            elif choice == "4":
+            elif choice == "5":
+                h = IntPrompt.ask(
+                    "每日摘要時間（0-23 整點, Asia/Taipei）",
+                    default=self.config.telegram_daily_pnl_hour,
+                )
+                if 0 <= h <= 23:
+                    self.config.telegram_daily_pnl_hour = h
+                    self.config.save()
+                    console.print(f"[green]✓ 每日摘要時間設為 {h:02d}:00[/]")
+                else:
+                    console.print("[red]請輸入 0-23 之間的整數[/]")
+            elif choice == "6":
                 if Confirm.ask("[yellow]確定清除 Telegram 設定？[/]"):
                     self.config.telegram_bot_token = ""
                     self.config.telegram_chat_id = ""

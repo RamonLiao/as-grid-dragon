@@ -69,6 +69,7 @@ class MaxGridBot:
         self.notifier = TelegramNotifier(
             bot_token=config.telegram_bot_token,
             chat_id=config.telegram_chat_id,
+            switch_on=getattr(config, "telegram_enabled", True),
         )
         self.precisions: Dict[str, dict] = {}
         self.last_sync_time = 0
@@ -881,12 +882,13 @@ class MaxGridBot:
                 logger.error(f"更新 listenKey 失敗: {e}")
 
     async def _daily_pnl_loop(self):
-        """每日 20:00 (Asia/Taipei, UTC+8) 發送損益摘要"""
+        """每日 telegram_daily_pnl_hour (Asia/Taipei, UTC+8) 整點發送損益摘要"""
         while not self._stop_event.is_set():
             try:
                 now = datetime.utcnow()
-                # UTC 12:00 = Asia/Taipei 20:00
-                target = now.replace(hour=12, minute=0, second=0, microsecond=0)
+                # Asia/Taipei (UTC+8) 整點 → UTC
+                utc_hour = (self.config.telegram_daily_pnl_hour - 8) % 24
+                target = now.replace(hour=utc_hour, minute=0, second=0, microsecond=0)
                 if now >= target:
                     from datetime import timedelta
                     target += timedelta(days=1)
@@ -898,9 +900,12 @@ class MaxGridBot:
 
                 positions = {}
                 for sym, sym_state in self.state.symbols.items():
-                    net = sym_state.long_position - sym_state.short_position
-                    if net != 0:
-                        positions[sym] = net
+                    if sym_state.long_position > 0 or sym_state.short_position > 0:
+                        positions[sym] = {
+                            "long": sym_state.long_position,
+                            "short": sym_state.short_position,
+                            "pnl": sym_state.unrealized_pnl,
+                        }
 
                 running_hours = 0
                 if self.state.start_time:
@@ -909,6 +914,8 @@ class MaxGridBot:
                 pnl_data = {
                     "total_pnl": self.state.total_unrealized_pnl,
                     "total_equity": self.state.total_equity,
+                    "margin_usage": self.state.margin_usage,
+                    "total_profit": self.state.total_profit,
                     "positions": positions,
                     "running_hours": running_hours,
                 }
@@ -953,6 +960,15 @@ class MaxGridBot:
         ]
         if self.notifier.enabled:
             self.tasks.append(asyncio.create_task(self._daily_pnl_loop()))
+            self.tasks.append(asyncio.create_task(self.notifier.notify_start(
+                symbols=list(self.state.symbols.keys()),
+                daily_pnl_hour=self.config.telegram_daily_pnl_hour,
+            )))
+        else:
+            logger.warning(
+                "[MAX] Telegram 未設定（telegram_bot_token/telegram_chat_id 為空），"
+                "通知與每日報告已停用。可在主選單「連線設定 → Telegram 通知」設定"
+            )
 
         try:
             while not self._stop_event.is_set():

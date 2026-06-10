@@ -13,13 +13,14 @@ class TelegramNotifier:
 
     TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
-    def __init__(self, bot_token: str = "", chat_id: str = ""):
+    def __init__(self, bot_token: str = "", chat_id: str = "", switch_on: bool = True):
         self.bot_token = bot_token
         self.chat_id = chat_id
+        self.switch_on = switch_on
 
     @property
     def enabled(self) -> bool:
-        return bool(self.bot_token and self.chat_id)
+        return bool(self.bot_token and self.chat_id) and self.switch_on
 
     async def send(self, message: str) -> bool:
         """發送 Telegram 訊息，失敗不拋異常"""
@@ -66,6 +67,18 @@ class TelegramNotifier:
         )
         await self.send(msg)
 
+    async def notify_start(self, symbols: list = None, daily_pnl_hour: int = 20):
+        """交易啟動通知"""
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        sym_list = ", ".join(symbols) if symbols else "(無)"
+        msg = (
+            f"🟢 <b>AS Grid Bot 交易已啟動</b>\n"
+            f"時間: {now}\n"
+            f"交易對: {sym_list}\n"
+            f"每日摘要: {daily_pnl_hour:02d}:00 (Asia/Taipei)"
+        )
+        await self.send(msg)
+
     async def notify_stop(self):
         """Bot 正常停止通知"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -81,21 +94,36 @@ class TelegramNotifier:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         total_pnl = pnl_data.get("total_pnl", 0)
         total_equity = pnl_data.get("total_equity", 0)
+        margin_usage = pnl_data.get("margin_usage", 0)
+        total_profit = pnl_data.get("total_profit", 0)
         positions = pnl_data.get("positions", {})
         running_hours = pnl_data.get("running_hours", 0)
 
         icon = "📈" if total_pnl >= 0 else "📉"
-        pos_lines = "\n".join(
-            f"  {sym}: {qty}" for sym, qty in positions.items()
-        ) or "  無持倉"
+        pos_lines = []
+        for sym, pos in positions.items():
+            coin = sym.split("/")[0]
+            if not isinstance(pos, dict):
+                # 相容舊格式：純數量
+                pos_lines.append(f"  {coin}: {pos}")
+                continue
+            sides = []
+            if pos.get("long", 0) > 0:
+                sides.append(f"L:{pos['long']}")
+            if pos.get("short", 0) > 0:
+                sides.append(f"S:{pos['short']}")
+            pos_lines.append(f"  {coin}: {', '.join(sides)} | PnL: {pos.get('pnl', 0):+.2f}")
+        pos_text = "\n".join(pos_lines) or "  (無持倉)"
 
         msg = (
             f"{icon} <b>每日損益摘要</b>\n"
             f"時間: {now}\n"
-            f"損益: <b>{total_pnl:+.2f} USDC</b>\n"
-            f"權益: {total_equity:.2f} USDC\n"
+            f"帳戶權益: {total_equity:.2f} USDC\n"
+            f"保證金使用率: {margin_usage:.1%}\n"
+            f"未實現 PnL: <b>{total_pnl:+.2f}</b>\n"
+            f"累計已實現: {total_profit:+.2f}\n"
             f"運行: {running_hours:.1f} 小時\n"
-            f"\n<b>持倉:</b>\n{pos_lines}"
+            f"\n<b>持倉概況:</b>\n{pos_text}"
         )
         await self.send(msg)
 

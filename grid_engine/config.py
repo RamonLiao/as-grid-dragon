@@ -121,6 +121,8 @@ class GlobalConfig:
     legacy_api_detected: bool = field(default=False, repr=False)
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+    telegram_enabled: bool = True
+    telegram_daily_pnl_hour: int = 20  # Asia/Taipei (UTC+8) 整點
 
     def to_dict(self) -> dict:
         return {
@@ -140,7 +142,18 @@ class GlobalConfig:
             "leading_indicator": self.leading_indicator.to_dict(),
             "telegram_bot_token": self.telegram_bot_token,
             "telegram_chat_id": self.telegram_chat_id,
+            "telegram_enabled": self.telegram_enabled,
+            "telegram_daily_pnl_hour": self.telegram_daily_pnl_hour,
         }
+
+    @staticmethod
+    def _parse_daily_pnl_hour(value) -> int:
+        """正規化每日摘要時間，非法值 fallback 到 20"""
+        try:
+            hour = int(value)
+        except (TypeError, ValueError):
+            return 20
+        return hour if 0 <= hour <= 23 else 20
 
     @classmethod
     def from_dict(cls, data: dict) -> 'GlobalConfig':
@@ -156,6 +169,8 @@ class GlobalConfig:
             legacy_api_detected=False,
             telegram_bot_token=data.get("telegram_bot_token", ""),
             telegram_chat_id=data.get("telegram_chat_id", ""),
+            telegram_enabled=bool(data.get("telegram_enabled", True)),
+            telegram_daily_pnl_hour=cls._parse_daily_pnl_hour(data.get("telegram_daily_pnl_hour")),
         )
         for k, v in data.get("symbols", {}).items():
             config.symbols[k] = SymbolConfig.from_dict(v)
