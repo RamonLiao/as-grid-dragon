@@ -155,3 +155,70 @@ class TestAsyncSync:
         await bot._sync_orders()
         st = bot.state.symbols[sym]
         assert st.buy_long_orders == 2 and st.sell_long_orders == 3
+
+
+class TestConcurrencyLocks:
+    @pytest.mark.asyncio
+    async def test_adjust_grid_skips_when_locked(self):
+        """同 symbol 並發觸發：一個在跑，其餘直接 skip 不排隊。"""
+        bot = _make_synced_bot()
+        sym = list(bot.state.symbols)[0]
+        st = bot.state.symbols[sym]
+        st.latest_price = st.best_bid = st.best_ask = 600.0
+        entered = []
+
+        async def slow_step(ccxt_symbol, sym_config):
+            entered.append(ccxt_symbol)
+            await asyncio.sleep(0.1)
+
+        bot._grid_step = slow_step
+        await asyncio.gather(*[bot.adjust_grid(sym) for _ in range(5)])
+        assert len(entered) == 1, "adjust_grid 未互斥或發生排隊"
+
+    @pytest.mark.asyncio
+    async def test_adjust_grid_lock_released_on_exception(self):
+        bot = _make_synced_bot()
+        sym = list(bot.state.symbols)[0]
+        st = bot.state.symbols[sym]
+        st.latest_price = st.best_bid = st.best_ask = 600.0
+
+        async def boom(ccxt_symbol, sym_config):
+            raise RuntimeError("x")
+
+        bot._grid_step = boom
+        with pytest.raises(RuntimeError):
+            await bot.adjust_grid(sym)
+        assert not bot._symbol_lock(sym).locked()
+
+    @pytest.mark.asyncio
+    async def test_sync_all_no_reentry(self):
+        """sync 進行中再觸發 → 直接 return，fetch 只跑一輪。"""
+        bot = _make_synced_bot()
+        calls = []
+
+        def slow_fetch(*a, **kw):
+            calls.append(1)
+            _time.sleep(0.1)
+            return []
+
+        bot.exchange.fetch_positions = slow_fetch
+        await asyncio.gather(bot.sync_all(), bot.sync_all(), bot.sync_all())
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_sync_apply_waits_for_adjust_lock(self):
+        """adjust_grid 持鎖期間，_sync_orders 的 apply 不得插入。"""
+        bot = _make_synced_bot()
+        sym = list(bot.state.symbols)[0]
+        st = bot.state.symbols[sym]
+        st.buy_long_orders = 99  # adjust 期間的「決策依據」
+        bot.exchange.fetch_open_orders.return_value = []
+
+        lock = bot._symbol_lock(sym)
+        async with lock:  # 模擬 adjust_grid 持鎖中
+            sync_task = asyncio.create_task(bot._sync_orders())
+            await asyncio.sleep(0.05)
+            assert st.buy_long_orders == 99, "sync 在 adjust 持鎖期間改寫了掛單計數"
+        await sync_task
+        assert st.buy_long_orders == 0  # 釋放後才 apply
+

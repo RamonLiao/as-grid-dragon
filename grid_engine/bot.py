@@ -92,6 +92,10 @@ class MaxGridBot:
         # REST 卸載：單 worker 序列化（同步 ccxt 實例非 thread-safe）
         self._rest_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ccxt-rest")
 
+        # 並發鎖：per-symbol 網格互斥 + sync 防重入（鎖序固定 _sync_lock → symbol lock）
+        self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        self._sync_lock = asyncio.Lock()
+
         # MAX 增強模組
         self.funding_manager: Optional[FundingRateManager] = None
         self.glft_controller = GLFTController()
@@ -156,15 +160,21 @@ class MaxGridBot:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._rest_executor, partial(fn, *args, **kwargs))
 
+    def _symbol_lock(self, ccxt_symbol: str) -> asyncio.Lock:
+        return self._symbol_locks.setdefault(ccxt_symbol, asyncio.Lock())
+
     def _get_listen_key(self) -> str:
         response = self.exchange.fapiPrivatePostListenKey()
         return response.get("listenKey")
 
     async def sync_all(self):
-        await self._sync_positions()
-        await self._sync_orders()
-        await self._sync_account()
-        await self._sync_funding_rates()
+        if self._sync_lock.locked():
+            return
+        async with self._sync_lock:
+            await self._sync_positions()
+            await self._sync_orders()
+            await self._sync_account()
+            await self._sync_funding_rates()
 
     async def _sync_funding_rates(self):
         """同步所有交易對的 funding rate"""
@@ -199,11 +209,12 @@ class MaxGridBot:
                 agg[symbol][2] += pnl
 
         for symbol, (long_pos, short_pos, upnl) in agg.items():
-            # 原子 apply：無 await（Task 4 在此加 symbol lock）
-            st = self.state.symbols[symbol]
-            st.long_position = long_pos
-            st.short_position = short_pos
-            st.unrealized_pnl = upnl
+            async with self._symbol_lock(symbol):
+                # 原子 apply：鎖內無其他 await
+                st = self.state.symbols[symbol]
+                st.long_position = long_pos
+                st.short_position = short_pos
+                st.unrealized_pnl = upnl
 
     async def _sync_orders(self):
         for sym_config in self.config.symbols.values():
@@ -230,9 +241,10 @@ class MaxGridBot:
                         counts[2] += qty
                     elif side == 'sell' and pos_side == 'SHORT':
                         counts[3] += qty
-                # 原子 apply（Task 4 在此加 symbol lock）
-                state.buy_long_orders, state.sell_long_orders, \
-                    state.buy_short_orders, state.sell_short_orders = counts
+                async with self._symbol_lock(symbol):
+                    # 原子 apply：鎖內無其他 await
+                    state.buy_long_orders, state.sell_long_orders, \
+                        state.buy_short_orders, state.sell_short_orders = counts
             except Exception as e:
                 logger.error(f"同步 {symbol} 掛單失敗: {e}")
 
@@ -324,30 +336,31 @@ class MaxGridBot:
 
     async def _close_symbol_positions(self, ccxt_symbol: str, sym_config: SymbolConfig):
         """平倉指定交易對"""
-        try:
-            sym_state = self.state.symbols.get(ccxt_symbol)
-            if not sym_state:
-                return
+        async with self._symbol_lock(ccxt_symbol):
+            try:
+                sym_state = self.state.symbols.get(ccxt_symbol)
+                if not sym_state:
+                    return
 
-            await self.cancel_orders_for_side(ccxt_symbol, 'long')
-            await self.cancel_orders_for_side(ccxt_symbol, 'short')
+                await self.cancel_orders_for_side(ccxt_symbol, 'long')
+                await self.cancel_orders_for_side(ccxt_symbol, 'short')
 
-            if sym_state.long_position > 0:
-                await self.place_order(
-                    ccxt_symbol, 'sell', 0, sym_state.long_position,
-                    reduce_only=True, position_side='long', order_type='market'
-                )
-                logger.info(f"[追蹤止盈] {sym_config.symbol} 市價平多 {sym_state.long_position}")
+                if sym_state.long_position > 0:
+                    await self.place_order(
+                        ccxt_symbol, 'sell', 0, sym_state.long_position,
+                        reduce_only=True, position_side='long', order_type='market'
+                    )
+                    logger.info(f"[追蹤止盈] {sym_config.symbol} 市價平多 {sym_state.long_position}")
 
-            if sym_state.short_position > 0:
-                await self.place_order(
-                    ccxt_symbol, 'buy', 0, sym_state.short_position,
-                    reduce_only=True, position_side='short', order_type='market'
-                )
-                logger.info(f"[追蹤止盈] {sym_config.symbol} 市價平空 {sym_state.short_position}")
+                if sym_state.short_position > 0:
+                    await self.place_order(
+                        ccxt_symbol, 'buy', 0, sym_state.short_position,
+                        reduce_only=True, position_side='short', order_type='market'
+                    )
+                    logger.info(f"[追蹤止盈] {sym_config.symbol} 市價平空 {sym_state.short_position}")
 
-        except Exception as e:
-            logger.error(f"[追蹤止盈] {sym_config.symbol} 平倉失敗: {e}")
+            except Exception as e:
+                logger.error(f"[追蹤止盈] {sym_config.symbol} 平倉失敗: {e}")
 
     async def place_order(self, symbol: str, side: str, price: float, quantity: float,
                     reduce_only: bool = False, position_side: str = None,
@@ -602,14 +615,18 @@ class MaxGridBot:
             if cfg.ccxt_symbol == ccxt_symbol and cfg.enabled:
                 sym_config = cfg
                 break
-
-        if not sym_config:
+        if sym_config is None:
             return
 
-        sym_state = self.state.symbols.get(ccxt_symbol)
-        if not sym_state:
+        # 忙碌時跳過本 tick（ticker 高頻，排隊只會積壓過期決策）
+        lock = self._symbol_lock(ccxt_symbol)
+        if lock.locked():
             return
+        async with lock:
+            await self._grid_step(ccxt_symbol, sym_config)
 
+    async def _grid_step(self, ccxt_symbol: str, sym_config: SymbolConfig):
+        sym_state = self.state.symbols[ccxt_symbol]
         price = sym_state.latest_price
         if price <= 0:
             return
