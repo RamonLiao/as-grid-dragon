@@ -108,3 +108,50 @@ class TestAsyncOrderPath:
         bot.exchange.create_order = MagicMock(side_effect=RuntimeError("boom"))
         assert await bot.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0) is None
         assert bot._order_fail_counts["BNB/USDC:USDC"] == 1
+
+
+def _make_synced_bot():
+    from grid_engine.config import SymbolConfig
+    cfg = GlobalConfig()
+    sym_cfg = SymbolConfig(symbol="BNBUSDC")
+    sym_cfg.enabled = True
+    cfg.symbols["BNBUSDC"] = sym_cfg
+    bot = MaxGridBot(cfg)
+    bot.exchange = MagicMock()
+    bot.exchange.fetch_positions.return_value = []
+    bot.exchange.fetch_open_orders.return_value = []
+    bot.exchange.fetch_balance.return_value = {"info": {"assets": []}, "total": {}, "free": {}}
+    bot.funding_manager = None
+    return bot
+
+
+class TestAsyncSync:
+    @pytest.mark.asyncio
+    async def test_sync_all_offloads_fetches(self):
+        bot = _make_synced_bot()
+        threads = set()
+
+        def rec(*a, **kw):
+            threads.add(threading.current_thread().name)
+            return []
+
+        bot.exchange.fetch_positions = rec
+        bot.exchange.fetch_open_orders = rec
+        bot.exchange.fetch_balance = MagicMock(
+            side_effect=lambda *a, **kw: (threads.add(threading.current_thread().name),
+                                          {"info": {"assets": []}, "total": {}, "free": {}})[1])
+        await bot.sync_all()
+        assert threads and all(t.startswith("ccxt-rest") for t in threads)
+
+    @pytest.mark.asyncio
+    async def test_sync_orders_applies_counts(self):
+        """回歸：async 化後掛單計數彙總邏輯不變。"""
+        bot = _make_synced_bot()
+        sym = list(bot.state.symbols)[0]
+        bot.exchange.fetch_open_orders.return_value = [
+            {"side": "buy", "info": {"origQty": "2", "positionSide": "LONG"}},
+            {"side": "sell", "info": {"origQty": "3", "positionSide": "LONG"}},
+        ]
+        await bot._sync_orders()
+        st = bot.state.symbols[sym]
+        assert st.buy_long_orders == 2 and st.sell_long_orders == 3

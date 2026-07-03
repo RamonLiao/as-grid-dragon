@@ -160,86 +160,85 @@ class MaxGridBot:
         response = self.exchange.fapiPrivatePostListenKey()
         return response.get("listenKey")
 
-    def sync_all(self):
-        self._sync_positions()
-        self._sync_orders()
-        self._sync_account()
-        self._sync_funding_rates()
+    async def sync_all(self):
+        await self._sync_positions()
+        await self._sync_orders()
+        await self._sync_account()
+        await self._sync_funding_rates()
 
-    def _sync_funding_rates(self):
+    async def _sync_funding_rates(self):
         """同步所有交易對的 funding rate"""
         if not self.funding_manager:
             return
 
         for sym_config in self.config.symbols.values():
             if sym_config.enabled:
-                rate = self.funding_manager.update_funding_rate(sym_config.ccxt_symbol)
+                rate = await self._rest(self.funding_manager.update_funding_rate, sym_config.ccxt_symbol)
                 sym_state = self.state.symbols.get(sym_config.ccxt_symbol)
                 if sym_state:
                     sym_state.current_funding_rate = rate
 
-    def _sync_positions(self):
+    async def _sync_positions(self):
         try:
-            positions = self.exchange.fetch_positions(params={'type': 'future'})
-
-            for sym_state in self.state.symbols.values():
-                sym_state.long_position = 0
-                sym_state.short_position = 0
-                sym_state.unrealized_pnl = 0
-
-            for pos in positions:
-                symbol = pos['symbol']
-                if symbol in self.state.symbols:
-                    contracts = pos.get('contracts', 0)
-                    side = pos.get('side')
-                    pnl = float(pos.get('unrealizedPnl', 0) or 0)
-
-                    if side == 'long':
-                        self.state.symbols[symbol].long_position = contracts
-                    elif side == 'short':
-                        self.state.symbols[symbol].short_position = abs(contracts)
-
-                    self.state.symbols[symbol].unrealized_pnl += pnl
-
+            positions = await self._rest(self.exchange.fetch_positions, params={'type': 'future'})
         except Exception as e:
             logger.error(f"同步持倉失敗: {e}")
+            return
 
-    def _sync_orders(self):
+        agg = {s: [0.0, 0.0, 0.0] for s in self.state.symbols}  # long, short, upnl
+        for pos in positions:
+            symbol = pos['symbol']
+            if symbol in agg:
+                contracts = pos.get('contracts', 0)
+                side = pos.get('side')
+                pnl = float(pos.get('unrealizedPnl', 0) or 0)
+                if side == 'long':
+                    agg[symbol][0] = contracts
+                elif side == 'short':
+                    agg[symbol][1] = abs(contracts)
+                agg[symbol][2] += pnl
+
+        for symbol, (long_pos, short_pos, upnl) in agg.items():
+            # 原子 apply：無 await（Task 4 在此加 symbol lock）
+            st = self.state.symbols[symbol]
+            st.long_position = long_pos
+            st.short_position = short_pos
+            st.unrealized_pnl = upnl
+
+    async def _sync_orders(self):
         for sym_config in self.config.symbols.values():
             if not sym_config.enabled:
                 continue
             symbol = sym_config.ccxt_symbol
 
             try:
-                orders = self.exchange.fetch_open_orders(symbol=symbol)
+                orders = await self._rest(self.exchange.fetch_open_orders, symbol=symbol)
                 state = self.state.symbols.get(symbol)
                 if not state:
                     continue
 
-                state.buy_long_orders = 0
-                state.sell_long_orders = 0
-                state.buy_short_orders = 0
-                state.sell_short_orders = 0
-
+                counts = [0.0, 0.0, 0.0, 0.0]  # buy_long, sell_long, buy_short, sell_short
                 for order in orders:
                     qty = abs(float(order.get('info', {}).get('origQty', 0)))
                     side = order.get('side')
                     pos_side = order.get('info', {}).get('positionSide')
-
                     if side == 'buy' and pos_side == 'LONG':
-                        state.buy_long_orders += qty
+                        counts[0] += qty
                     elif side == 'sell' and pos_side == 'LONG':
-                        state.sell_long_orders += qty
+                        counts[1] += qty
                     elif side == 'buy' and pos_side == 'SHORT':
-                        state.buy_short_orders += qty
+                        counts[2] += qty
                     elif side == 'sell' and pos_side == 'SHORT':
-                        state.sell_short_orders += qty
+                        counts[3] += qty
+                # 原子 apply（Task 4 在此加 symbol lock）
+                state.buy_long_orders, state.sell_long_orders, \
+                    state.buy_short_orders, state.sell_short_orders = counts
             except Exception as e:
                 logger.error(f"同步 {symbol} 掛單失敗: {e}")
 
-    def _sync_account(self):
+    async def _sync_account(self):
         try:
-            balance = self.exchange.fetch_balance({'type': 'future'})
+            balance = await self._rest(self.exchange.fetch_balance, {'type': 'future'})
 
             # ccxt 頂層 total=marginBalance(已含浮盈)、free=availableBalance、used=initialMargin，
             # 語意對不上面板欄位，且 equity 公式會重複加浮盈。改從 info.assets 取幣安原值。
@@ -273,11 +272,7 @@ class MaxGridBot:
             if self.notifier.enabled:
                 asyncio.create_task(self._check_risk_and_notify())
 
-            try:
-                asyncio.get_running_loop()
-                asyncio.create_task(self._check_trailing_stop())
-            except RuntimeError:
-                pass  # 無 event loop（同步測試環境）時跳過
+            await self._check_trailing_stop()
         except Exception as e:
             logger.error(f"同步帳戶失敗: {e}")
 
@@ -780,7 +775,7 @@ class MaxGridBot:
                 break
 
         if time.time() - self.last_sync_time > self.config.sync_interval:
-            self.sync_all()
+            await self.sync_all()
             self.last_sync_time = time.time()
 
     async def _handle_account_update(self, data: dict):
@@ -957,8 +952,8 @@ class MaxGridBot:
             try:
                 await asyncio.sleep(1800)
                 if not self._stop_event.is_set():
-                    self.exchange.fapiPrivatePutListenKey()
-                    self.listen_key = self._get_listen_key()
+                    await self._rest(self.exchange.fapiPrivatePutListenKey)
+                    self.listen_key = await self._rest(self._get_listen_key)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1026,14 +1021,15 @@ class MaxGridBot:
 
     async def run(self):
         try:
-            self._init_exchange()
-            self._check_hedge_mode()
-            self.listen_key = self._get_listen_key()
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(self._rest_executor, self._init_exchange)
+            await loop.run_in_executor(self._rest_executor, self._check_hedge_mode)
+            self.listen_key = await self._rest(self._get_listen_key)
 
             self.state.running = True
             self.state.start_time = datetime.now()
 
-            self.sync_all()
+            await self.sync_all()
         except Exception as e:
             logger.error(f"[MAX] 初始化失敗: {e}")
             await self.notifier.notify_crash(f"初始化失敗: {e}")
