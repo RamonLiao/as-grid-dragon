@@ -273,11 +273,15 @@ class MaxGridBot:
             if self.notifier.enabled:
                 asyncio.create_task(self._check_risk_and_notify())
 
-            self._check_trailing_stop()
+            try:
+                asyncio.get_running_loop()
+                asyncio.create_task(self._check_trailing_stop())
+            except RuntimeError:
+                pass  # 無 event loop（同步測試環境）時跳過
         except Exception as e:
             logger.error(f"同步帳戶失敗: {e}")
 
-    def _check_trailing_stop(self):
+    async def _check_trailing_stop(self):
         """保證金追蹤止盈邏輯"""
         risk = self.config.risk
 
@@ -313,7 +317,7 @@ class MaxGridBot:
 
                 if drawdown >= trigger and peak > 0:
                     logger.info(f"[追蹤止盈] {sym_config.symbol} 觸發! 最高:{peak:.2f}, 當前:{current_pnl:.2f}, 回撤:{drawdown:.2f}")
-                    self._close_symbol_positions(ccxt_symbol, sym_config)
+                    await self._close_symbol_positions(ccxt_symbol, sym_config)
                     self.state.trailing_active[ccxt_symbol] = False
                     self.state.peak_pnl[ccxt_symbol] = 0
 
@@ -323,25 +327,25 @@ class MaxGridBot:
                     self.state.peak_pnl[ccxt_symbol] = current_pnl
                     logger.info(f"[追蹤止盈] {sym_config.symbol} 開始追蹤! 浮盈: {current_pnl:.2f}U")
 
-    def _close_symbol_positions(self, ccxt_symbol: str, sym_config: SymbolConfig):
+    async def _close_symbol_positions(self, ccxt_symbol: str, sym_config: SymbolConfig):
         """平倉指定交易對"""
         try:
             sym_state = self.state.symbols.get(ccxt_symbol)
             if not sym_state:
                 return
 
-            self.cancel_orders_for_side(ccxt_symbol, 'long')
-            self.cancel_orders_for_side(ccxt_symbol, 'short')
+            await self.cancel_orders_for_side(ccxt_symbol, 'long')
+            await self.cancel_orders_for_side(ccxt_symbol, 'short')
 
             if sym_state.long_position > 0:
-                self.place_order(
+                await self.place_order(
                     ccxt_symbol, 'sell', 0, sym_state.long_position,
                     reduce_only=True, position_side='long', order_type='market'
                 )
                 logger.info(f"[追蹤止盈] {sym_config.symbol} 市價平多 {sym_state.long_position}")
 
             if sym_state.short_position > 0:
-                self.place_order(
+                await self.place_order(
                     ccxt_symbol, 'buy', 0, sym_state.short_position,
                     reduce_only=True, position_side='short', order_type='market'
                 )
@@ -350,9 +354,12 @@ class MaxGridBot:
         except Exception as e:
             logger.error(f"[追蹤止盈] {sym_config.symbol} 平倉失敗: {e}")
 
-    def place_order(self, symbol: str, side: str, price: float, quantity: float,
+    async def place_order(self, symbol: str, side: str, price: float, quantity: float,
                     reduce_only: bool = False, position_side: str = None,
                     order_type: str = 'limit'):
+        # 停機後不再送單（executor 已排入的由 shutdown(cancel_futures) 收掉）
+        if self._stop_event.is_set():
+            return None
         # 退避封鎖只擋開倉單；reduce_only（止盈/平倉）永遠放行
         if not reduce_only and time.time() < self._order_block_until.get(symbol, 0):
             return None
@@ -373,9 +380,9 @@ class MaxGridBot:
                 params['positionSide'] = position_side.upper()
 
             if order_type == 'market':
-                result = self.exchange.create_order(symbol, 'market', side, quantity, params=params)
+                result = await self._rest(self.exchange.create_order, symbol, 'market', side, quantity, params=params)
             else:
-                result = self.exchange.create_order(symbol, 'limit', side, quantity, price, params=params)
+                result = await self._rest(self.exchange.create_order, symbol, 'limit', side, quantity, price, params=params)
             # 只有開倉單成功才重置退避 — 有倉位時 TP(reduce_only) 成功與補倉失敗
             # 每輪交錯，若 TP 成功也重置，連續失敗永遠數不到斷路閾值
             if not reduce_only:
@@ -409,9 +416,9 @@ class MaxGridBot:
         self._order_block_until[symbol] = time.time() + block
         logger.error(f"下單失敗 {symbol} (連續{n}次, 暫停開倉{block:.0f}s): {error}")
 
-    def cancel_orders_for_side(self, symbol: str, position_side: str):
+    async def cancel_orders_for_side(self, symbol: str, position_side: str):
         try:
-            orders = self.exchange.fetch_open_orders(symbol)
+            orders = await self._rest(self.exchange.fetch_open_orders, symbol)
             for order in orders:
                 order_side = order.get('side')
                 order_pos_side = order.get('info', {}).get('positionSide', 'BOTH')
@@ -428,7 +435,7 @@ class MaxGridBot:
                         should_cancel = True
 
                 if should_cancel:
-                    self.exchange.cancel_order(order['id'], symbol)
+                    await self._rest(self.exchange.cancel_order, order['id'], symbol)
         except Exception as e:
             logger.error(f"撤單失敗 {symbol}: {e}")
 
@@ -541,7 +548,7 @@ class MaxGridBot:
 
         return max(sym_config.initial_quantity * 0.5, base_qty)
 
-    def _check_and_reduce_positions(self, sym_config: SymbolConfig, sym_state: SymbolState):
+    async def _check_and_reduce_positions(self, sym_config: SymbolConfig, sym_state: SymbolState):
         """檢查並減倉"""
         REDUCE_COOLDOWN = 60
 
@@ -557,11 +564,11 @@ class MaxGridBot:
             logger.info(f"[風控] {sym_config.symbol} 多空持倉均超過 {local_threshold}，開始雙向減倉")
 
             if sym_state.long_position > 0:
-                self.place_order(ccxt_symbol, 'sell', 0, reduce_qty, True, 'long', 'market')
+                await self.place_order(ccxt_symbol, 'sell', 0, reduce_qty, True, 'long', 'market')
                 logger.info(f"[風控] {sym_config.symbol} 市價平多 {reduce_qty}")
 
             if sym_state.short_position > 0:
-                self.place_order(ccxt_symbol, 'buy', 0, reduce_qty, True, 'short', 'market')
+                await self.place_order(ccxt_symbol, 'buy', 0, reduce_qty, True, 'short', 'market')
                 logger.info(f"[風控] {sym_config.symbol} 市價平空 {reduce_qty}")
 
             self.state.last_reduce_time[ccxt_symbol] = time.time()
@@ -639,7 +646,7 @@ class MaxGridBot:
         sym_state.dynamic_take_profit = sym_config.take_profit_spacing
         sym_state.dynamic_grid_spacing = sym_config.grid_spacing
 
-        self._check_and_reduce_positions(sym_config, sym_state)
+        await self._check_and_reduce_positions(sym_config, sym_state)
 
         # 封鎖期內開倉單必被跳過，無倉位分支撤了單也補不回來 — 直接不動作
         order_blocked = time.time() < self._order_block_until.get(ccxt_symbol, 0)
@@ -648,9 +655,9 @@ class MaxGridBot:
         if sym_state.long_position == 0:
             if not order_blocked and \
                     time.time() - self.last_order_times.get(f"{ccxt_symbol}_long", 0) > 10:
-                self.cancel_orders_for_side(ccxt_symbol, 'long')
+                await self.cancel_orders_for_side(ccxt_symbol, 'long')
                 qty = self._get_adjusted_quantity(sym_config, sym_state, 'long', False)
-                self.place_order(ccxt_symbol, 'buy', sym_state.best_bid, qty, False, 'long')
+                await self.place_order(ccxt_symbol, 'buy', sym_state.best_bid, qty, False, 'long')
                 self.last_order_times[f"{ccxt_symbol}_long"] = time.time()
                 sym_state.last_grid_price_long = price
         else:
@@ -664,9 +671,9 @@ class MaxGridBot:
         if sym_state.short_position == 0:
             if not order_blocked and \
                     time.time() - self.last_order_times.get(f"{ccxt_symbol}_short", 0) > 10:
-                self.cancel_orders_for_side(ccxt_symbol, 'short')
+                await self.cancel_orders_for_side(ccxt_symbol, 'short')
                 qty = self._get_adjusted_quantity(sym_config, sym_state, 'short', False)
-                self.place_order(ccxt_symbol, 'sell', sym_state.best_ask, qty, False, 'short')
+                await self.place_order(ccxt_symbol, 'sell', sym_state.best_ask, qty, False, 'short')
                 self.last_order_times[f"{ccxt_symbol}_short"] = time.time()
                 sym_state.last_grid_price_short = price
         else:
@@ -720,9 +727,9 @@ class MaxGridBot:
                 )
 
                 if side == 'long':
-                    self.place_order(ccxt_symbol, 'sell', special_price, tp_qty, True, 'long')
+                    await self.place_order(ccxt_symbol, 'sell', special_price, tp_qty, True, 'long')
                 else:
-                    self.place_order(ccxt_symbol, 'buy', special_price, tp_qty, True, 'short')
+                    await self.place_order(ccxt_symbol, 'buy', special_price, tp_qty, True, 'short')
                 logger.info(f"[MAX] {sym_config.symbol} {side}頭裝死止盈@{special_price:.4f}")
         else:
             if dead_mode_flag:
@@ -732,7 +739,7 @@ class MaxGridBot:
                     sym_state.short_dead_mode = False
                 logger.info(f"[MAX] {sym_config.symbol} {side}頭離開裝死模式")
 
-            self.cancel_orders_for_side(ccxt_symbol, side)
+            await self.cancel_orders_for_side(ccxt_symbol, side)
 
             tp_price, entry_price = GridStrategy.calculate_grid_prices(
                 price, take_profit_spacing, grid_spacing, side
@@ -740,12 +747,12 @@ class MaxGridBot:
 
             if side == 'long':
                 if sym_state.long_position > 0:
-                    self.place_order(ccxt_symbol, 'sell', tp_price, tp_qty, True, 'long')
-                self.place_order(ccxt_symbol, 'buy', entry_price, base_qty, False, 'long')
+                    await self.place_order(ccxt_symbol, 'sell', tp_price, tp_qty, True, 'long')
+                await self.place_order(ccxt_symbol, 'buy', entry_price, base_qty, False, 'long')
             else:
                 if sym_state.short_position > 0:
-                    self.place_order(ccxt_symbol, 'buy', tp_price, tp_qty, True, 'short')
-                self.place_order(ccxt_symbol, 'sell', entry_price, base_qty, False, 'short')
+                    await self.place_order(ccxt_symbol, 'buy', tp_price, tp_qty, True, 'short')
+                await self.place_order(ccxt_symbol, 'sell', entry_price, base_qty, False, 'short')
 
             logger.info(f"[MAX] {sym_config.symbol} {side}頭 止盈@{tp_price:.4f}({tp_qty:.1f}) "
                        f"補倉@{entry_price:.4f}({base_qty:.1f}) [TP:{take_profit_spacing*100:.2f}%/GS:{grid_spacing*100:.2f}%]")

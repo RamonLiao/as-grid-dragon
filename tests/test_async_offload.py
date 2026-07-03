@@ -74,3 +74,37 @@ class TestRestHelper:
 
         with pytest.raises(ValueError):
             await bot._rest(boom)
+
+
+class TestAsyncOrderPath:
+    @pytest.mark.asyncio
+    async def test_place_order_goes_through_executor(self):
+        """create_order 必須在 executor thread 執行，不在 event loop thread。"""
+        bot = _make_bot()
+        seen = {}
+
+        def fake_create(*a, **kw):
+            seen["thread"] = threading.current_thread().name
+            return {"id": "1"}
+
+        bot.exchange.create_order = fake_create
+        bot.precisions["BNB/USDC:USDC"] = {"price": 2, "amount": 1, "min_amount": 0.1}
+        result = await bot.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0)
+        assert result == {"id": "1"}
+        assert seen["thread"].startswith("ccxt-rest")
+
+    @pytest.mark.asyncio
+    async def test_place_order_skipped_after_stop(self):
+        """停機後 place_order 直接 return None，不打 exchange。"""
+        bot = _make_bot()
+        bot._stop_event.set()
+        assert await bot.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0) is None
+        bot.exchange.create_order.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_order_failure_still_backs_off(self):
+        """回歸：executor 內拋例外 → 退避計數照常累加。"""
+        bot = _make_bot()
+        bot.exchange.create_order = MagicMock(side_effect=RuntimeError("boom"))
+        assert await bot.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0) is None
+        assert bot._order_fail_counts["BNB/USDC:USDC"] == 1
