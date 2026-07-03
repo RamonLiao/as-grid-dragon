@@ -282,3 +282,12 @@ class TestMonkey:
         assert (await bot.place_order(sym, "buy", 600.0, 1.0)) is None
         assert bot.exchange.create_order.call_count == calls_after_stop
 
+    @pytest.mark.asyncio
+    async def test_run_init_failure_shuts_down_executor(self):
+        """回歸：run() 初始化失敗 early-return 前必須 shutdown executor，否則長駐 app 每次失敗啟動洩漏一條 thread。"""
+        bot = _make_bot()
+        bot._init_exchange = MagicMock(side_effect=RuntimeError("boom"))
+        await bot.run()
+        with pytest.raises(RuntimeError):
+            bot._rest_executor.submit(lambda: None)
+

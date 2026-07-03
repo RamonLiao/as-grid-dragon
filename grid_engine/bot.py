@@ -1051,6 +1051,7 @@ class MaxGridBot:
             logger.error(f"[MAX] 初始化失敗: {e}")
             await self.notifier.notify_crash(f"初始化失敗: {e}")
             self.state.running = False
+            self._rest_executor.shutdown(wait=False, cancel_futures=True)
             return
 
         self.tasks = [
