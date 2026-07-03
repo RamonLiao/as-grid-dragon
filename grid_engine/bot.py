@@ -7,7 +7,9 @@ import json
 import math
 import ssl
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from functools import partial
 from typing import Optional, List, Dict, Tuple
 
 import ccxt
@@ -87,6 +89,9 @@ class MaxGridBot:
         self._order_block_until: Dict[str, float] = {}
         self._order_seq = 0
 
+        # REST 卸載：單 worker 序列化（同步 ccxt 實例非 thread-safe）
+        self._rest_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ccxt-rest")
+
         # MAX 增強模組
         self.funding_manager: Optional[FundingRateManager] = None
         self.glft_controller = GLFTController()
@@ -145,6 +150,11 @@ class MaxGridBot:
                         break
                 except Exception:
                     pass
+
+    async def _rest(self, fn, *args, **kwargs):
+        """在專用單 worker thread 執行同步 REST 呼叫，不阻塞 event loop"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._rest_executor, partial(fn, *args, **kwargs))
 
     def _get_listen_key(self) -> str:
         response = self.exchange.fapiPrivatePostListenKey()
@@ -1064,3 +1074,6 @@ class MaxGridBot:
                 await task
             except asyncio.CancelledError:
                 pass
+
+        # 排隊中的 REST 直接取消；in-flight 的自然結束，place_order 入口的停機檢查擋住後續
+        self._rest_executor.shutdown(wait=False, cancel_futures=True)
