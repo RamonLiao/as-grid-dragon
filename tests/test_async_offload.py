@@ -222,3 +222,63 @@ class TestConcurrencyLocks:
         await sync_task
         assert st.buy_long_orders == 0  # 釋放後才 apply
 
+
+class TestMonkey:
+    @pytest.mark.asyncio
+    async def test_ticker_storm_50_concurrent(self):
+        """50 個並發 adjust_grid + 3 個 sync_all 同時轟：不死鎖、不炸例外。"""
+        bot = _make_synced_bot()
+        sym = list(bot.state.symbols)[0]
+        st = bot.state.symbols[sym]
+        st.latest_price = st.best_bid = st.best_ask = 600.0
+        bot.exchange.create_order.return_value = {"id": "1"}
+        await asyncio.wait_for(
+            asyncio.gather(
+                *[bot.adjust_grid(sym) for _ in range(50)],
+                bot.sync_all(), bot.sync_all(), bot.sync_all(),
+            ),
+            timeout=10,
+        )
+        assert not bot._symbol_lock(sym).locked()
+        assert not bot._sync_lock.locked()
+
+    @pytest.mark.asyncio
+    async def test_rest_exception_storm_releases_all_locks(self):
+        """每個 REST 都炸：鎖不得洩漏，之後仍可正常進入。"""
+        bot = _make_synced_bot()
+        sym = list(bot.state.symbols)[0]
+        st = bot.state.symbols[sym]
+        st.latest_price = st.best_bid = st.best_ask = 600.0
+        for m in ("fetch_positions", "fetch_open_orders", "fetch_balance",
+                  "create_order", "cancel_order"):
+            setattr(bot.exchange, m, MagicMock(side_effect=RuntimeError("boom")))
+        await asyncio.gather(
+            *[bot.adjust_grid(sym) for _ in range(10)],
+            bot.sync_all(),
+            return_exceptions=True,
+        )
+        assert not bot._symbol_lock(sym).locked()
+        assert not bot._sync_lock.locked()
+        # 復原後可再進入
+        bot.exchange.fetch_positions = MagicMock(return_value=[])
+        bot.exchange.fetch_open_orders = MagicMock(return_value=[])
+        bot.exchange.fetch_balance = MagicMock(
+            return_value={"info": {"assets": []}, "total": {}, "free": {}})
+        await bot.sync_all()
+
+    @pytest.mark.asyncio
+    async def test_stop_mid_flight(self):
+        """REST in-flight 時 stop：不掛死、事後不再送單。"""
+        bot = _make_synced_bot()
+        bot.exchange.create_order = MagicMock(
+            side_effect=lambda *a, **kw: (_time.sleep(0.2), {"id": "1"})[1])
+        bot.precisions[list(bot.state.symbols)[0]] = {"price": 2, "amount": 1, "min_amount": 0.1}
+        sym = list(bot.state.symbols)[0]
+        order_task = asyncio.create_task(bot.place_order(sym, "buy", 600.0, 1.0))
+        await asyncio.sleep(0.05)
+        await asyncio.wait_for(bot.stop(), timeout=5)
+        await asyncio.wait_for(order_task, timeout=5)
+        calls_after_stop = bot.exchange.create_order.call_count
+        assert (await bot.place_order(sym, "buy", 600.0, 1.0)) is None
+        assert bot.exchange.create_order.call_count == calls_after_stop
+
