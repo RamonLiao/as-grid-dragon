@@ -3,6 +3,7 @@
 """
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Dict
 
@@ -112,6 +113,7 @@ class GlobalConfig:
     api_url_override: str = ""           # 手動覆蓋 REST API URL (e.g. Bybit demo)
     websocket_url: str = "wss://fstream.binance.com/ws"
     sync_interval: float = 10.0
+    position_adjust_cooldown: float = 5.0  # 有倉位時網格重掛最小間隔（秒），0 = 關閉
     symbols: Dict[str, SymbolConfig] = field(default_factory=dict)
     risk: RiskConfig = field(default_factory=RiskConfig)
     max_enhancement: MaxEnhancement = field(default_factory=MaxEnhancement)
@@ -136,6 +138,7 @@ class GlobalConfig:
             "api_url_override": self.api_url_override,
             "websocket_url": self.websocket_url,
             "sync_interval": self.sync_interval,
+            "position_adjust_cooldown": self.position_adjust_cooldown,
             "symbols": {k: v.to_dict() for k, v in self.symbols.items()},
             "risk": self.risk.to_dict(),
             "max_enhancement": self.max_enhancement.to_dict(),
@@ -168,6 +171,15 @@ class GlobalConfig:
             return 300
         return cooldown if cooldown > 0 else 300
 
+    @staticmethod
+    def _parse_position_adjust_cooldown(value) -> float:
+        """正規化有倉位重掛冷卻秒數，非法/負值 fallback 到 5.0（0 為合法關閉值）"""
+        try:
+            cooldown = float(value)
+        except (TypeError, ValueError):
+            return 5.0
+        return cooldown if math.isfinite(cooldown) and cooldown >= 0 else 5.0
+
     @classmethod
     def from_dict(cls, data: dict) -> 'GlobalConfig':
         config = cls(
@@ -179,6 +191,8 @@ class GlobalConfig:
             api_url_override=data.get("api_url_override", ""),
             websocket_url=data.get("websocket_url", "wss://fstream.binance.com/ws"),
             sync_interval=data.get("sync_interval", 10.0),
+            position_adjust_cooldown=cls._parse_position_adjust_cooldown(
+                data.get("position_adjust_cooldown", 5.0)),
             legacy_api_detected=False,
             telegram_bot_token=data.get("telegram_bot_token", ""),
             telegram_chat_id=data.get("telegram_chat_id", ""),
