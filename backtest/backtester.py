@@ -29,13 +29,19 @@ from backtest.costs import apply_slippage, funding_charge
 # 回測保真限制（樂觀成交模型，與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
     "回測保真限制: "
-    "(1) 樂觀成交——限價單以當根收盤價成交、無 queue/部分成交佇列、無滑價; "
+    "(1) 樂觀成交——限價單以當根收盤價成交、無 queue/部分成交佇列; "
     "(2) flat-entry 近似——零倉位 bootstrap 沿用收盤價觸發即進場; "
-    "(3) K 線粒度不足——leading/ATR/funding/GLFT 增強於回測退化為中性(全關); "
+    "(3) leading/ATR/GLFT 增強於回測退化為中性(全關); "
     "(4) Bandit 參數優化不在回測 loop 內重現; "
-    "(5) 決策同源實盤 decide()，但實盤每 10s 追價重掛(pos==0)於回測以 should_adjust 偏離門檻近似; "
-    "(6) 進場量語意變更——舊回測用固定名目(order_value/price，幣量隨價反比)，新版改固定幣量"
-    "(=initial_quantity，同實盤下單)，故舊/新 equity 曲線不可直接比較。"
+    "(5) 決策同源實盤 decide()，實盤每 10s 追價重掛(pos==0)於回測以 should_adjust 偏離門檻近似; "
+    "(6) 進場量語意=固定幣量(=initial_quantity，同實盤下單)，舊/新 equity 曲線不可直接比較; "
+    "(7) 成本模型(主路徑)——slippage_bps 執行成本 haircut(逆選擇代理，非訂單簿滑價；"
+    "網格 maker 單實際成交價≤掛單價，此 bps 當保守緩衝) + funding 現金流結算"
+    "(真實歷史 settlement 時點，缺漏時點 rate=0；notional 用 bar close 當 mark price 代理"
+    "；funding 快取按 symbol 不按區間，同 symbol 更寬回測區間需先刪 data/funding/<symbol>.csv 重抓，否則尾段缺漏 rate=0); "
+    "(8) 保守堆疊——fee_pct 預設 0.04%(taker)已對 maker 網格偏保守，疊 slippage haircut → "
+    "回測績效偏低估、屬刻意保守下界; "
+    "(9) legacy 路徑(initial_quantity<=0)不含成本模型。"
 )
 
 
@@ -96,6 +102,7 @@ class BacktestResult:
     trade_history: List[Trade] = field(default_factory=list)
     equity_curve: List[Tuple] = field(default_factory=list)
     notes: str = ""  # 保真限制 / 已知差異說明
+    funding_paid: float = 0.0  # funding 現金流總額（正=淨付出），不計入 trades
 
     def to_dict(self) -> dict:
         """轉換為字典"""
@@ -110,7 +117,8 @@ class BacktestResult:
             "win_rate": self.win_rate,
             "profit_factor": self.profit_factor,
             "sharpe_ratio": self.sharpe_ratio,
-            "direction": self.direction
+            "direction": self.direction,
+            "funding_paid": self.funding_paid,
         }
 
     def __str__(self) -> str:
@@ -138,16 +146,18 @@ class GridBacktester:
     - 止盈加倍機制
     """
 
-    def __init__(self, df: pd.DataFrame, config: Config):
+    def __init__(self, df: pd.DataFrame, config: Config, funding_map=None):
         """
         初始化回測器
 
         Args:
             df: K線數據 DataFrame (需含 open_time, open, high, low, close, volume)
             config: 回測配置
+            funding_map: {epoch_sec: rate} funding settlement 對照表，None 則嘗試從 DataLoader 讀取
         """
         self.df = df.reset_index(drop=True)
         self.config = config
+        self.funding_map = funding_map
 
         # 網格設定
         self.long_settings = config.long_settings
@@ -537,6 +547,27 @@ class GridBacktester:
         bundle = self._build_bundle()
 
         balance = cfg.initial_balance
+        funding_paid = 0.0
+        # funding settlements：(epoch_sec, rate) 排序；pointer 掃過已結算的
+        settlements = []
+        if cfg.funding_enabled:
+            fmap = self.funding_map
+            if fmap is None:
+                try:
+                    from .data_loader import DataLoader
+                    fmap = DataLoader().load_funding(
+                        sym, self.df["open_time"].iloc[0], self.df["open_time"].iloc[-1])
+                except Exception:
+                    fmap = {}
+            settlements = sorted((int(k), float(v)) for k, v in fmap.items())
+        fund_i = 0
+        first_epoch = (self.df["open_time"].iloc[0].timestamp()
+                       if len(self.df) and hasattr(self.df["open_time"].iloc[0], "timestamp")
+                       else 0.0)
+        # 略過回測起點之前的 settlement（不對開跑前的時間收費）
+        while fund_i < len(settlements) and settlements[fund_i][0] < first_epoch:
+            fund_i += 1
+
         max_equity = balance
         long_positions: list = []
         short_positions: list = []
@@ -623,6 +654,18 @@ class GridBacktester:
                 for side in ("long", "short"):
                     if cfg.direction in (side, "both"):
                         _settle(side, price, timestamp)
+
+                # funding 現金流結算：掃過所有 <= 本根 epoch 的 settlement（data-driven，非 8h 網格）
+                if settlements and epoch > 0:
+                    while fund_i < len(settlements) and settlements[fund_i][0] <= epoch:
+                        rate = settlements[fund_i][1]
+                        for fside, fpos in (("long", long_positions), ("short", short_positions)):
+                            if cfg.direction not in (fside, "both"):
+                                continue
+                            charge = funding_charge(fpos, rate, fside, price)
+                            balance -= charge
+                            funding_paid += charge
+                        fund_i += 1
 
                 # 組決策輸入（pending 狀態驅動 buy/sell_orders）→ decide()
                 long_pos = sum(p["qty"] for p in long_positions)
@@ -729,6 +772,7 @@ class GridBacktester:
             trade_history=[],  # 簡化版不記錄詳細交易歷史
             equity_curve=equity_curve,
             notes=FIDELITY_NOTES,
+            funding_paid=funding_paid,
         )
 
     def _run_legacy_mode(self) -> BacktestResult:
