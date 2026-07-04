@@ -117,5 +117,10 @@ def load_bandit_state(bandit, path: str, max_age_sec: Optional[float] = None) ->
     except Exception as e:
         logger.warning("[Bandit] 套用狀態失敗（資料損毀），冷啟動: %s", e)
         return False
+    # load_state 對 pull_counts 是整表取代（非 merge），部分/空 pull_counts
+    # 會讓後續 select_arm() 對缺失 index 做 self.pull_counts[i] → KeyError 炸 async 交易迴圈。
+    # 補齊為 0（select_arm 的 cold-start 分支會優先探索 pull=0 的 arm），確保永不 KeyError。
+    for i in range(len(bandit.arms)):
+        bandit.pull_counts.setdefault(i, 0)
     logger.info("[Bandit] 載入狀態 total_pulls=%s", bandit.total_pulls)
     return True

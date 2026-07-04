@@ -269,6 +269,24 @@ def test_empty_state_dict_loads_as_noop(tmp_path):
     b2 = _bandit()
     assert load_bandit_state(b2, path) is True  # 不 crash
     assert b2.total_pulls == 0
+    assert 0 <= b2.select_arm() < len(b2.arms)  # 空 state 載入後 select_arm 不得 raise（pull_counts 需 backfill）
+
+
+def test_partial_pull_counts_no_keyerror(tmp_path):
+    """pull_counts 只剩部分 arm key（部分寫入/損毀但仍合法 JSON）時，
+    load_state 整表取代 pull_counts → 後續 select_arm() 對缺失 index KeyError 炸 async 迴圈。
+    persistence 層須 backfill 缺失 index 為 0。"""
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["state"]["pull_counts"] = {"0": 3}     # 只保留單一 arm key
+    (tmp_path / "s.json").write_text(json.dumps(env))
+
+    b2 = _bandit()
+    assert load_bandit_state(b2, path) is True
+    assert 0 <= b2.select_arm() < len(b2.arms)          # 不得 KeyError
+    assert set(b2.pull_counts) >= set(range(len(b2.arms)))  # 涵蓋所有 arm index
 
 
 def test_truncated_json_cold_starts(tmp_path):
