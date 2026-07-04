@@ -1,0 +1,47 @@
+"""決策日誌重放：用同一 decide() 逐筆重放實盤落地的 inputs，比對 decision。
+零 diff = 快照捕捉完整（實盤 execute 與純層一致）。上線 ≥24h 零 diff 為 #4 最終驗收。"""
+import json
+import dataclasses
+
+from .decision import DecisionInputs, EnhancementSnapshot, decide
+
+
+def load_records(path):
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def _rebuild_inputs(inp: dict) -> DecisionInputs:
+    enh = EnhancementSnapshot(**{**inp["enh"],
+                                 "leading_signals": tuple(inp["enh"].get("leading_signals", ()))})
+    fields = {k: v for k, v in inp.items() if k != "enh"}
+    return DecisionInputs(enh=enh, **fields)
+
+
+def _normalize_tuples_to_lists(obj):
+    """遞迴轉換 tuple → list，以匹配 JSON 序列化後的格式。"""
+    if isinstance(obj, dict):
+        return {k: _normalize_tuples_to_lists(v) for k, v in obj.items()}
+    elif isinstance(obj, tuple):
+        return [_normalize_tuples_to_lists(item) for item in obj]
+    elif isinstance(obj, list):
+        return [_normalize_tuples_to_lists(item) for item in obj]
+    else:
+        return obj
+
+
+def replay_record(rec: dict) -> dict:
+    result = dataclasses.asdict(decide(_rebuild_inputs(rec["inputs"])))
+    return _normalize_tuples_to_lists(result)
+
+
+def diff_record(rec: dict):
+    replayed = replay_record(rec)
+    return None if replayed == rec["decision"] else {
+        "symbol": rec.get("symbol"), "expected": rec["decision"], "replayed": replayed}
+
+
+def replay_file(path):
+    recs = load_records(path)
+    diffs = [d for d in (diff_record(r) for r in recs) if d is not None]
+    return len(recs), diffs
