@@ -7,15 +7,49 @@
 - 持倉閾值控制
 - 止盈加倍機制
 """
+import math
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass, field
 from .config import Config
 
-# 從 core.strategy 導入統一的 GridStrategy (避免重複代碼)
-# 路徑設置已在 __init__.py 中處理
-from core.strategy import GridStrategy
+# 決策改吃純層 grid_engine.decision.decide()（實盤與回測同源，移除舊策略模組依賴）。
+from grid_engine import clock
+from grid_engine.decision import (
+    decide, DecisionInputs,
+    is_dead_mode, dead_mode_price, grid_prices, tp_quantity,
+)
+from grid_engine.snapshot import ManagerBundle, build_snapshot
+from grid_engine.enhancements import (
+    DynamicGridManager, LeadingIndicatorManager, GLFTController, MaxEnhancement,
+)
+
+# 回測保真限制（樂觀成交模型，與實盤的已知差異）。寫入 BacktestResult.notes。
+FIDELITY_NOTES = (
+    "回測保真限制: "
+    "(1) 樂觀成交——限價單以當根收盤價成交、無 queue/部分成交佇列、無滑價; "
+    "(2) flat-entry 近似——零倉位 bootstrap 沿用收盤價觸發即進場; "
+    "(3) K 線粒度不足——leading/ATR/funding/GLFT 增強於回測退化為中性(全關); "
+    "(4) Bandit 參數優化不在回測 loop 內重現; "
+    "(5) 決策同源實盤 decide()，但實盤每 10s 追價重掛(pos==0)於回測以 should_adjust 偏離門檻近似; "
+    "(6) 進場量語意變更——舊回測用固定名目(order_value/price，幣量隨價反比)，新版改固定幣量"
+    "(=initial_quantity，同實盤下單)，故舊/新 equity 曲線不可直接比較。"
+)
+
+
+def _legacy_grid_decision(price, my_position, opposite_position, cfg, side, base_qty):
+    """legacy 模式決策：改吃純層 decision helpers（取代已刪的 core strategy get_grid_decision）。
+    回傳與舊 get_grid_decision 相容的 dict。此路徑僅 initial_quantity<=0 時觸發（deprecated）。
+    注意：dead_mode 自訂 fallback 比例不在此重現（config 預設 1.05/0.95 與純層常數一致）。"""
+    dead = getattr(cfg, 'dead_mode_enabled', True) and is_dead_mode(my_position, cfg.position_threshold)
+    tp_qty = tp_quantity(base_qty, my_position, opposite_position,
+                         cfg.position_limit, cfg.position_threshold)
+    if dead:
+        tp_price = dead_mode_price(price, my_position, opposite_position, side)
+        return {"dead_mode": True, "tp_price": tp_price, "entry_price": None, "tp_qty": tp_qty}
+    tp_price, entry_price = grid_prices(price, cfg.take_profit_spacing, cfg.grid_spacing, side)
+    return {"dead_mode": False, "tp_price": tp_price, "entry_price": entry_price, "tp_qty": tp_qty}
 
 
 @dataclass
@@ -60,6 +94,7 @@ class BacktestResult:
     config: Config
     trade_history: List[Trade] = field(default_factory=list)
     equity_curve: List[Tuple] = field(default_factory=list)
+    notes: str = ""  # 保真限制 / 已知差異說明
 
     def to_dict(self) -> dict:
         """轉換為字典"""
@@ -219,21 +254,10 @@ class GridBacktester:
         long_position = sum(pos.quantity for pos in self.long_positions)
         short_position = sum(pos.quantity for pos in self.short_positions)
 
-        # 使用 GridStrategy 獲取決策
-        decision = GridStrategy.get_grid_decision(
-            price=self.last_long_price or price,
-            my_position=long_position,
-            opposite_position=short_position,
-            position_threshold=self.config.position_threshold,
-            position_limit=self.config.position_limit,
-            base_qty=base_qty,
-            take_profit_spacing=self.config.take_profit_spacing,
-            grid_spacing=self.config.grid_spacing,
-            side='long',
-            dead_mode_enabled=getattr(self.config, 'dead_mode_enabled', True),
-            fallback_long=getattr(self.config, 'dead_mode_fallback_long', 1.05),
-            fallback_short=getattr(self.config, 'dead_mode_fallback_short', 0.95)
-        )
+        # 使用純層 decision helpers 獲取決策（取代已刪的舊策略模組）
+        decision = _legacy_grid_decision(
+            self.last_long_price or price, long_position, short_position,
+            self.config, 'long', base_qty)
 
         self.long_dead_mode = decision['dead_mode']
         tp_price = decision['tp_price']
@@ -356,21 +380,10 @@ class GridBacktester:
         long_position = sum(pos.quantity for pos in self.long_positions)
         short_position = sum(pos.quantity for pos in self.short_positions)
 
-        # 使用 GridStrategy 獲取決策
-        decision = GridStrategy.get_grid_decision(
-            price=self.last_short_price or price,
-            my_position=short_position,
-            opposite_position=long_position,
-            position_threshold=self.config.position_threshold,
-            position_limit=self.config.position_limit,
-            base_qty=base_qty,
-            take_profit_spacing=self.config.take_profit_spacing,
-            grid_spacing=self.config.grid_spacing,
-            side='short',
-            dead_mode_enabled=getattr(self.config, 'dead_mode_enabled', True),
-            fallback_long=getattr(self.config, 'dead_mode_fallback_long', 1.05),
-            fallback_short=getattr(self.config, 'dead_mode_fallback_short', 0.95)
-        )
+        # 使用純層 decision helpers 獲取決策（取代已刪的舊策略模組）
+        decision = _legacy_grid_decision(
+            self.last_short_price or price, short_position, long_position,
+            self.config, 'short', base_qty)
 
         self.short_dead_mode = decision['dead_mode']
         tp_price = decision['tp_price']
@@ -490,168 +503,182 @@ class GridBacktester:
         else:
             return self._run_legacy_mode()
 
+    def _build_bundle(self) -> ManagerBundle:
+        """回測用真 manager 實例，全增強關閉 → build_snapshot 回傳中性間距/bias。
+        與 bot._build_bundle 同結構，保證回測與實盤決策同源。"""
+        return ManagerBundle(
+            leading_indicator=LeadingIndicatorManager(),
+            dynamic_grid_manager=self._dgm,
+            glft_controller=GLFTController(),
+            funding_manager=None,          # → funding bias = 1.0
+            max_enhancement=self._max_enh,  # 全關 → is_feature_enabled 恆 False
+            leading_enabled=False,          # → 跳過 leading 區塊
+        )
+
     def _run_terminal_ui_mode(self) -> BacktestResult:
+        """終端 UI 兼容模式：決策吃純層 decide()，追價語意 + sim-clock 餵真 manager。
+
+        每根 K 線：set_clock → update_price → 先結算既有掛單成交 → build_snapshot →
+        decide() → 依 should_adjust/cancel_side/orders 重掛 pending（錨在觸發時價）。
+        clock 於 finally reset，不污染其他測試的實盤時鐘。
         """
-        終端 UI 兼容模式 - 與 as_terminal_max.py BacktestManager.run_backtest 完全一致
-        """
-        balance = self.config.initial_balance
+        cfg = self.config
+        sym = cfg.symbol
+        initial_quantity = cfg.initial_quantity
+        leverage = cfg.leverage
+        fee_pct = cfg.fee_pct
+        position_threshold = initial_quantity * cfg.threshold_multiplier
+        position_limit = initial_quantity * cfg.limit_multiplier
+
+        # 回測用 manager（sim-clock 驅動；此處增強全關故僅承載 update_price 歷史）
+        self._dgm = DynamicGridManager()
+        self._max_enh = MaxEnhancement()
+        bundle = self._build_bundle()
+
+        balance = cfg.initial_balance
         max_equity = balance
+        long_positions: list = []
+        short_positions: list = []
+        trades: list = []
+        equity_curve: list = []
 
-        long_positions = []
-        short_positions = []
-        trades = []
-        equity_curve = []
+        # pending 掛單狀態：每側 entry/tp 各為 {"price","qty"} 或 None，驅動 should_adjust
+        pend = {"long": {"entry": None, "tp": None},
+                "short": {"entry": None, "tp": None}}
+        anchor = {"long": 0.0, "short": 0.0}   # last_grid_price_*（上次掛網價）
+        dead = {"long": False, "short": False}
 
-        # 關鍵：order_value = 幣數量 × 初始價格 (與終端 UI 一致)
-        initial_quantity = self.config.initial_quantity
-        order_value = initial_quantity * self.df['close'].iloc[0]
-        leverage = self.config.leverage
-        fee_pct = self.config.fee_pct
+        def _open(side: str, fill_price: float, qty: float) -> bool:
+            nonlocal balance
+            margin = (qty * fill_price) / leverage
+            fee = qty * fill_price * fee_pct
+            if margin + fee < balance:
+                balance -= (margin + fee)
+                (long_positions if side == "long" else short_positions).append(
+                    {"price": fill_price, "qty": qty, "margin": margin})
+                return True
+            return False
 
-        last_long_price = self.df['close'].iloc[0]
-        last_short_price = self.df['close'].iloc[0]
+        def _close(side: str, fill_price: float, tp_qty: float, ts) -> None:
+            nonlocal balance
+            positions = long_positions if side == "long" else short_positions
+            remaining = tp_qty
+            while positions and remaining > 0:
+                pos = positions[0]
+                if pos["qty"] <= remaining:
+                    positions.pop(0)
+                    gross = ((fill_price - pos["price"]) if side == "long"
+                             else (pos["price"] - fill_price)) * pos["qty"]
+                    fee = pos["qty"] * fill_price * fee_pct
+                    net = gross - fee
+                    balance += pos["margin"] + net
+                    trades.append({"pnl": net, "type": side, "timestamp": ts})
+                    remaining -= pos["qty"]
+                else:
+                    ratio = remaining / pos["qty"]
+                    close_margin = pos["margin"] * ratio
+                    gross = ((fill_price - pos["price"]) if side == "long"
+                             else (pos["price"] - fill_price)) * remaining
+                    fee = remaining * fill_price * fee_pct
+                    net = gross - fee
+                    balance += close_margin + net
+                    trades.append({"pnl": net, "type": side, "timestamp": ts})
+                    pos["qty"] -= remaining
+                    pos["margin"] -= close_margin
+                    remaining = 0
 
-        # 計算持倉閾值 (與終端 UI 一致)
-        position_threshold = initial_quantity * self.config.threshold_multiplier
-        position_limit = initial_quantity * self.config.limit_multiplier
+        def _settle(side: str, price: float, ts) -> None:
+            """結算既有 pending（上一根掛的單）對本根價格的成交，樂觀以收盤價成交。"""
+            positions = long_positions if side == "long" else short_positions
+            e = pend[side]["entry"]
+            if e is not None:
+                crossed = price <= e["price"] if side == "long" else price >= e["price"]
+                if crossed and _open(side, price, e["qty"]):
+                    pend[side]["entry"] = None
+            t = pend[side]["tp"]
+            if t is not None and positions:
+                crossed = price >= t["price"] if side == "long" else price <= t["price"]
+                if crossed:
+                    _close(side, price, t["qty"], ts)
+                    pend[side]["tp"] = None
 
-        for _, row in self.df.iterrows():
-            price = row['close']
-            timestamp = row.get('open_time', None)
+        try:
+            for _, row in self.df.iterrows():
+                price = row['close']
+                timestamp = row.get('open_time', None)
 
-            # 計算當前持倉量
-            long_position = sum(p["qty"] for p in long_positions)
-            short_position = sum(p["qty"] for p in short_positions)
+                # 髒資料防禦：價格非正/NaN → 跳過本根（避免除零、污染 pnl）
+                if not (isinstance(price, (int, float)) and math.isfinite(price) and price > 0):
+                    continue
 
-            # === 多頭網格 (使用 GridStrategy 統一邏輯) ===
-            if self.config.direction in ["long", "both"]:
-                long_decision = GridStrategy.get_grid_decision(
-                    price=last_long_price,
-                    my_position=long_position,
-                    opposite_position=short_position,
+                # sim-clock 推進：epoch 秒；bar_time 倒流時 manager 用 clock.now() 需容忍
+                epoch = timestamp.timestamp() if hasattr(timestamp, "timestamp") else 0.0
+                clock.set_clock(lambda t=epoch: t)
+                self._dgm.update_price(sym, price)
+
+                # 先結算成交（用上一根掛出的 pending）
+                for side in ("long", "short"):
+                    if cfg.direction in (side, "both"):
+                        _settle(side, price, timestamp)
+
+                # 組決策輸入（pending 狀態驅動 buy/sell_orders）→ decide()
+                long_pos = sum(p["qty"] for p in long_positions)
+                short_pos = sum(p["qty"] for p in short_positions)
+                snapshot = build_snapshot(
+                    bundle, sym, cfg.take_profit_spacing, cfg.grid_spacing)
+                inputs = DecisionInputs(
+                    price=price,
+                    long_position=long_pos,
+                    short_position=short_pos,
+                    buy_long_orders=1.0 if pend["long"]["entry"] else 0.0,
+                    sell_long_orders=1.0 if pend["long"]["tp"] else 0.0,
+                    buy_short_orders=1.0 if pend["short"]["tp"] else 0.0,   # 空頭 TP = 買回
+                    sell_short_orders=1.0 if pend["short"]["entry"] else 0.0,  # 空頭進場 = 賣
+                    last_grid_price_long=anchor["long"],
+                    last_grid_price_short=anchor["short"],
+                    long_dead_mode=dead["long"],
+                    short_dead_mode=dead["short"],
+                    grid_spacing=cfg.grid_spacing,
+                    take_profit_spacing=cfg.take_profit_spacing,
+                    initial_quantity=initial_quantity,
                     position_threshold=position_threshold,
                     position_limit=position_limit,
-                    base_qty=initial_quantity,
-                    take_profit_spacing=self.config.take_profit_spacing,
-                    grid_spacing=self.config.grid_spacing,
-                    side='long'
+                    glft_enabled=self._max_enh.is_feature_enabled('glft'),
+                    gamma=self._max_enh.gamma,
+                    enh=snapshot,
                 )
+                decision = decide(inputs)
 
-                sell_price = long_decision['tp_price']
-                long_tp_qty = long_decision['tp_qty']
-                long_dead_mode = long_decision['dead_mode']
-                buy_price = long_decision['entry_price'] if long_decision['entry_price'] else last_long_price * (1 - self.config.grid_spacing)
+                # 依純層決策重掛 pending（追價：cancel_side 清舊、依 orders 掛新、錨在觸發價）
+                for side, sd in (("long", decision.long), ("short", decision.short)):
+                    if cfg.direction not in (side, "both"):
+                        continue
+                    if not sd.should_adjust:
+                        continue
+                    if sd.enter_dead_mode:
+                        dead[side] = True
+                    if sd.exit_dead_mode:
+                        dead[side] = False
+                    if sd.cancel_side:
+                        pend[side]["entry"] = None
+                        pend[side]["tp"] = None
+                    for o in sd.orders:
+                        slot = "tp" if o.reduce_only else "entry"
+                        pend[side][slot] = {"price": o.price, "qty": o.quantity}
+                    if sd.new_anchor_price is not None:
+                        anchor[side] = sd.new_anchor_price
 
-                if not long_dead_mode:
-                    # 【正常模式】補倉邏輯
-                    if price <= buy_price:
-                        qty = order_value / price
-                        margin = (qty * price) / leverage
-                        fee = qty * price * fee_pct
+                # 計算淨值
+                unrealized = sum((price - p["price"]) * p["qty"] for p in long_positions)
+                unrealized += sum((p["price"] - price) * p["qty"] for p in short_positions)
+                equity = balance + unrealized
+                max_equity = max(max_equity, equity)
+                equity_curve.append((timestamp, price, equity))
+        finally:
+            clock.reset_clock()  # 絕不殘留 sim-clock 給後續（實盤/其他測試）
 
-                        if margin + fee < balance:
-                            balance -= (margin + fee)
-                            long_positions.append({"price": price, "qty": qty, "margin": margin})
-                            last_long_price = price
-
-                # 止盈邏輯 (兩種模式都執行)
-                if price >= sell_price and long_positions:
-                    remaining_tp = long_tp_qty
-                    while long_positions and remaining_tp > 0:
-                        pos = long_positions[0]
-                        if pos["qty"] <= remaining_tp:
-                            # 全部平倉
-                            long_positions.pop(0)
-                            gross_pnl = (price - pos["price"]) * pos["qty"]
-                            fee = pos["qty"] * price * fee_pct
-                            net_pnl = gross_pnl - fee
-                            balance += pos["margin"] + net_pnl
-                            trades.append({"pnl": net_pnl, "type": "long", "timestamp": timestamp})
-                            remaining_tp -= pos["qty"]
-                        else:
-                            # 部分平倉
-                            close_ratio = remaining_tp / pos["qty"]
-                            close_qty = remaining_tp
-                            close_margin = pos["margin"] * close_ratio
-                            gross_pnl = (price - pos["price"]) * close_qty
-                            fee = close_qty * price * fee_pct
-                            net_pnl = gross_pnl - fee
-                            balance += close_margin + net_pnl
-                            trades.append({"pnl": net_pnl, "type": "long", "timestamp": timestamp})
-                            pos["qty"] -= close_qty
-                            pos["margin"] -= close_margin
-                            remaining_tp = 0
-                    last_long_price = price
-
-            # === 空頭網格 (使用 GridStrategy 統一邏輯) ===
-            if self.config.direction in ["short", "both"]:
-                short_decision = GridStrategy.get_grid_decision(
-                    price=last_short_price,
-                    my_position=short_position,
-                    opposite_position=long_position,
-                    position_threshold=position_threshold,
-                    position_limit=position_limit,
-                    base_qty=initial_quantity,
-                    take_profit_spacing=self.config.take_profit_spacing,
-                    grid_spacing=self.config.grid_spacing,
-                    side='short'
-                )
-
-                cover_price = short_decision['tp_price']
-                short_tp_qty = short_decision['tp_qty']
-                short_dead_mode = short_decision['dead_mode']
-                sell_short_price = short_decision['entry_price'] if short_decision['entry_price'] else last_short_price * (1 + self.config.grid_spacing)
-
-                if not short_dead_mode:
-                    # 【正常模式】補倉邏輯
-                    if price >= sell_short_price:
-                        qty = order_value / price
-                        margin = (qty * price) / leverage
-                        fee = qty * price * fee_pct
-
-                        if margin + fee < balance:
-                            balance -= (margin + fee)
-                            short_positions.append({"price": price, "qty": qty, "margin": margin})
-                            last_short_price = price
-
-                # 止盈邏輯 (兩種模式都執行)
-                if price <= cover_price and short_positions:
-                    remaining_tp = short_tp_qty
-                    while short_positions and remaining_tp > 0:
-                        pos = short_positions[0]
-                        if pos["qty"] <= remaining_tp:
-                            # 全部平倉
-                            short_positions.pop(0)
-                            gross_pnl = (pos["price"] - price) * pos["qty"]
-                            fee = pos["qty"] * price * fee_pct
-                            net_pnl = gross_pnl - fee
-                            balance += pos["margin"] + net_pnl
-                            trades.append({"pnl": net_pnl, "type": "short", "timestamp": timestamp})
-                            remaining_tp -= pos["qty"]
-                        else:
-                            # 部分平倉
-                            close_ratio = remaining_tp / pos["qty"]
-                            close_qty = remaining_tp
-                            close_margin = pos["margin"] * close_ratio
-                            gross_pnl = (pos["price"] - price) * close_qty
-                            fee = close_qty * price * fee_pct
-                            net_pnl = gross_pnl - fee
-                            balance += close_margin + net_pnl
-                            trades.append({"pnl": net_pnl, "type": "short", "timestamp": timestamp})
-                            pos["qty"] -= close_qty
-                            pos["margin"] -= close_margin
-                            remaining_tp = 0
-                    last_short_price = price
-
-            # 計算淨值
-            unrealized = sum((price - p["price"]) * p["qty"] for p in long_positions)
-            unrealized += sum((p["price"] - price) * p["qty"] for p in short_positions)
-            equity = balance + unrealized
-            max_equity = max(max_equity, equity)
-            equity_curve.append((timestamp, price, equity))
-
-        # 計算結果
-        final_price = self.df['close'].iloc[-1]
+        # 計算結果（final_price 取最後一根有效收盤價，避免 NaN 尾根污染 final_equity）
+        final_price = equity_curve[-1][1] if equity_curve else self.config.initial_balance
         unrealized_pnl = sum((final_price - p["price"]) * p["qty"] for p in long_positions)
         unrealized_pnl += sum((p["price"] - final_price) * p["qty"] for p in short_positions)
 
@@ -697,7 +724,8 @@ class GridBacktester:
             direction=self.config.direction,
             config=self.config,
             trade_history=[],  # 簡化版不記錄詳細交易歷史
-            equity_curve=equity_curve
+            equity_curve=equity_curve,
+            notes=FIDELITY_NOTES,
         )
 
     def _run_legacy_mode(self) -> BacktestResult:
