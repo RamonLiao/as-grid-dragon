@@ -137,7 +137,7 @@ run() → _run_terminal_ui_mode()
 **backtester 整合**
 - 開滑價：同一情境 entry 成本↑、TP 淨收益↓（對照零滑價 baseline）。
 - funding 跨 settlement：balance 依 notional×rate 精確變動；多頭正 rate 扣款、負 rate 收款；空頭相反；`funding_paid` 精確累加。
-- **funding 不污染指標**：跑含 funding 的回測，`trades_count`/`win_rate`/`profit_factor` 與零 funding baseline **完全一致**（funding 只動 balance/equity，不進 trades）。
+- **funding 不污染指標**：跑含 funding 的回測，`trades_count`/`win_rate`/`profit_factor` 與零 funding baseline 一致（funding 只動 balance/equity，不進 trades）。**註**：此不變量是條件性的 — funding 扣款降低 balance，當 balance 成為 `_open` margin-gate 的約束時，成交集合可能改變（這是正確的 fidelity：錢變少本來就開不了倉），測試以充裕 balance 驗證「不經由 trades 直接污染」的路徑。
 - `funding_enabled=False`：balance 與零 funding baseline 完全一致（等價舊行為守門）。
 - 單根跨多 settlement 全部結算。
 - 4h funding 資料（非 8h）也正確逐點結算（data-driven 守門）。
