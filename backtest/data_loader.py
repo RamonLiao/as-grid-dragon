@@ -473,6 +473,63 @@ class DataLoader:
         print(f"\n✅ 下載完成，共 {total_bars:,} 條數據")
         return True
 
+    def get_funding_path(self, symbol: str):
+        """funding 快取檔路徑。"""
+        return self.data_dir / "funding" / f"{symbol}.csv"
+
+    def load_funding(self, symbol, start, end, exchange=None) -> dict:
+        """按需下載/快取真實 funding 歷史 → {settlement_epoch_sec: rate}。
+
+        本地缺 → fetch_funding_rate_history 分頁拖區間存 CSV。
+        settlement 時點以交易所真實 timestamp 為準（非假設 8h）。
+        抓取失敗/缺漏 → 回已知部分（可能空）；缺時點呼叫端以 rate=0 處理。
+        """
+        path = self.get_funding_path(symbol)
+
+        if path.exists():
+            df = pd.read_csv(path)
+            return {int(r): float(v)
+                    for r, v in zip(df["settlement_time"], df["funding_rate"])}
+
+        if exchange is None:
+            exchange = self._create_exchange("binance")
+
+        ccxt_symbol = symbol.replace("USDC", "/USDC").replace("USDT", "/USDT")
+        since = int(datetime(start.year, start.month, start.day).timestamp() * 1000)
+        end_ms = int((datetime(end.year, end.month, end.day).timestamp() + 86400) * 1000)
+
+        rows = []
+        seen = set()
+        try:
+            while since < end_ms:
+                batch = exchange.fetch_funding_rate_history(
+                    ccxt_symbol, since=since, limit=1000, params={})
+                if not batch:
+                    break
+                progressed = False
+                for item in batch:
+                    ts = int(item["timestamp"])          # ms
+                    if ts >= end_ms or ts in seen:
+                        continue
+                    seen.add(ts)
+                    rate = float(item.get("fundingRate", 0) or 0)
+                    rows.append((ts // 1000, rate))       # 存秒
+                    progressed = True
+                last_ts = int(batch[-1]["timestamp"])
+                if not progressed or last_ts < since:
+                    break
+                since = last_ts + 1
+        except Exception:
+            # fidelity：抓取失敗回已知部分，不中斷回測
+            pass
+
+        if rows:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(rows, columns=["settlement_time", "funding_rate"]).to_csv(
+                path, index=False)
+
+        return {int(sec): float(rate) for sec, rate in rows}
+
 
 # 使用範例
 if __name__ == "__main__":
