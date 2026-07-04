@@ -16,6 +16,7 @@ from collections import deque
 
 import numpy as np
 
+from . import clock
 from .utils import logger
 
 
@@ -401,7 +402,7 @@ class UCBBanditOptimizer:
             'side': side,
             'arm_idx': self.current_arm_idx,
             'context': self.current_context,
-            'timestamp': time.time()
+            'timestamp': clock.now()
         })
         self.trade_count_since_update += 1
 
@@ -583,8 +584,8 @@ class DGTBoundaryManager:
             'lower': lower,
             'grid_spacing': grid_spacing,
             'num_grids': num_grids,
-            'initialized_at': time.time(),
-            'last_reset': time.time()
+            'initialized_at': clock.now(),
+            'last_reset': clock.now()
         }
 
         self.accumulated_profits[symbol] = 0
@@ -685,7 +686,7 @@ class FundingRateManager:
 
     def update_funding_rate(self, symbol: str) -> float:
         """更新並返回 funding rate"""
-        now = time.time()
+        now = clock.now()
 
         if symbol in self.last_update:
             if now - self.last_update[symbol] < self.update_interval:
@@ -796,12 +797,12 @@ class DynamicGridManager:
 
         self.price_history[symbol].append({
             'price': price,
-            'time': time.time()
+            'time': clock.now()
         })
 
     def calculate_atr(self, symbol: str, config: 'MaxEnhancement') -> float:
         """計算 ATR 百分比"""
-        now = time.time()
+        now = clock.now()
 
         if symbol in self.last_calc_time:
             if now - self.last_calc_time[symbol] < self.calc_interval:
@@ -937,7 +938,7 @@ class LeadingIndicatorManager:
         self._ensure_symbol_data(symbol)
 
         self.trade_history[symbol].append({
-            'time': time.time(),
+            'time': clock.now(),
             'price': price,
             'quantity': quantity,
             'side': side,
@@ -955,7 +956,7 @@ class LeadingIndicatorManager:
         spread_bps = (ask - bid) / mid_price * 10000
 
         self.spread_history[symbol].append({
-            'time': time.time(),
+            'time': clock.now(),
             'bid': bid,
             'ask': ask,
             'spread_bps': spread_bps
@@ -983,7 +984,7 @@ class LeadingIndicatorManager:
 
         self.current_ofi[symbol] = ofi
         self.ofi_history[symbol].append({
-            'time': time.time(),
+            'time': clock.now(),
             'ofi': ofi,
             'buy_vol': buy_volume,
             'sell_vol': sell_volume
@@ -1000,7 +1001,7 @@ class LeadingIndicatorManager:
         if len(trades) < self.config.volume_lookback:
             return 1.0
 
-        now = time.time()
+        now = clock.now()
         recent_minute = [t['value'] for t in trades if now - t['time'] < 60]
         historical = trades[-self.config.volume_lookback:]
 
