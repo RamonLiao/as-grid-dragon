@@ -12,7 +12,7 @@ import pandas as pd
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .utils import DATA_DIR, console
-from .strategy import GridStrategy
+from . import GridStrategy  # 相容 shim（strategy.py 已刪，get_grid_decision 未遷移，見 Task 8）
 from .config import SymbolConfig
 
 

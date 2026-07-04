@@ -19,7 +19,7 @@ Task 5 接線時 bot 側只會呼叫一次而非現行的多次——此為刻�
 from dataclasses import dataclass
 from typing import Optional
 
-from .decision import EnhancementSnapshot, inventory_ratio  # noqa: F401  (re-export 供下游使用)
+from .decision import EnhancementSnapshot
 
 
 @dataclass
