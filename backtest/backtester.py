@@ -24,6 +24,7 @@ from grid_engine.snapshot import ManagerBundle, build_snapshot
 from grid_engine.enhancements import (
     DynamicGridManager, LeadingIndicatorManager, GLFTController, MaxEnhancement,
 )
+from backtest.costs import apply_slippage, funding_charge
 
 # 回測保真限制（樂觀成交模型，與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
@@ -550,6 +551,7 @@ class GridBacktester:
 
         def _open(side: str, fill_price: float, qty: float) -> bool:
             nonlocal balance
+            fill_price = apply_slippage(fill_price, side, "entry", cfg.slippage_bps)
             margin = (qty * fill_price) / leverage
             fee = qty * fill_price * fee_pct
             if margin + fee < balance:
@@ -561,6 +563,7 @@ class GridBacktester:
 
         def _close(side: str, fill_price: float, tp_qty: float, ts) -> None:
             nonlocal balance
+            fill_price = apply_slippage(fill_price, side, "tp", cfg.slippage_bps)
             positions = long_positions if side == "long" else short_positions
             remaining = tp_qty
             while positions and remaining > 0:
