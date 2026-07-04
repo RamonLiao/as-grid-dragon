@@ -21,3 +21,20 @@ def apply_slippage(price: float, side: str, action: str, bps: float) -> float:
     # 買方（成交價升）: long entry / short tp；賣方（成交價降）: long tp / short entry
     buy_side = (side == "long" and action == "entry") or (side == "short" and action == "tp")
     return price * (1 + bps) if buy_side else price * (1 - bps)
+
+
+def funding_charge(positions: list, rate: float, side: str, mark_price: float) -> float:
+    """該側 funding 現金流（正=付出，呼叫端 balance -= charge）。
+
+    notional = Σ(pos["qty"]) * mark_price（mark_price 用結算時點 bar close 代理）。
+    - long:  +notional*rate  正 rate 多頭付、負 rate 收
+    - short: -notional*rate  相反
+    rate 非有限、positions 空 → 0。
+    """
+    if not (isinstance(rate, (int, float)) and math.isfinite(rate)):
+        return 0.0
+    if not (isinstance(mark_price, (int, float)) and math.isfinite(mark_price)):
+        return 0.0
+    notional = sum(p["qty"] for p in positions) * mark_price
+    charge = notional * rate
+    return charge if side == "long" else -charge
