@@ -308,6 +308,40 @@ def test_garbage_signature_type_cold_starts(tmp_path):
     assert load_bandit_state(_bandit(), path) is False
 
 
+def test_load_resets_nonpositive_thompson_priors(tmp_path):
+    """thompson_alpha/beta 有限但 <=0（竄改/部分寫壞）→ 重置為先驗 1.0。
+    np.random.beta 要求 a>0 且 b>0，非正值會在 select_arm 走 Thompson 分支時 raise ValueError 炸 async 迴圈。"""
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["state"]["thompson_alpha"]["0"] = -5.0
+    env["state"]["thompson_beta"]["1"] = 0.0
+    (tmp_path / "s.json").write_text(json.dumps(env))
+
+    b2 = _bandit()
+    assert load_bandit_state(b2, path) is True
+    assert b2.thompson_alpha[0] == 1.0   # 負值被重置為先驗
+    assert b2.thompson_beta[1] == 1.0    # 0 被重置為先驗
+
+
+def test_load_poisoned_priors_select_arm_no_crash(tmp_path):
+    """載入非正 thompson 先驗後，反覆 select_arm() 走 Thompson 分支不得 raise（防 async 迴圈 crash 回歸）。"""
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["state"]["thompson_alpha"]["0"] = -5.0
+    env["state"]["thompson_beta"]["1"] = 0.0
+    (tmp_path / "s.json").write_text(json.dumps(env))
+
+    b2 = _bandit()
+    assert load_bandit_state(b2, path) is True
+    for _ in range(30):
+        idx = b2.select_arm()
+        assert 0 <= idx < len(b2.arms)
+
+
 def test_bandit_params_present_in_decision_inputs():
     # F: bandit 覆寫的三個參數必須是 DecisionInputs 欄位，才會落進 decisions.jsonl、replay 才吃得到。
     # 守住「#6 不回歸 #4 replay zero-diff」：bandit 只改未來選哪個 arm，每筆決策的參數已凍結在 log。

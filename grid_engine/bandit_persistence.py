@@ -66,7 +66,8 @@ def _sanitize_state(state: dict) -> None:
         d = state.get(key)
         if isinstance(d, dict):
             for k, v in list(d.items()):
-                if not (isinstance(v, (int, float)) and math.isfinite(v)):
+                # np.random.beta 要求 a>0 且 b>0：非有限或 <=0（含竄改/部分寫壞的 0、負值）→ 先驗 1.0
+                if not (isinstance(v, (int, float)) and math.isfinite(v) and v > 0):
                     d[k] = 1.0
     cr = state.get("cumulative_reward")
     if not (isinstance(cr, (int, float)) and math.isfinite(cr)):
