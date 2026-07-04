@@ -4,6 +4,14 @@
 from dataclasses import dataclass, field
 from typing import Optional, List
 import json
+import math
+
+
+def _norm_slippage(v) -> float:
+    """滑價 fallback：非數值/NaN/負值 → 0.0001。"""
+    if not (isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)) or v < 0:
+        return 0.0001
+    return float(v)
 
 
 @dataclass
@@ -27,6 +35,10 @@ class Config:
     max_drawdown: float = 0.5           # 最大回撤 50%
     max_positions: int = 50             # 最大持倉數
     fee_pct: float = 0.0004             # 手續費 0.04%
+
+    # 成本模型（fidelity-first：預設全開）
+    slippage_bps: float = 0.0001       # 每次成交向不利方向偏移比例（執行成本 haircut）
+    funding_enabled: bool = True       # 是否結算 funding 現金流
 
     # 持倉控制參數 (與實盤 GridStrategy 一致)
     # 如果設為 0，會使用 limit_multiplier/threshold_multiplier 自動計算
@@ -82,7 +94,9 @@ class Config:
             "position_threshold": self.position_threshold,
             "position_limit": self.position_limit,
             "long_settings": self.long_settings,
-            "short_settings": self.short_settings
+            "short_settings": self.short_settings,
+            "slippage_bps": self.slippage_bps,
+            "funding_enabled": self.funding_enabled,
         }
 
     @classmethod
@@ -106,6 +120,9 @@ class Config:
             limit_multiplier=data.get("limit_multiplier", 5.0),
             threshold_multiplier=data.get("threshold_multiplier", 14.0),
             terminal_ui_mode=data.get("terminal_ui_mode", True),
+            slippage_bps=_norm_slippage(data.get("slippage_bps", 0.0001)),
+            funding_enabled=data.get("funding_enabled", True)
+                if isinstance(data.get("funding_enabled", True), bool) else True,
         )
 
     def save(self, filepath: str):
