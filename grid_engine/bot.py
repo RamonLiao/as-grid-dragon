@@ -3,21 +3,24 @@ MAX 網格交易機器人
 """
 
 import asyncio
+import dataclasses
 import json
 import math
+import os
 import ssl
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from functools import partial
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict
 
 import ccxt
 import certifi
 import websockets
 
 from .utils import logger
-from .strategy import GridStrategy
+from .decision import decide, DecisionInputs
+from .snapshot import ManagerBundle, build_snapshot
 from .enhancements import (
     FundingRateManager, GLFTController, DynamicGridManager,
     UCBBanditOptimizer, DGTBoundaryManager, LeadingIndicatorManager
@@ -447,72 +450,43 @@ class MaxGridBot:
         except Exception as e:
             logger.error(f"撤單失敗 {symbol}: {e}")
 
-    def _get_dynamic_spacing(self, sym_config: SymbolConfig, sym_state: SymbolState) -> Tuple[float, float]:
-        """獲取動態調整後的間距"""
+    def _build_bundle(self, sym_config: SymbolConfig) -> ManagerBundle:
+        """組現有 manager 實例成 ManagerBundle，供 build_snapshot 共用（回測/實盤同源）。"""
+        return ManagerBundle(
+            leading_indicator=self.leading_indicator,
+            dynamic_grid_manager=self.dynamic_grid_manager,
+            glft_controller=self.glft_controller,
+            funding_manager=self.funding_manager,
+            max_enhancement=self.config.max_enhancement,
+            leading_enabled=self.config.leading_indicator.enabled,
+        )
+
+    def _build_inputs(self, sym_config: SymbolConfig, sym_state: SymbolState,
+                      snapshot) -> DecisionInputs:
+        """從 sym_config / sym_state / snapshot 組出純層決策輸入（無副作用）。
+        grid_spacing/take_profit_spacing 取 bandit 覆寫後的 sym_config 值。"""
         max_cfg = self.config.max_enhancement
-        ccxt_symbol = sym_config.ccxt_symbol
-
-        base_take_profit = sym_config.take_profit_spacing
-        base_grid_spacing = sym_config.grid_spacing
-
-        # === 1. 領先指標調整 ===
-        leading_reason = ""
-        leading_signals = []
-        leading_values = {}
-
-        if self.config.leading_indicator.enabled:
-            leading_signals, leading_values = self.leading_indicator.get_signals(ccxt_symbol)
-
-            sym_state.leading_ofi = leading_values.get('ofi', 0)
-            sym_state.leading_volume_ratio = leading_values.get('volume_ratio', 1.0)
-            sym_state.leading_spread_ratio = leading_values.get('spread_ratio', 1.0)
-            sym_state.leading_signals = leading_signals
-
-            should_pause, pause_reason = self.leading_indicator.should_pause_trading(ccxt_symbol)
-            if should_pause:
-                logger.warning(f"[LeadingIndicator] {sym_config.symbol} 暫停交易: {pause_reason}")
-                base_take_profit *= 2.0
-                base_grid_spacing *= 2.0
-                leading_reason = f"暫停:{pause_reason}"
-            elif leading_signals:
-                adjusted_spacing, leading_reason = self.leading_indicator.get_spacing_adjustment(
-                    ccxt_symbol, base_grid_spacing
-                )
-                if adjusted_spacing != base_grid_spacing:
-                    ratio = adjusted_spacing / base_grid_spacing
-                    base_grid_spacing = adjusted_spacing
-                    base_take_profit *= ratio
-
-        # === 2. 動態網格範圍 (ATR) ===
-        if not leading_reason or leading_reason == "正常":
-            take_profit, grid_spacing = self.dynamic_grid_manager.get_dynamic_spacing(
-                ccxt_symbol,
-                base_take_profit,
-                base_grid_spacing,
-                max_cfg
-            )
-        else:
-            take_profit = base_take_profit
-            grid_spacing = base_grid_spacing
-
-        # === 3. GLFT 偏移 ===
-        bid_skew, ask_skew = self.glft_controller.calculate_spread_skew(
-            sym_state.long_position,
-            sym_state.short_position,
-            grid_spacing,
-            max_cfg
+        return DecisionInputs(
+            price=sym_state.latest_price,
+            long_position=sym_state.long_position,
+            short_position=sym_state.short_position,
+            buy_long_orders=sym_state.buy_long_orders,
+            sell_long_orders=sym_state.sell_long_orders,
+            buy_short_orders=sym_state.buy_short_orders,
+            sell_short_orders=sym_state.sell_short_orders,
+            last_grid_price_long=sym_state.last_grid_price_long,
+            last_grid_price_short=sym_state.last_grid_price_short,
+            long_dead_mode=sym_state.long_dead_mode,
+            short_dead_mode=sym_state.short_dead_mode,
+            grid_spacing=sym_config.grid_spacing,
+            take_profit_spacing=sym_config.take_profit_spacing,
+            initial_quantity=sym_config.initial_quantity,
+            position_threshold=sym_config.position_threshold,
+            position_limit=sym_config.position_limit,
+            glft_enabled=max_cfg.is_feature_enabled('glft'),
+            gamma=max_cfg.gamma,
+            enh=snapshot,
         )
-
-        sym_state.dynamic_take_profit = take_profit
-        sym_state.dynamic_grid_spacing = grid_spacing
-        sym_state.inventory_ratio = self.glft_controller.calculate_inventory_ratio(
-            sym_state.long_position, sym_state.short_position
-        )
-
-        if leading_reason and leading_reason != "正常":
-            logger.debug(f"[LeadingIndicator] {sym_config.symbol} 間距調整: {leading_reason}")
-
-        return take_profit, grid_spacing
 
     def _get_adjusted_quantity(
         self,
@@ -663,6 +637,27 @@ class MaxGridBot:
         # 封鎖期內開倉單必被跳過，無倉位分支撤了單也補不回來 — 直接不動作
         order_blocked = time.time() < self._order_block_until.get(ccxt_symbol, 0)
 
+        # 有倉位側是否要重掛（純判斷，無 manager 副作用）——決定是否建快照跑純層。
+        # 只在至少一側真的要執行時才 build_snapshot，維持 get_signals/ATR 的呼叫時機
+        # 與原 _place_grid 一致（should_adjust=False 或 cooldown 未過 → 不觸發 manager）。
+        need_long = (sym_state.long_position != 0
+                     and self._should_adjust_grid(sym_config, sym_state, 'long')
+                     and self._grid_cooldown_passed(ccxt_symbol, 'long'))
+        need_short = (sym_state.short_position != 0
+                      and self._should_adjust_grid(sym_config, sym_state, 'short')
+                      and self._grid_cooldown_passed(ccxt_symbol, 'short'))
+
+        decision = None
+        inputs = None
+        if need_long or need_short:
+            bundle = self._build_bundle(sym_config)
+            snapshot = build_snapshot(
+                bundle, ccxt_symbol,
+                sym_config.take_profit_spacing, sym_config.grid_spacing,
+            )
+            inputs = self._build_inputs(sym_config, sym_state, snapshot)
+            decision = decide(inputs)
+
         # 多頭
         if sym_state.long_position == 0:
             if not order_blocked and \
@@ -672,12 +667,10 @@ class MaxGridBot:
                 await self.place_order(ccxt_symbol, 'buy', sym_state.best_bid, qty, False, 'long')
                 self.last_order_times[f"{ccxt_symbol}_long"] = time.time()
                 sym_state.last_grid_price_long = price
-        else:
-            if self._should_adjust_grid(sym_config, sym_state, 'long') and \
-                    self._grid_cooldown_passed(ccxt_symbol, 'long'):
-                await self._place_grid(ccxt_symbol, sym_config, 'long')
-                self.last_order_times[f"{ccxt_symbol}_long_grid"] = time.time()
-                sym_state.last_grid_price_long = price
+        elif need_long:
+            await self._place_grid(ccxt_symbol, sym_config, 'long', decision.long)
+            self.last_order_times[f"{ccxt_symbol}_long_grid"] = time.time()
+            sym_state.last_grid_price_long = price
 
         # 空頭
         if sym_state.short_position == 0:
@@ -688,17 +681,20 @@ class MaxGridBot:
                 await self.place_order(ccxt_symbol, 'sell', sym_state.best_ask, qty, False, 'short')
                 self.last_order_times[f"{ccxt_symbol}_short"] = time.time()
                 sym_state.last_grid_price_short = price
-        else:
-            if self._should_adjust_grid(sym_config, sym_state, 'short') and \
-                    self._grid_cooldown_passed(ccxt_symbol, 'short'):
-                await self._place_grid(ccxt_symbol, sym_config, 'short')
-                self.last_order_times[f"{ccxt_symbol}_short_grid"] = time.time()
-                sym_state.last_grid_price_short = price
+        elif need_short:
+            await self._place_grid(ccxt_symbol, sym_config, 'short', decision.short)
+            self.last_order_times[f"{ccxt_symbol}_short_grid"] = time.time()
+            sym_state.last_grid_price_short = price
 
-    async def _place_grid(self, ccxt_symbol: str, sym_config: SymbolConfig, side: str):
-        """掛出網格訂單 (MAX 版本)"""
+        if decision is not None:
+            self._log_decision(ccxt_symbol, inputs, decision)
+
+    async def _place_grid(self, ccxt_symbol: str, sym_config: SymbolConfig, side: str,
+                          side_decision=None):
+        """掛出網格訂單 (MAX 版本)：純層薄封裝——build_snapshot → decide → execute。
+        維持與原本相同的 place_order/cancel 呼叫序列（characterization 鎖定）。
+        side_decision 可由 _grid_step 預先算好傳入，避免同 tick 重複 build_snapshot。"""
         sym_state = self.state.symbols[ccxt_symbol]
-        price = sym_state.latest_price
 
         if side == 'long' and sym_state.long_position <= 0:
             logger.debug(f"[Grid] {sym_config.symbol} 多頭無倉位，跳過 _place_grid")
@@ -707,67 +703,81 @@ class MaxGridBot:
             logger.debug(f"[Grid] {sym_config.symbol} 空頭無倉位，跳過 _place_grid")
             return
 
-        take_profit_spacing, grid_spacing = self._get_dynamic_spacing(sym_config, sym_state)
+        if side_decision is None:
+            bundle = self._build_bundle(sym_config)
+            snapshot = build_snapshot(
+                bundle, ccxt_symbol,
+                sym_config.take_profit_spacing, sym_config.grid_spacing,
+            )
+            inputs = self._build_inputs(sym_config, sym_state, snapshot)
+            decision = decide(inputs)
+            side_decision = decision.long if side == 'long' else decision.short
+        await self._execute_side_decision(ccxt_symbol, sym_config, side, side_decision)
 
-        tp_qty = self._get_adjusted_quantity(sym_config, sym_state, side, True)
-        base_qty = self._get_adjusted_quantity(sym_config, sym_state, side, False)
+    async def _execute_side_decision(self, ccxt_symbol: str, sym_config: SymbolConfig,
+                                     side: str, side_decision) -> None:
+        """執行純層單側決策：裝死 flag 轉換 → 撤單 → 下單 → 寫回顯示欄位。
+        撤/下單走既有 cancel_orders_for_side / place_order 守衛路徑。"""
+        sym_state = self.state.symbols[ccxt_symbol]
+        my_position = sym_state.long_position if side == 'long' else sym_state.short_position
 
-        if side == 'long':
-            my_position = sym_state.long_position
-            opposite_position = sym_state.short_position
-            dead_mode_flag = sym_state.long_dead_mode
-            pending_tp_orders = sym_state.sell_long_orders
-        else:
-            my_position = sym_state.short_position
-            opposite_position = sym_state.long_position
-            dead_mode_flag = sym_state.short_dead_mode
-            pending_tp_orders = sym_state.buy_short_orders
+        if side_decision.enter_dead_mode:
+            if side == 'long':
+                sym_state.long_dead_mode = True
+            else:
+                sym_state.short_dead_mode = True
+            logger.info(f"[MAX] {sym_config.symbol} {side}頭進入裝死模式 (持倉:{my_position})")
+        if side_decision.exit_dead_mode:
+            if side == 'long':
+                sym_state.long_dead_mode = False
+            else:
+                sym_state.short_dead_mode = False
+            logger.info(f"[MAX] {sym_config.symbol} {side}頭離開裝死模式")
 
-        is_dead = GridStrategy.is_dead_mode(my_position, sym_config.position_threshold)
-
-        if is_dead:
-            if not dead_mode_flag:
-                if side == 'long':
-                    sym_state.long_dead_mode = True
-                else:
-                    sym_state.short_dead_mode = True
-                logger.info(f"[MAX] {sym_config.symbol} {side}頭進入裝死模式 (持倉:{my_position})")
-
-            if pending_tp_orders <= 0:
-                special_price = GridStrategy.calculate_dead_mode_price(
-                    price, my_position, opposite_position, side
-                )
-
-                if side == 'long':
-                    await self.place_order(ccxt_symbol, 'sell', special_price, tp_qty, True, 'long')
-                else:
-                    await self.place_order(ccxt_symbol, 'buy', special_price, tp_qty, True, 'short')
-                logger.info(f"[MAX] {sym_config.symbol} {side}頭裝死止盈@{special_price:.4f}")
-        else:
-            if dead_mode_flag:
-                if side == 'long':
-                    sym_state.long_dead_mode = False
-                else:
-                    sym_state.short_dead_mode = False
-                logger.info(f"[MAX] {sym_config.symbol} {side}頭離開裝死模式")
-
+        if side_decision.cancel_side:
             await self.cancel_orders_for_side(ccxt_symbol, side)
 
-            tp_price, entry_price = GridStrategy.calculate_grid_prices(
-                price, take_profit_spacing, grid_spacing, side
-            )
+        for o in side_decision.orders:
+            await self.place_order(ccxt_symbol, o.side, o.price, o.quantity,
+                                   o.reduce_only, o.position_side)
 
-            if side == 'long':
-                if sym_state.long_position > 0:
-                    await self.place_order(ccxt_symbol, 'sell', tp_price, tp_qty, True, 'long')
-                await self.place_order(ccxt_symbol, 'buy', entry_price, base_qty, False, 'long')
-            else:
-                if sym_state.short_position > 0:
-                    await self.place_order(ccxt_symbol, 'buy', tp_price, tp_qty, True, 'short')
-                await self.place_order(ccxt_symbol, 'sell', entry_price, base_qty, False, 'short')
+        if side_decision.orders:
+            logger.info(f"[MAX] {sym_config.symbol} {side}頭掛單 x{len(side_decision.orders)} "
+                        f"[TP:{side_decision.dynamic_tp*100:.2f}%/GS:{side_decision.dynamic_gs*100:.2f}%]")
 
-            logger.info(f"[MAX] {sym_config.symbol} {side}頭 止盈@{tp_price:.4f}({tp_qty:.1f}) "
-                       f"補倉@{entry_price:.4f}({base_qty:.1f}) [TP:{take_profit_spacing*100:.2f}%/GS:{grid_spacing*100:.2f}%]")
+        # 寫回顯示欄位（不影響交易決策）。dynamic/inventory 恆寫；leading_* 僅在
+        # leading 啟用時寫回，維持原行為（關閉時保留上 tick 舊值）。
+        sym_state.dynamic_take_profit = side_decision.dynamic_tp
+        sym_state.dynamic_grid_spacing = side_decision.dynamic_gs
+        disp = side_decision.display
+        if 'inventory_ratio' in disp:
+            sym_state.inventory_ratio = disp['inventory_ratio']
+        if self.config.leading_indicator.enabled:
+            sym_state.leading_ofi = disp.get('leading_ofi', sym_state.leading_ofi)
+            sym_state.leading_volume_ratio = disp.get('leading_volume_ratio', sym_state.leading_volume_ratio)
+            sym_state.leading_spread_ratio = disp.get('leading_spread_ratio', sym_state.leading_spread_ratio)
+            sym_state.leading_signals = disp.get('leading_signals', sym_state.leading_signals)
+
+    def _log_decision(self, ccxt_symbol: str, inputs, decision) -> None:
+        """落地一行 JSON（inputs + decision）。I/O 失敗只記 log 不拋，絕不中斷交易。"""
+        path = getattr(self, "_decision_log_path", None)
+        if not path:
+            return
+        try:
+            rec = {
+                "ts": time.time(),
+                "symbol": ccxt_symbol,
+                "inputs": dataclasses.asdict(inputs),
+                "decision": dataclasses.asdict(decision),
+            }
+            line = json.dumps(rec, ensure_ascii=False)
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception as e:
+            logger.error(f"決策日誌寫入失敗 {ccxt_symbol}: {e}")
 
     async def _handle_ticker(self, data: dict):
         symbol_raw = data.get('s', '')
@@ -1045,6 +1055,12 @@ class MaxGridBot:
 
             self.state.running = True
             self.state.start_time = datetime.now()
+
+            # 決策日誌預設路徑：設定檔指定 > logs/decisions.jsonl（已顯式設過則不覆寫）
+            if getattr(self, "_decision_log_path", None) is None:
+                self._decision_log_path = (
+                    getattr(self.config, "decision_log_path", None) or "logs/decisions.jsonl"
+                )
 
             await self.sync_all()
         except Exception as e:
