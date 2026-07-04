@@ -1,5 +1,5 @@
 import json
-from indicators.bandit import UCBBanditOptimizer, ParameterArm
+from indicators.bandit import UCBBanditOptimizer, ParameterArm, MarketContext
 from grid_engine.enhancements import BanditConfig
 from grid_engine.bandit_persistence import save_bandit_state, load_bandit_state, SCHEMA_VERSION
 
@@ -107,3 +107,71 @@ def test_save_atomic_makedirs_and_no_tmp(tmp_path):
     env = json.loads(nested.read_text())
     assert env["schema_version"] == SCHEMA_VERSION
     assert "saved_at" in env and "state" in env
+
+
+def test_load_does_not_restore_transient_selection(tmp_path):
+    b = _trained_bandit()
+    b.current_arm_idx = 7
+    b.current_context = MarketContext.HIGH_VOLATILITY
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+
+    b2 = _bandit()
+    assert load_bandit_state(b2, path) is True
+    assert b2.current_arm_idx == 0                      # 瞬時選擇不復原
+    assert b2.current_context == MarketContext.RANGING  # context 不復原
+    assert b2.total_pulls == b.total_pulls              # 學到的統計仍復原
+
+
+def test_load_sanitizes_non_finite(tmp_path):
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["state"]["rewards"]["0"] = [float("nan"), 1.0, float("inf"), 2.0]
+    env["state"]["thompson_alpha"]["0"] = float("inf")
+    (tmp_path / "s.json").write_text(json.dumps(env))
+
+    b2 = _bandit()
+    assert load_bandit_state(b2, path) is True
+    assert list(b2.rewards[0]) == [1.0, 2.0]
+    assert b2.thompson_alpha[0] == 1.0
+    assert 0 <= b2.select_arm() < len(b2.arms)  # 無 NaN 傳播、不丟例外
+
+
+def test_load_clamps_negative_counts(tmp_path):
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["state"]["total_pulls"] = -5
+    env["state"]["pull_counts"]["0"] = -3
+    (tmp_path / "s.json").write_text(json.dumps(env))
+
+    b2 = _bandit()
+    assert load_bandit_state(b2, path) is True
+    assert b2.total_pulls == 0
+    assert b2.pull_counts[0] == 0
+    assert 0 <= b2.select_arm() < len(b2.arms)
+
+
+def test_max_age_expiry(tmp_path):
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["saved_at"] = "2000-01-01T00:00:00"
+    (tmp_path / "s.json").write_text(json.dumps(env))
+
+    assert load_bandit_state(_bandit(), path, max_age_sec=60) is False   # 過期 → 冷啟動
+    assert load_bandit_state(_bandit(), path) is True                    # 未設 max_age → 不因舊而拒
+
+
+def test_max_age_unparseable_saved_at_is_stale(tmp_path):
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["saved_at"] = "not-a-timestamp"
+    (tmp_path / "s.json").write_text(json.dumps(env))
+    assert load_bandit_state(_bandit(), path, max_age_sec=60) is False  # 無法解析視為過期
