@@ -15,6 +15,15 @@ funding.get_position_bias 不在 bot.py:_get_dynamic_spacing 序列內（現行�
 _get_adjusted_quantity，bot.py:547-550，每次算數量時各呼叫一次）。這裡併入單一
 快照是 Task 3 decision.py 既定設計（EnhancementSnapshot 攜帶 funding bias），
 Task 5 接線時 bot 側只會呼叫一次而非現行的多次——此為刻意行為變更，非序列對照範圍。
+
+同理 get_signals 的每-tick 呼叫次數也縮減：現行 _place_grid 每側各呼一次
+_get_dynamic_spacing，長短側同 tick 都需調整時 get_signals 觸發 2 次；接線後每 tick
+只 build_snapshot 一次故僅觸發 1 次。get_signals→calculate_ofi 每次無條件 append
+current_ofi/ofi_history（enhancements.py:965-993）。此縮減經查證行為 inert：
+ofi_history 全 repo 無 reader（純死 buffer），current_ofi 僅 get_direction_bias 讀而該
+方法無 caller；且同 tick 多次 calculate_ofi 讀同一 trade_history snapshot 回相同 ofi，
+次數不影響本 tick 或未來 tick 的 get_signals/pause/spacing 輸出。列此為已知且已接受的
+呼叫次數偏離，與 funding bias 同類。
 """
 from dataclasses import dataclass
 from typing import Optional
