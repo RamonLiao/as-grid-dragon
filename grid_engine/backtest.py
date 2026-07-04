@@ -12,7 +12,6 @@ import pandas as pd
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 from .utils import DATA_DIR, console
-from . import GridStrategy  # 相容 shim（strategy.py 已刪，get_grid_decision 未遷移，見 Task 8）
 from .config import SymbolConfig
 
 
@@ -130,168 +129,29 @@ class BacktestManager:
             return False
 
     def run_backtest(self, config: SymbolConfig, df: pd.DataFrame) -> dict:
-        """執行回測"""
-        balance = 1000.0
-        max_equity = balance
+        """執行回測 — 委派給 backtest.backtester.GridBacktester（決策同源 grid_engine.decision.decide()）。
 
-        long_positions = []
-        short_positions = []
-        trades = []
-        equity_curve = []
+        將 grid_engine.config.SymbolConfig 映射為 backtest.config.Config，走與實盤一致的
+        terminal_ui_mode（initial_quantity 幣量下單），確保與 as_terminal_max.py 實盤路徑同源。
+        """
+        # 延遲 import：避免 grid_engine 套件層級對 backtest 套件產生循環依賴
+        from backtest.config import Config as BacktestConfig
+        from backtest.backtester import GridBacktester
 
-        order_value = config.initial_quantity * df['close'].iloc[0]
-        leverage = config.leverage
-        fee_pct = 0.0004
+        bt_config = BacktestConfig(
+            symbol=config.symbol,
+            take_profit_spacing=config.take_profit_spacing,
+            grid_spacing=config.grid_spacing,
+            initial_quantity=config.initial_quantity,
+            leverage=config.leverage,
+            limit_multiplier=config.limit_multiplier,
+            threshold_multiplier=config.threshold_multiplier,
+            direction=getattr(config, "direction", "both"),
+            terminal_ui_mode=True,
+        )
 
-        last_long_price = df['close'].iloc[0]
-        last_short_price = df['close'].iloc[0]
-
-        position_threshold = config.position_threshold
-        position_limit = config.position_limit
-
-        for _, row in df.iterrows():
-            price = row['close']
-
-            long_position = sum(p["qty"] for p in long_positions)
-            short_position = sum(p["qty"] for p in short_positions)
-
-            # === 多頭網格 ===
-            long_decision = GridStrategy.get_grid_decision(
-                price=last_long_price,
-                my_position=long_position,
-                opposite_position=short_position,
-                position_threshold=position_threshold,
-                position_limit=position_limit,
-                base_qty=config.initial_quantity,
-                take_profit_spacing=config.take_profit_spacing,
-                grid_spacing=config.grid_spacing,
-                side='long'
-            )
-
-            sell_price = long_decision['tp_price']
-            long_tp_qty = long_decision['tp_qty']
-            long_dead_mode = long_decision['dead_mode']
-            buy_price = long_decision['entry_price'] if long_decision['entry_price'] else last_long_price * (1 - config.grid_spacing)
-
-            if not long_dead_mode:
-                if price <= buy_price:
-                    qty = order_value / price
-                    margin = (qty * price) / leverage
-                    fee = qty * price * fee_pct
-
-                    if margin + fee < balance:
-                        balance -= (margin + fee)
-                        long_positions.append({"price": price, "qty": qty, "margin": margin})
-                        last_long_price = price
-
-            if price >= sell_price and long_positions:
-                remaining_tp = long_tp_qty
-                while long_positions and remaining_tp > 0:
-                    pos = long_positions[0]
-                    if pos["qty"] <= remaining_tp:
-                        long_positions.pop(0)
-                        gross_pnl = (price - pos["price"]) * pos["qty"]
-                        fee = pos["qty"] * price * fee_pct
-                        net_pnl = gross_pnl - fee
-                        balance += pos["margin"] + net_pnl
-                        trades.append({"pnl": net_pnl, "type": "long"})
-                        remaining_tp -= pos["qty"]
-                    else:
-                        close_ratio = remaining_tp / pos["qty"]
-                        close_qty = remaining_tp
-                        close_margin = pos["margin"] * close_ratio
-                        gross_pnl = (price - pos["price"]) * close_qty
-                        fee = close_qty * price * fee_pct
-                        net_pnl = gross_pnl - fee
-                        balance += close_margin + net_pnl
-                        trades.append({"pnl": net_pnl, "type": "long"})
-                        pos["qty"] -= close_qty
-                        pos["margin"] -= close_margin
-                        remaining_tp = 0
-                last_long_price = price
-
-            # === 空頭網格 ===
-            short_decision = GridStrategy.get_grid_decision(
-                price=last_short_price,
-                my_position=short_position,
-                opposite_position=long_position,
-                position_threshold=position_threshold,
-                position_limit=position_limit,
-                base_qty=config.initial_quantity,
-                take_profit_spacing=config.take_profit_spacing,
-                grid_spacing=config.grid_spacing,
-                side='short'
-            )
-
-            cover_price = short_decision['tp_price']
-            short_tp_qty = short_decision['tp_qty']
-            short_dead_mode = short_decision['dead_mode']
-            sell_short_price = short_decision['entry_price'] if short_decision['entry_price'] else last_short_price * (1 + config.grid_spacing)
-
-            if not short_dead_mode:
-                if price >= sell_short_price:
-                    qty = order_value / price
-                    margin = (qty * price) / leverage
-                    fee = qty * price * fee_pct
-
-                    if margin + fee < balance:
-                        balance -= (margin + fee)
-                        short_positions.append({"price": price, "qty": qty, "margin": margin})
-                        last_short_price = price
-
-            if price <= cover_price and short_positions:
-                remaining_tp = short_tp_qty
-                while short_positions and remaining_tp > 0:
-                    pos = short_positions[0]
-                    if pos["qty"] <= remaining_tp:
-                        short_positions.pop(0)
-                        gross_pnl = (pos["price"] - price) * pos["qty"]
-                        fee = pos["qty"] * price * fee_pct
-                        net_pnl = gross_pnl - fee
-                        balance += pos["margin"] + net_pnl
-                        trades.append({"pnl": net_pnl, "type": "short"})
-                        remaining_tp -= pos["qty"]
-                    else:
-                        close_ratio = remaining_tp / pos["qty"]
-                        close_qty = remaining_tp
-                        close_margin = pos["margin"] * close_ratio
-                        gross_pnl = (pos["price"] - price) * close_qty
-                        fee = close_qty * price * fee_pct
-                        net_pnl = gross_pnl - fee
-                        balance += close_margin + net_pnl
-                        trades.append({"pnl": net_pnl, "type": "short"})
-                        pos["qty"] -= close_qty
-                        pos["margin"] -= close_margin
-                        remaining_tp = 0
-                last_short_price = price
-
-            unrealized = sum((price - p["price"]) * p["qty"] for p in long_positions)
-            unrealized += sum((p["price"] - price) * p["qty"] for p in short_positions)
-            equity = balance + unrealized
-            max_equity = max(max_equity, equity)
-            equity_curve.append(equity)
-
-        # 計算結果
-        final_price = df['close'].iloc[-1]
-        unrealized_pnl = sum((final_price - p["price"]) * p["qty"] for p in long_positions)
-        unrealized_pnl += sum((p["price"] - final_price) * p["qty"] for p in short_positions)
-
-        realized_pnl = sum(t["pnl"] for t in trades)
-        final_equity = balance + unrealized_pnl
-
-        winning = [t for t in trades if t["pnl"] > 0]
-        losing = [t for t in trades if t["pnl"] < 0]
-
-        return {
-            "final_equity": final_equity,
-            "return_pct": (final_equity - 1000) / 1000,
-            "max_drawdown": 1 - (min(equity_curve) / max_equity) if equity_curve else 0,
-            "realized_pnl": realized_pnl,
-            "unrealized_pnl": unrealized_pnl,
-            "trades_count": len(trades),
-            "win_rate": len(winning) / len(trades) if trades else 0,
-            "profit_factor": sum(t["pnl"] for t in winning) / abs(sum(t["pnl"] for t in losing)) if losing else float('inf')
-        }
+        result = GridBacktester(df, bt_config).run()
+        return result.to_dict()
 
     def optimize_params(self, config: SymbolConfig, df: pd.DataFrame, progress_callback=None) -> List[dict]:
         """優化參數"""
