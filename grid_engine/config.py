@@ -5,7 +5,7 @@
 import json
 import math
 from dataclasses import dataclass, field
-from typing import Dict
+from typing import Dict, Optional
 
 from .utils import CONFIG_FILE, console
 from .enhancements import (
@@ -127,6 +127,9 @@ class GlobalConfig:
     telegram_risk_alert_enabled: bool = True
     telegram_risk_alert_cooldown: int = 300  # 風控警報冷卻秒數
     telegram_daily_pnl_hour: int = 20  # Asia/Taipei (UTC+8) 整點
+    # === Bandit 狀態持久化 ===
+    bandit_state_path: Optional[str] = None       # None → bot 套 default logs/bandit_state.json
+    bandit_state_max_age_sec: Optional[int] = None  # None = 永不過期
 
     def to_dict(self) -> dict:
         return {
@@ -151,6 +154,8 @@ class GlobalConfig:
             "telegram_risk_alert_enabled": self.telegram_risk_alert_enabled,
             "telegram_risk_alert_cooldown": self.telegram_risk_alert_cooldown,
             "telegram_daily_pnl_hour": self.telegram_daily_pnl_hour,
+            "bandit_state_path": self.bandit_state_path,
+            "bandit_state_max_age_sec": self.bandit_state_max_age_sec,
         }
 
     @staticmethod
@@ -180,6 +185,17 @@ class GlobalConfig:
             return 5.0
         return cooldown if math.isfinite(cooldown) and cooldown >= 0 else 5.0
 
+    @staticmethod
+    def _parse_bandit_state_max_age(value) -> Optional[int]:
+        """正規化 bandit 狀態過期秒數；非正/非法/None → None（永不過期）。"""
+        if value is None:
+            return None
+        try:
+            secs = int(value)
+        except (TypeError, ValueError):
+            return None
+        return secs if secs > 0 else None
+
     @classmethod
     def from_dict(cls, data: dict) -> 'GlobalConfig':
         config = cls(
@@ -200,6 +216,9 @@ class GlobalConfig:
             telegram_risk_alert_enabled=bool(data.get("telegram_risk_alert_enabled", True)),
             telegram_risk_alert_cooldown=cls._parse_risk_alert_cooldown(data.get("telegram_risk_alert_cooldown")),
             telegram_daily_pnl_hour=cls._parse_daily_pnl_hour(data.get("telegram_daily_pnl_hour")),
+            bandit_state_path=data.get("bandit_state_path") or None,
+            bandit_state_max_age_sec=cls._parse_bandit_state_max_age(
+                data.get("bandit_state_max_age_sec")),
         )
         for k, v in data.get("symbols", {}).items():
             config.symbols[k] = SymbolConfig.from_dict(v)
