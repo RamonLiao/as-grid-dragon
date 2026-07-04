@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from backtest.data_loader import DataLoader
 
 
@@ -76,3 +76,43 @@ def test_load_funding_mid_pagination_failure_does_not_poison_cache(tmp_path):
     fmap2 = loader.load_funding("BTCUSDC", datetime(2001, 9, 9), datetime(2001, 9, 10), exchange=ex2)
     assert ex2.calls == 2
     assert fmap2 == {1_000_000_000: 0.0001, 1_000_028_800: -0.0002}
+
+
+class _CapturingExchange:
+    """記錄呼叫時收到的 since，並依 end 邊界回傳一筆邊界內/邊界外的 item 驗證 end_ms 排除邏輯。"""
+    def __init__(self, end_ms):
+        self.calls = 0
+        self.captured_since = None
+        self._end_ms = end_ms
+
+    def fetch_funding_rate_history(self, symbol, since=None, limit=None, params=None):
+        self.calls += 1
+        if self.calls == 1:
+            self.captured_since = since
+            return [
+                {"timestamp": self._end_ms, "fundingRate": 0.0001},          # 應被納入（等於 since 起點日）
+                {"timestamp": self._end_ms + 86400_000, "fundingRate": 0.9},  # >= end_ms 排除
+            ]
+        return []
+
+
+def test_load_funding_window_is_utc_not_local_tz(tmp_path):
+    """回歸測試（final-review I1）：since/end_ms 必須以 UTC 計算，不受本地時區影響。
+
+    datetime(2001, 9, 9, tzinfo=timezone.utc).timestamp() == 999993600.0
+    → since 應精確為 999993600000（ms）。在非 UTC 本地時區（例如 Asia/Taipei，UTC+8）
+    若用 naive datetime().timestamp()（本地時區解讀），會得到 999964800000，與此不符。
+    """
+    expected_since = 999_993_600_000
+    assert int(datetime(2001, 9, 9, tzinfo=timezone.utc).timestamp() * 1000) == expected_since
+
+    loader = DataLoader(data_dir=str(tmp_path))
+    ex = _CapturingExchange(end_ms=expected_since)
+    fmap = loader.load_funding("BTCUSDC", datetime(2001, 9, 9), datetime(2001, 9, 9), exchange=ex)
+
+    assert ex.captured_since == expected_since
+
+    # end_ms = expected_since + 86400*1000（單日窗口）；邊界內納入，邊界外（>= end_ms）排除
+    assert (expected_since // 1000) in fmap
+    assert fmap[expected_since // 1000] == 0.0001
+    assert ((expected_since + 86400_000) // 1000) not in fmap

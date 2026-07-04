@@ -3,7 +3,7 @@
 支援多種交易對的歷史數據下載與載入
 """
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, List, Union
 import os
@@ -495,8 +495,8 @@ class DataLoader:
             exchange = self._create_exchange("binance")
 
         ccxt_symbol = symbol.replace("USDC", "/USDC").replace("USDT", "/USDT")
-        since = int(datetime(start.year, start.month, start.day).timestamp() * 1000)
-        end_ms = int((datetime(end.year, end.month, end.day).timestamp() + 86400) * 1000)
+        since = int(datetime(start.year, start.month, start.day, tzinfo=timezone.utc).timestamp() * 1000)
+        end_ms = int((datetime(end.year, end.month, end.day, tzinfo=timezone.utc).timestamp() + 86400) * 1000)
 
         rows = []
         seen = set()
