@@ -112,6 +112,10 @@ def load_bandit_state(bandit, path: str, max_age_sec: Optional[float] = None) ->
     state.pop("current_arm_idx", None)   # 不復原瞬時選擇：讓 select_arm 在 live data 重選
     state.pop("current_context", None)   # price_history 未持久化，context 重新暖機
     _sanitize_state(state)
-    bandit.load_state(state)
+    try:
+        bandit.load_state(state)
+    except Exception as e:
+        logger.warning("[Bandit] 套用狀態失敗（資料損毀），冷啟動: %s", e)
+        return False
     logger.info("[Bandit] 載入狀態 total_pulls=%s", bandit.total_pulls)
     return True

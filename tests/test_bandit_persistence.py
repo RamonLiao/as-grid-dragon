@@ -175,3 +175,37 @@ def test_max_age_unparseable_saved_at_is_stale(tmp_path):
     env["saved_at"] = "not-a-timestamp"
     (tmp_path / "s.json").write_text(json.dumps(env))
     assert load_bandit_state(_bandit(), path, max_age_sec=60) is False  # 無法解析視為過期
+
+
+def test_corrupted_pull_counts_non_numeric_key_cold_starts(tmp_path):
+    """pull_counts 包含非數字 key 時，load_bandit_state 應回 False 不 raise。"""
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    # 竄改 pull_counts，加入非數字 key
+    env["state"]["pull_counts"]["abc"] = 3
+    (tmp_path / "s.json").write_text(json.dumps(env))
+
+    b2 = _bandit()
+    # 呼叫不應 raise，應回 False；且 bandit 仍可用（select_arm 不拋例外）
+    result = load_bandit_state(b2, path)
+    assert result is False  # 應回 False（資料損毀，冷啟動）
+    assert 0 <= b2.select_arm() < len(b2.arms)  # 損毀後仍可安全使用
+
+
+def test_corrupted_rewards_non_list_value_cold_starts(tmp_path):
+    """rewards 包含非 list value 時，load_bandit_state 應回 False 不 raise。"""
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    # 竄改 rewards，某個 value 改成整數而非 list
+    env["state"]["rewards"]["0"] = 5
+    (tmp_path / "s.json").write_text(json.dumps(env))
+
+    b2 = _bandit()
+    # 呼叫不應 raise，應回 False；且 bandit 仍可用（select_arm 不拋例外）
+    result = load_bandit_state(b2, path)
+    assert result is False  # 應回 False（資料損毀，冷啟動）
+    assert 0 <= b2.select_arm() < len(b2.arms)  # 損毀後仍可安全使用
