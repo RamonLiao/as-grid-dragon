@@ -10,6 +10,7 @@ MAX 增強模組
 """
 
 import time
+import hashlib
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple
 from collections import deque
@@ -492,6 +493,12 @@ class UCBBanditOptimizer:
             'dynamic_arm': str(self.dynamic_arm) if self.dynamic_arm else None,
             'arm_stats': arm_stats
         }
+
+    def arm_signature(self) -> str:
+        """arms 定義的穩定簽章；arms 數量/順序/參數值任一改變則簽章改變。
+        用於持久化：載入時簽章不符即捨棄舊狀態冷啟動，避免 arm index 錯位學錯。"""
+        payload = [(a.gamma, a.grid_spacing, a.take_profit_spacing) for a in self.arms]
+        return hashlib.sha1(repr(payload).encode()).hexdigest()
 
     def to_dict(self) -> dict:
         """序列化狀態"""

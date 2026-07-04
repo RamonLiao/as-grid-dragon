@@ -1,7 +1,10 @@
 import json
+import os
 from indicators.bandit import UCBBanditOptimizer, ParameterArm, MarketContext
 from grid_engine.enhancements import BanditConfig
 from grid_engine.bandit_persistence import save_bandit_state, load_bandit_state, SCHEMA_VERSION
+from grid_engine.bot import MaxGridBot
+from grid_engine.config import GlobalConfig
 
 
 def _bandit():
@@ -192,6 +195,50 @@ def test_corrupted_pull_counts_non_numeric_key_cold_starts(tmp_path):
     result = load_bandit_state(b2, path)
     assert result is False  # 應回 False（資料損毀，冷啟動）
     assert 0 <= b2.select_arm() < len(b2.arms)  # 損毀後仍可安全使用
+
+
+def _bot(tmp_path, enabled=True):
+    cfg = GlobalConfig()
+    cfg.bandit.enabled = enabled
+    cfg.bandit.cold_start_enabled = False  # 冷啟動會預載 pulls，干擾 total_pulls 斷言
+    bot = MaxGridBot(cfg)
+    bot._bandit_state_path = str(tmp_path / "bandit_state.json")
+    bot._bandit_last_saved_pulls = 0
+    return bot
+
+
+def test_maybe_persist_writes_on_pull_change(tmp_path):
+    bot = _bot(tmp_path)
+    for _ in range(bot.bandit_optimizer.config.update_interval):
+        bot.bandit_optimizer.record_trade(1.0, "long")
+    assert bot.bandit_optimizer.total_pulls == 1
+    bot._maybe_persist_bandit_state()
+    assert os.path.exists(bot._bandit_state_path)
+    assert bot._bandit_last_saved_pulls == 1
+
+
+def test_maybe_persist_noop_when_no_pull_change(tmp_path):
+    bot = _bot(tmp_path)
+    bot._maybe_persist_bandit_state()  # total_pulls 0 == last 0
+    assert not os.path.exists(bot._bandit_state_path)
+
+
+def test_disabled_bandit_never_writes(tmp_path):
+    bot = _bot(tmp_path, enabled=False)
+    bot._persist_bandit_state()
+    bot._maybe_persist_bandit_state()
+    assert not os.path.exists(bot._bandit_state_path)
+
+
+def test_persist_swallows_errors(tmp_path):
+    bot = _bot(tmp_path)
+    for _ in range(bot.bandit_optimizer.config.update_interval):
+        bot.bandit_optimizer.record_trade(1.0, "long")
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")                    # 用檔案當目錄 → makedirs 失敗
+    bot._bandit_state_path = str(blocker / "sub" / "state.json")
+    bot._persist_bandit_state()                # 不可 raise
+    assert not (blocker / "sub").exists()
 
 
 def test_corrupted_rewards_non_list_value_cold_starts(tmp_path):

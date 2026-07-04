@@ -106,6 +106,8 @@ class MaxGridBot:
 
         # 學習模組 (Bandit + DGT)
         self.bandit_optimizer = UCBBanditOptimizer(config.bandit)
+        self._bandit_state_path = None
+        self._bandit_last_saved_pulls = 0
         self.dgt_manager = DGTBoundaryManager(config.dgt)
 
         # 領先指標系統
@@ -907,6 +909,7 @@ class MaxGridBot:
 
                     trade_side = 'long' if position_side == 'LONG' else 'short'
                     self.bandit_optimizer.record_trade(realized_pnl, trade_side)
+                    self._maybe_persist_bandit_state()
 
                     self.dgt_manager.accumulated_profits[ccxt_symbol] = \
                         self.dgt_manager.accumulated_profits.get(ccxt_symbol, 0) + realized_pnl
@@ -1062,6 +1065,20 @@ class MaxGridBot:
                     getattr(self.config, "decision_log_path", None) or "logs/decisions.jsonl"
                 )
 
+            # Bandit 狀態預設路徑 + 啟動載入（已學到的統計跨重啟延續）
+            if getattr(self, "_bandit_state_path", None) is None:
+                self._bandit_state_path = (
+                    getattr(self.config, "bandit_state_path", None) or "logs/bandit_state.json"
+                )
+            if self.config.bandit.enabled:
+                from grid_engine.bandit_persistence import load_bandit_state
+                if load_bandit_state(
+                    self.bandit_optimizer,
+                    self._bandit_state_path,
+                    getattr(self.config, "bandit_state_max_age_sec", None),
+                ):
+                    self._bandit_last_saved_pulls = self.bandit_optimizer.total_pulls
+
             await self.sync_all()
         except Exception as e:
             logger.error(f"[MAX] 初始化失敗: {e}")
@@ -1095,12 +1112,32 @@ class MaxGridBot:
         finally:
             await self.stop()
 
+    def _persist_bandit_state(self):
+        """best-effort 存 bandit 狀態；僅 enabled 時存，失敗只 log 不炸主流程。"""
+        if not self.config.bandit.enabled:
+            return
+        path = getattr(self, "_bandit_state_path", None) or "logs/bandit_state.json"
+        try:
+            from grid_engine.bandit_persistence import save_bandit_state
+            save_bandit_state(self.bandit_optimizer, path)
+        except Exception as e:
+            logger.warning(f"[Bandit] 狀態存檔失敗: {e}")
+
+    def _maybe_persist_bandit_state(self):
+        """bandit 評估過（total_pulls 變化）才落地，寫檔次數 = 評估次數。"""
+        if self.bandit_optimizer.total_pulls != self._bandit_last_saved_pulls:
+            self._persist_bandit_state()
+            self._bandit_last_saved_pulls = self.bandit_optimizer.total_pulls
+
     async def stop(self):
         # 發送停止通知
         try:
             await self.notifier.notify_stop()
         except Exception:
             pass
+
+        # best-effort 收尾：落地最新 bandit 狀態
+        self._persist_bandit_state()
 
         self._stop_event.set()
         self.state.running = False
