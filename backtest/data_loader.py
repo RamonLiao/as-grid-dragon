@@ -500,6 +500,7 @@ class DataLoader:
 
         rows = []
         seen = set()
+        clean = False
         try:
             while since < end_ms:
                 batch = exchange.fetch_funding_rate_history(
@@ -519,11 +520,12 @@ class DataLoader:
                 if not progressed or last_ts < since:
                     break
                 since = last_ts + 1
+            clean = True
         except Exception:
-            # fidelity：抓取失敗回已知部分，不中斷回測
+            # fidelity：抓取失敗回已知部分，不中斷回測；但不快取部分結果，避免永久毒化快取
             pass
 
-        if rows:
+        if rows and clean:
             path.parent.mkdir(parents=True, exist_ok=True)
             pd.DataFrame(rows, columns=["settlement_time", "funding_rate"]).to_csv(
                 path, index=False)
