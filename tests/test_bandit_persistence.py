@@ -1,7 +1,6 @@
 import json
 import os
-from indicators.bandit import UCBBanditOptimizer, ParameterArm, MarketContext
-from grid_engine.enhancements import BanditConfig
+from grid_engine.enhancements import UCBBanditOptimizer, ParameterArm, MarketContext, BanditConfig
 from grid_engine.bandit_persistence import save_bandit_state, load_bandit_state, SCHEMA_VERSION
 from grid_engine.bot import MaxGridBot
 from grid_engine.config import GlobalConfig
