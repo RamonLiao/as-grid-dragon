@@ -1,9 +1,11 @@
 import json
 import os
+import dataclasses
 from grid_engine.enhancements import UCBBanditOptimizer, ParameterArm, MarketContext, BanditConfig
 from grid_engine.bandit_persistence import save_bandit_state, load_bandit_state, SCHEMA_VERSION
 from grid_engine.bot import MaxGridBot
 from grid_engine.config import GlobalConfig
+from grid_engine.decision import DecisionInputs
 
 
 def _bandit():
@@ -255,3 +257,41 @@ def test_corrupted_rewards_non_list_value_cold_starts(tmp_path):
     result = load_bandit_state(b2, path)
     assert result is False  # 應回 False（資料損毀，冷啟動）
     assert 0 <= b2.select_arm() < len(b2.arms)  # 損毀後仍可安全使用
+
+
+def test_empty_state_dict_loads_as_noop(tmp_path):
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["state"] = {}                          # 空 state（load_state 對空 dict 早退）
+    (tmp_path / "s.json").write_text(json.dumps(env))
+    b2 = _bandit()
+    assert load_bandit_state(b2, path) is True  # 不 crash
+    assert b2.total_pulls == 0
+
+
+def test_truncated_json_cold_starts(tmp_path):
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    full = (tmp_path / "s.json").read_text()
+    (tmp_path / "s.json").write_text(full[:len(full) // 2])  # 砍一半
+    assert load_bandit_state(_bandit(), path) is False
+
+
+def test_garbage_signature_type_cold_starts(tmp_path):
+    b = _trained_bandit()
+    path = str(tmp_path / "s.json")
+    save_bandit_state(b, path)
+    env = json.loads((tmp_path / "s.json").read_text())
+    env["arm_signature"] = 12345               # 非字串亂填
+    (tmp_path / "s.json").write_text(json.dumps(env))
+    assert load_bandit_state(_bandit(), path) is False
+
+
+def test_bandit_params_present_in_decision_inputs():
+    # F: bandit 覆寫的三個參數必須是 DecisionInputs 欄位，才會落進 decisions.jsonl、replay 才吃得到。
+    # 守住「#6 不回歸 #4 replay zero-diff」：bandit 只改未來選哪個 arm，每筆決策的參數已凍結在 log。
+    fields = {f.name for f in dataclasses.fields(DecisionInputs)}
+    assert {"gamma", "grid_spacing", "take_profit_spacing"} <= fields
