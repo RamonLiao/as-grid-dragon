@@ -50,12 +50,14 @@ bot.stop()     ──save(best-effort)──▶ 同上
 {
   "schema_version": 1,
   "arm_signature": "<sha1 hexdigest of [(gamma, grid_spacing, take_profit_spacing), ...]>",
+  "saved_at": "<ISO8601 UTC, datetime.utcnow().isoformat()>",
   "state": { "...bandit.to_dict() 原樣..." }
 }
 ```
 
 - `state` 直接嵌 `bandit.to_dict()`（`bandit.py:525`）的回傳，不改其結構。
-- **原子寫入**：寫 `<path>.tmp` → `os.replace(tmp, path)`（同檔系統 rename 原子）；先 `os.makedirs(os.path.dirname(path), exist_ok=True)`。
+- `saved_at` 供 staleness 判斷與觀測（見「載入時機」的 max-age gate）。
+- **原子寫入 + 持久化**：寫 `<path>.tmp` → `f.flush()` + `os.fsync(fd)` → `os.replace(tmp, path)`（同檔系統 rename 原子）→ `os.fsync(dir_fd)`。先 `os.makedirs(os.path.dirname(path), exist_ok=True)`。fsync 是為了 GCE VM 被 kill / 斷電時不留 0-byte / 截斷檔（load 端雖已 cold-start 兜底，但 fsync 讓「存了就真的存到」）。
 
 ## arm_signature
 
@@ -70,6 +72,7 @@ def arm_signature(self) -> str:
 
 - 純函數、無副作用、只讀 `self.arms`。是唯一動到 bandit.py 的地方。
 - **不**納入 `window_size` — window_size 變動不影響 index↔參數對應，`load_state` 已用 `deque(v, maxlen=window_size)` 重建（`bandit.py:554`），改窗大小仍可安全載入。
+- **不**納入 sizing 設定（`initial_quantity`/槓桿）：已驗證 `_calculate_reward`（`bandit.py:294-332`）是無量綱比值（Sharpe `mean/std` + `mdd/|total_pnl|` + win_rate），倉位線性縮放被比值抵銷；UCB/Thompson 只吃此無量綱 reward，唯一絕對尺度的 `cumulative_reward` 從不進選擇邏輯（純顯示）。故改 sizing 不會汙染 arm 比較，簽 arm 參數已足夠。（唯一殘留尺度依賴：`std_pnl` 硬底 0.001、`total_pnl != 0` 門檻，在 USDT 實務 PnL 量級下不觸發，不處理。）
 
 ## 存檔時機（事件驅動 + stop）
 
@@ -93,7 +96,12 @@ def arm_signature(self) -> str:
 | JSON parse 失敗 / 非 dict / 缺 `state` | 冷啟動 | warning |
 | `schema_version` 不符 | 冷啟動 | warning |
 | `arm_signature` 不符 | 冷啟動 | warning「arms 定義已變，捨棄舊 bandit 狀態」 |
-| 全部通過 | `bandit.load_state(payload['state'])` | info「載入 bandit 狀態 total_pulls=N」 |
+| `saved_at` 距今 > `bandit_state_max_age_sec`（若有設） | 冷啟動 | warning「bandit 狀態過期（停機 Xs），冷啟動」 |
+| 全部通過 | 見下「只復原學到的統計」 | info「載入 bandit 狀態 total_pulls=N」 |
+
+**只復原「學到的知識」，不復原「瞬時選擇」（C）**：套用前先從 `payload['state']` 剝掉 `current_arm_idx` 與 `current_context` 再交給 `bandit.load_state(...)`（`load_state` 用 `.get(..., default)`，剝掉即 fallback 到冷啟動預設 idx=0 / RANGING）。理由：`price_history`（deque maxlen 100）本就不持久化，重啟後 context 偵測要重新暖機；復原一個為「已消失 regime」選的 `current_arm_idx` = 拿舊選擇跑開機頭幾筆。學到的統計（`pull_counts`/`rewards`/`thompson_alpha,beta`/`context_pulls`/`cumulative_reward`）照常復原，`select_arm()` 會在 live data 上重選 arm。此做法不改 `bandit.load_state`（保持 to_dict↔load_state roundtrip 對稱給純層測試用），剝欄位在 persistence 層做。
+
+**非有限值 sanitize（D，硬性需求非邊角）**：套用前掃 `rewards` 各 deque，丟棄 `NaN`/`inf`（`math.isfinite` 過濾）；`thompson_alpha/beta` 非有限則重置為先驗 1.0。理由：單一 NaN 進 rewards deque → `np.mean` → NaN → UCB argmax 行為未定義，bandit 從此靜默壞掉不報錯。
 
 載入成功時同步把 `self._bandit_last_saved_pulls = bandit.total_pulls`（避免啟動後第一次評估前就多寫一次）。
 
@@ -103,7 +111,11 @@ def arm_signature(self) -> str:
 
 ## Config
 
-`config/models.py` 加 `bandit_state_path: Optional[str] = None`（GlobalConfig 層，非 BanditConfig，比照 `decision_log_path`）。None → bot 在 run() 套 default `logs/bandit_state.json`。from_dict 向後相容（舊 config 無此欄 → None → default）。
+`config/models.py`（GlobalConfig 層，非 BanditConfig，比照 `decision_log_path`）加：
+- `bandit_state_path: Optional[str] = None` → None 時 bot 在 run() 套 default `logs/bandit_state.json`。
+- `bandit_state_max_age_sec: Optional[int] = None` → None = 永不過期（預設不因停機時長丟棄狀態，避免驚喜）；設正整數則停機超過此秒數冷啟動。from_dict 正規化（非正值 / 非法型別 → None，比照 lessons「數值欄位 from_dict 正規化」）。
+
+兩者 from_dict 向後相容（舊 config 無此欄 → None → default 行為）。
 
 ## 錯誤處理總覽
 
@@ -116,12 +128,18 @@ def arm_signature(self) -> str:
 
 **純層 `tests/test_bandit_persistence.py`**
 - `arm_signature`：相同 arms 穩定、改任一 arm 參數 / 增刪 arm / 換順序 → 簽章變。
-- roundtrip：train 一個 bandit（跑數十筆 record_trade 觸發多次評估）→ save → 新 bandit load → 狀態等價（`current_arm_idx` / `total_pulls` / `pull_counts` / `rewards` / `thompson_alpha,beta` / `context_pulls` / `cumulative_reward`）。
+- roundtrip：train 一個 bandit（跑數十筆 record_trade 觸發多次評估）→ save → 新 bandit load → **學到的統計**等價（`total_pulls` / `pull_counts` / `rewards` / `thompson_alpha,beta` / `context_pulls` / `cumulative_reward`）。
+- **不復原瞬時選擇（C）**：存檔 state 的 `current_arm_idx` = 非 0、`current_context` = 非 RANGING → load 後 bandit 的 `current_arm_idx` 回 0、`current_context` 回 RANGING（統計仍復原）。
+- **非有限值 sanitize（D）**：存檔 rewards 含 `NaN`/`inf`、thompson α/β 含 `inf` → load 後該 deque 不含非有限值、α/β 重置 1.0；後續 `select_arm()` 回合法 index 不丟例外、無 NaN 傳播。
 - 相容拒絕：手改存檔 `arm_signature` → load 回 False、bandit 維持冷啟動預設。
 - `schema_version` 不符 → 拒絕。
+- **max-age 過期**：`saved_at` 設成很舊 + `bandit_state_max_age_sec` 設小值 → load 回 False 冷啟動；未設 max_age → 不因舊而拒。
 - 缺檔 → 回 False、不 raise。
 - 壞 JSON / 截斷檔 / 非 dict / 缺 `state` 欄 → 回 False、不 raise。
 - 原子寫：save 後無殘留 `.tmp`；目錄不存在會自動建。
+
+**replay invariant regression（F）**
+- 沿用 #4 replay 驗收：一段 live 決策序列（含 bandit 覆寫參數）落 `decisions.jsonl` → `replay.replay_file(...)` 期望 diff=0，**不受是否啟用 bandit 持久化影響**。斷言 bandit 選出的參數確實在 logged `DecisionInputs` 內（`gamma`/`grid_spacing`/`take_profit_spacing`），replay 不重建 bandit。守住「#6 不回歸 #4 zero-diff」。
 
 **bot 接線（擴充現有 bot 測試或新檔）**
 - `total_pulls` 因足量 record_trade 變化後 → 落地一次（用 `tmp_path` 指定 `bandit_state_path`）。
@@ -138,13 +156,19 @@ def arm_signature(self) -> str:
 
 > 注：最後一項 monkey 可能揭露 `bandit.load_state` 對 `pull_counts` / `thompson_alpha,beta` 未做 index 範圍過濾（只有 rewards 有 `if idx in self.rewards`）。若測試證實會導致後續 KeyError，於 load 路徑補範圍過濾（min-fix，不重寫 load_state）。
 
+## 已知限制（範圍外，標記待處理）
+
+- **全域單一 bandit 混跨 symbol PnL**：`self.bandit_optimizer` 一個實例吃所有 symbol 的 realized PnL 進同一組 arm 統計；持久化會把這個既有汙染永久烤進檔案。屬既有設計，per-symbol bandit 併未來 god-class 拆分（TODO #7）再處理。
+- **多 symbol 交錯覆寫 `max_enhancement.gamma`**：bandit 覆寫共享可變 config（`bot.py:622-627`）；目前單 symbol 路徑同步讀寫無並發，logged gamma == used gamma。未來多 symbol 共用同一 `max_enhancement` 實例交錯覆寫可能有 live 正確性 race（非 replay、非本任務）。
+- **`_calculate_reward` 極小 PnL 尺度依賴**：`std_pnl` 硬底 0.001、`total_pnl != 0` 絕對門檻，在 USDT 實務 PnL 量級下不觸發，不處理。
+
 ## 動到的檔
 
 - **新增** `grid_engine/bandit_persistence.py`
 - **新增** `tests/test_bandit_persistence.py`
 - **改** `indicators/bandit.py`：加 `arm_signature()` + `import hashlib`
 - **改** `grid_engine/bot.py`：`run()` 載入、record_trade 段條件 save、`stop()` best-effort save、`__init__` 加 `_bandit_last_saved_pulls` / `_bandit_state_path`
-- **改** `config/models.py`：GlobalConfig 加 `bandit_state_path`
+- **改** `config/models.py`：GlobalConfig 加 `bandit_state_path` + `bandit_state_max_age_sec`（含 from_dict 正規化）
 
 ## 驗收
 
