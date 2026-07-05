@@ -42,7 +42,7 @@ grid_engine/
 | `RestGateway` | `_rest`(163)、executor 建立(96)、`shutdown(cancel_futures=True)`(1153) | `_rest_executor`（max_workers=1） | — |
 | `OrderExecutor` | `place_order`(370)、`_register_order_failure`(409)、`cancel_orders_for_side`(432)、`_close_symbol_positions`(342)、`is_blocked(symbol)` 查詢介面 | `_order_fail_counts`、`_order_block_until`、`_order_seq` | gateway、ctx（讀 exchange/precisions）、state、notifier、config、SymbolLocks、`_stop_event`、task registry（bot.tasks，斷路通知 task 防 GC + stop 可 cancel，見 bot.py:423） |
 | `SyncService` | `sync_all`(175)、`_sync_positions`(196)、`_sync_orders`(224)、`_sync_account`(256)、`_sync_funding_rates`(184)、`maybe_sync()`（收編 _handle_ticker:806-808 的 interval gating） | `_sync_lock`、`last_sync_time` | gateway、ctx（讀 exchange/funding_manager）、state、SymbolLocks、notifier、RiskMonitor（_sync_account:289-292 反向呼叫 risk/trailing） |
-| `WsClient` | `_websocket_loop`(938)、`_get_listen_key`(171)、`_keep_alive_loop`(980) | `listen_key` | gateway、ctx（讀 exchange）、config、`_stop_event`、handler callbacks（bot 註冊） |
+| `WsClient` | `_websocket_loop`(938)、`_get_listen_key`(171)、`_keep_alive_loop`(980) | `listen_key` | gateway、ctx（讀 exchange）、config、state（寫 `state.connected`）、`_stop_event`、handler callbacks（bot 註冊） |
 | `RiskMonitor` | `_check_trailing_stop`(296)、`_check_and_reduce_positions`(535)、`_check_risk_and_notify`(1037) | `last_risk_alert_time` | state、OrderExecutor（平倉/減倉）、notifier、config |
 | `DailyReporter` | `_daily_pnl_loop`(992) | 排程時間狀態 | state、notifier、config、`_stop_event` |
 | `SymbolLocks` | `_symbol_lock`(168) 懶初始化 | `_symbol_locks` dict | — |
