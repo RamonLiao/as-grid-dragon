@@ -151,3 +151,29 @@ def test_bot_two_phase_init_propagates_to_components():
     bot.funding_manager = MagicMock()
     assert bot.order_executor.ctx.exchange is bot.exchange
     assert bot.sync_service.ctx.funding_manager is bot.funding_manager
+
+
+def test_monkey_cross_component_lock_contention():
+    """SyncService 原子區與 bot 網格鏈（adjust_grid skip-if-locked）搶同一把
+    symbol lock：50 並發下鎖內臨界區不得交錯（#3 語意跨組件仍成立）"""
+    locks = SymbolLocks()
+    sym = "BNB/USDC:USDC"
+    in_critical = []
+    violations = []
+
+    async def worker(i):
+        lock = locks.get(sym)
+        if i % 3 == 0 and lock.locked():
+            return                      # 模擬 adjust_grid 的 skip-if-locked
+        async with lock:
+            in_critical.append(i)
+            if len(in_critical) > 1:
+                violations.append(tuple(in_critical))
+            await asyncio.sleep(0)      # 讓出 event loop，製造交錯機會
+            in_critical.remove(i)
+
+    async def main():
+        await asyncio.gather(*[worker(i) for i in range(50)])
+
+    asyncio.run(main())
+    assert violations == []
