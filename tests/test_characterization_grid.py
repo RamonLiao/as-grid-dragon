@@ -22,8 +22,8 @@ def _make_bot(**enh_kwargs):
     )}
     cfg.max_enhancement = MaxEnhancement(**enh_kwargs)  # 預設全關 → manager 回中性值
     bot = MaxGridBot(cfg)
-    bot.place_order = AsyncMock()
-    bot.cancel_orders_for_side = AsyncMock()
+    bot.order_executor.place_order = AsyncMock()
+    bot.order_executor.cancel_orders_for_side = AsyncMock()
     return bot
 
 
@@ -45,9 +45,9 @@ async def test_normal_mode_long_places_tp_and_entry():
            sell_long_orders=0)  # threshold = 3*20 = 60，10 < 60 → 正常
     await bot._place_grid(SYMBOL, sc, "long")
 
-    bot.cancel_orders_for_side.assert_awaited_once_with(SYMBOL, "long")
+    bot.order_executor.cancel_orders_for_side.assert_awaited_once_with(SYMBOL, "long")
     # tp_price = 2.5*(1+0.004)=2.51, entry = 2.5*(1-0.006)=2.485
-    calls = bot.place_order.await_args_list
+    calls = bot.order_executor.place_order.await_args_list
     assert calls[0] == call(SYMBOL, "sell", pytest.approx(2.51), 3.0, True, "long")
     assert calls[1] == call(SYMBOL, "buy", pytest.approx(2.485), 3.0, False, "long")
 
@@ -62,10 +62,10 @@ async def test_dead_mode_enter_places_special_tp_no_cancel():
     st = _state(bot, latest_price=2.5, long_position=70, short_position=0,
                 sell_long_orders=0, long_dead_mode=False)
     await bot._place_grid(SYMBOL, sc, "long")
-    bot.cancel_orders_for_side.assert_not_awaited()
+    bot.order_executor.cancel_orders_for_side.assert_not_awaited()
     assert st.long_dead_mode is True
     # 無對手倉 → fallback 1.05 → 2.625；tp_qty：long_pos(70) > limit(15) → 加倍 = 6
-    bot.place_order.assert_awaited_once_with(
+    bot.order_executor.place_order.assert_awaited_once_with(
         SYMBOL, "sell", pytest.approx(2.625), 6.0, True, "long")
 
 
@@ -76,7 +76,7 @@ async def test_dead_mode_with_pending_tp_does_nothing():
     sc = bot.config.symbols[SYMBOL]
     _state(bot, latest_price=2.5, long_position=70, sell_long_orders=1, long_dead_mode=True)
     await bot._place_grid(SYMBOL, sc, "long")
-    bot.place_order.assert_not_awaited()
+    bot.order_executor.place_order.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -86,7 +86,7 @@ async def test_dead_mode_price_with_opposite_position():
     sc = bot.config.symbols[SYMBOL]
     _state(bot, latest_price=2.5, long_position=70, short_position=35, sell_long_orders=0)
     await bot._place_grid(SYMBOL, sc, "long")
-    price_arg = bot.place_order.await_args_list[0].args[2]
+    price_arg = bot.order_executor.place_order.await_args_list[0].args[2]
     assert price_arg == pytest.approx(2.55)
 
 
@@ -101,9 +101,9 @@ async def test_normal_mode_short_places_tp_and_entry():
            buy_short_orders=0)  # threshold = 60，10 < 60 → 正常
     await bot._place_grid(SYMBOL, sc, "short")
 
-    bot.cancel_orders_for_side.assert_awaited_once_with(SYMBOL, "short")
+    bot.order_executor.cancel_orders_for_side.assert_awaited_once_with(SYMBOL, "short")
     # tp_price = 2.5*(1-0.004)=2.49, entry = 2.5*(1+0.006)=2.515
-    calls = bot.place_order.await_args_list
+    calls = bot.order_executor.place_order.await_args_list
     assert calls[0] == call(SYMBOL, "buy", pytest.approx(2.49), 3.0, True, "short")
     assert calls[1] == call(SYMBOL, "sell", pytest.approx(2.515), 3.0, False, "short")
 
@@ -118,10 +118,10 @@ async def test_dead_mode_enter_places_special_tp_no_cancel_short():
     st = _state(bot, latest_price=2.5, long_position=0, short_position=70,
                 buy_short_orders=0, short_dead_mode=False)
     await bot._place_grid(SYMBOL, sc, "short")
-    bot.cancel_orders_for_side.assert_not_awaited()
+    bot.order_executor.cancel_orders_for_side.assert_not_awaited()
     assert st.short_dead_mode is True
     # 無對手倉 → fallback 0.95 → 2.375；tp_qty：short_pos(70) > limit(15) → 加倍 = 6
-    bot.place_order.assert_awaited_once_with(
+    bot.order_executor.place_order.assert_awaited_once_with(
         SYMBOL, "buy", pytest.approx(2.375), 6.0, True, "short")
 
 
@@ -133,7 +133,7 @@ async def test_dead_mode_with_pending_tp_does_nothing_short():
     _state(bot, latest_price=2.5, long_position=0, short_position=70,
            buy_short_orders=1, short_dead_mode=True)
     await bot._place_grid(SYMBOL, sc, "short")
-    bot.place_order.assert_not_awaited()
+    bot.order_executor.place_order.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -144,7 +144,7 @@ async def test_dead_mode_price_with_opposite_position_short():
     sc = bot.config.symbols[SYMBOL]
     _state(bot, latest_price=2.5, long_position=35, short_position=70, buy_short_orders=0)
     await bot._place_grid(SYMBOL, sc, "short")
-    price_arg = bot.place_order.await_args_list[0].args[2]
+    price_arg = bot.order_executor.place_order.await_args_list[0].args[2]
     assert price_arg == pytest.approx(2.5 / 1.02)
 
 

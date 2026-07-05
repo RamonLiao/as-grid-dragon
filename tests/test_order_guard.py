@@ -64,8 +64,8 @@ class TestClientOrderId:
     @pytest.mark.asyncio
     async def test_client_order_id_attached_and_unique(self):
         bot = _make_bot()
-        await bot.place_order(SYM, "buy", 600.0, 1.0)
-        await bot.place_order(SYM, "buy", 600.0, 1.0)
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
 
         calls = bot.exchange.create_order.call_args_list
         assert len(calls) == 2
@@ -80,7 +80,7 @@ class TestClientOrderId:
     @pytest.mark.asyncio
     async def test_market_order_also_gets_client_order_id(self):
         bot = _make_bot()
-        await bot.place_order(SYM, "sell", 0, 1.0, True, "long", "market")
+        await bot.order_executor.place_order(SYM, "sell", 0, 1.0, True, "long", "market")
         params = bot.exchange.create_order.call_args.kwargs.get("params")
         assert params and "clientOrderId" in params
 
@@ -93,8 +93,8 @@ class TestBackoff:
         bot = _make_bot()
         bot.exchange.create_order.side_effect = Exception("Margin is insufficient")
 
-        assert await bot.place_order(SYM, "buy", 600.0, 1.0) is None
-        assert await bot.place_order(SYM, "buy", 600.0, 1.0) is None
+        assert await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0) is None
+        assert await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0) is None
         # 第二次在封鎖期內，不應打到交易所
         assert bot.exchange.create_order.call_count == 1
 
@@ -103,11 +103,11 @@ class TestBackoff:
         bot = _make_bot()
         bot.exchange.create_order.side_effect = Exception("boom")
 
-        await bot.place_order(SYM, "buy", 600.0, 1.0)
-        first_block = bot._order_block_until[SYM] - _time.time()
-        bot._order_block_until[SYM] = 0  # 模擬封鎖期已過
-        await bot.place_order(SYM, "buy", 600.0, 1.0)
-        second_block = bot._order_block_until[SYM] - _time.time()
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
+        first_block = bot.order_executor._order_block_until[SYM] - _time.time()
+        bot.order_executor._order_block_until[SYM] = 0  # 模擬封鎖期已過
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
+        second_block = bot.order_executor._order_block_until[SYM] - _time.time()
 
         assert first_block == pytest.approx(ORDER_BACKOFF_BASE, abs=0.5)
         assert second_block == pytest.approx(ORDER_BACKOFF_BASE * 2, abs=0.5)
@@ -116,19 +116,19 @@ class TestBackoff:
     async def test_backoff_capped(self):
         bot = _make_bot()
         bot.exchange.create_order.side_effect = Exception("boom")
-        bot._order_fail_counts[SYM] = ORDER_CIRCUIT_THRESHOLD - 2  # 下一次未達斷路
+        bot.order_executor._order_fail_counts[SYM] = ORDER_CIRCUIT_THRESHOLD - 2  # 下一次未達斷路
 
-        await bot.place_order(SYM, "buy", 600.0, 1.0)
-        block = bot._order_block_until[SYM] - _time.time()
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
+        block = bot.order_executor._order_block_until[SYM] - _time.time()
         assert block <= ORDER_BACKOFF_CAP + 0.5
 
     @pytest.mark.asyncio
     async def test_success_resets_failures(self):
         bot = _make_bot()
-        bot._order_fail_counts[SYM] = 3
+        bot.order_executor._order_fail_counts[SYM] = 3
 
-        await bot.place_order(SYM, "buy", 600.0, 1.0)
-        assert bot._order_fail_counts[SYM] == 0
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
+        assert bot.order_executor._order_fail_counts[SYM] == 0
 
     @pytest.mark.asyncio
     async def test_reduce_only_success_does_not_reset_streak(self):
@@ -138,17 +138,17 @@ class TestBackoff:
         會重置計數，斷路閾值永遠達不到。
         """
         bot = _make_bot()
-        bot._order_fail_counts[SYM] = 4
+        bot.order_executor._order_fail_counts[SYM] = 4
 
-        await bot.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
-        assert bot._order_fail_counts[SYM] == 4  # 不因 TP 成功歸零
+        await bot.order_executor.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
+        assert bot.order_executor._order_fail_counts[SYM] == 4  # 不因 TP 成功歸零
 
     @pytest.mark.asyncio
     async def test_block_is_per_symbol(self):
         bot = _make_bot()
-        bot._order_block_until[SYM] = _time.time() + 999
+        bot.order_executor._order_block_until[SYM] = _time.time() + 999
         other = "BTC/USDC:USDC"
-        await bot.place_order(other, "buy", 60000.0, 0.001)
+        await bot.order_executor.place_order(other, "buy", 60000.0, 0.001)
         assert bot.exchange.create_order.call_count == 1
 
 
@@ -159,21 +159,21 @@ class TestCircuitBreaker:
     async def test_trips_at_threshold_with_long_cooldown_and_single_notify(self):
         bot = _make_bot()
         bot.exchange.create_order.side_effect = Exception("boom")
-        bot.notifier = MagicMock()
-        bot.notifier.send = AsyncMock()
-        bot._order_fail_counts[SYM] = ORDER_CIRCUIT_THRESHOLD - 1
+        bot.order_executor.notifier = MagicMock()
+        bot.order_executor.notifier.send = AsyncMock()
+        bot.order_executor._order_fail_counts[SYM] = ORDER_CIRCUIT_THRESHOLD - 1
 
-        await bot.place_order(SYM, "buy", 600.0, 1.0)  # 第 threshold 次失敗
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)  # 第 threshold 次失敗
         await asyncio.sleep(0)  # 讓 fire-and-forget task 跑
 
-        block = bot._order_block_until[SYM] - _time.time()
+        block = bot.order_executor._order_block_until[SYM] - _time.time()
         assert block == pytest.approx(ORDER_CIRCUIT_COOLDOWN, abs=1.0)
-        assert bot.notifier.send.await_count == 1
+        assert bot.order_executor.notifier.send.await_count == 1
 
         # 封鎖期內再叫 place_order：被跳過，不再通知
-        await bot.place_order(SYM, "buy", 600.0, 1.0)
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
         await asyncio.sleep(0)
-        assert bot.notifier.send.await_count == 1
+        assert bot.order_executor.notifier.send.await_count == 1
 
     @pytest.mark.asyncio
     async def test_interleaved_tp_success_entry_failure_still_trips_circuit(self):
@@ -188,27 +188,27 @@ class TestCircuitBreaker:
 
         bot.exchange.create_order.side_effect = flaky
         for _ in range(ORDER_CIRCUIT_THRESHOLD):
-            await bot.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
-            bot._order_block_until[SYM] = 0  # 模擬退避期已過
-            await bot.place_order(SYM, "buy", 600.0, 1.0)
+            await bot.order_executor.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
+            bot.order_executor._order_block_until[SYM] = 0  # 模擬退避期已過
+            await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
 
-        block = bot._order_block_until[SYM] - _time.time()
+        block = bot.order_executor._order_block_until[SYM] - _time.time()
         assert block == pytest.approx(ORDER_CIRCUIT_COOLDOWN, abs=1.0)
 
     @pytest.mark.asyncio
     async def test_reduce_only_bypasses_block(self):
         bot = _make_bot()
-        bot._order_block_until[SYM] = _time.time() + 999
+        bot.order_executor._order_block_until[SYM] = _time.time() + 999
 
-        await bot.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
+        await bot.order_executor.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
         assert bot.exchange.create_order.call_count == 1
 
     @pytest.mark.asyncio
     async def test_open_order_skipped_while_blocked(self):
         bot = _make_bot()
-        bot._order_block_until[SYM] = _time.time() + 999
+        bot.order_executor._order_block_until[SYM] = _time.time() + 999
 
-        assert await bot.place_order(SYM, "buy", 600.0, 1.0) is None
+        assert await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0) is None
         assert bot.exchange.create_order.call_count == 0
 
 
@@ -222,11 +222,11 @@ class TestPositionAdjustCooldown:
         st = bot.state.symbols[sym]
         st.long_position = 0
         st.short_position = 0
-        bot._order_block_until[sym] = _time.time() + 999
-        bot.cancel_orders_for_side = AsyncMock()
+        bot.order_executor._order_block_until[sym] = _time.time() + 999
+        bot.order_executor.cancel_orders_for_side = AsyncMock()
 
         await bot.adjust_grid(sym)
-        bot.cancel_orders_for_side.assert_not_called()
+        bot.order_executor.cancel_orders_for_side.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_positioned_adjust_respects_cooldown(self):
@@ -304,8 +304,8 @@ class TestOrderGuardMonkey:
     @pytest.mark.asyncio
     async def test_client_order_id_within_binance_36_char_limit(self):
         bot = _make_bot()
-        bot._order_seq = 10**9  # 模擬長期運行後的序號
-        await bot.place_order(SYM, "buy", 600.0, 1.0)
+        bot.order_executor._order_seq = 10**9  # 模擬長期運行後的序號
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)
         params = bot.exchange.create_order.call_args.kwargs.get("params")
         assert len(params["clientOrderId"]) <= 36
 
@@ -313,9 +313,9 @@ class TestOrderGuardMonkey:
     async def test_huge_fail_count_does_not_overflow(self):
         bot = _make_bot()
         bot.exchange.create_order.side_effect = Exception("boom")
-        bot._order_fail_counts[SYM] = 10**6  # 遠超閾值
-        await bot.place_order(SYM, "buy", 600.0, 1.0)  # 不應 OverflowError
-        block = bot._order_block_until[SYM] - _time.time()
+        bot.order_executor._order_fail_counts[SYM] = 10**6  # 遠超閾值
+        await bot.order_executor.place_order(SYM, "buy", 600.0, 1.0)  # 不應 OverflowError
+        block = bot.order_executor._order_block_until[SYM] - _time.time()
         assert block == pytest.approx(ORDER_CIRCUIT_COOLDOWN, abs=1.0)
 
     @pytest.mark.asyncio
@@ -323,8 +323,8 @@ class TestOrderGuardMonkey:
         """止盈單失敗也累積退避狀態（但下次 reduce_only 仍放行）"""
         bot = _make_bot()
         bot.exchange.create_order.side_effect = Exception("boom")
-        await bot.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
-        assert bot._order_fail_counts[SYM] == 1
+        await bot.order_executor.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
+        assert bot.order_executor._order_fail_counts[SYM] == 1
         # reduce_only 不受封鎖，重試仍會打到交易所
-        await bot.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
+        await bot.order_executor.place_order(SYM, "sell", 610.0, 1.0, reduce_only=True, position_side="long")
         assert bot.exchange.create_order.call_count == 2

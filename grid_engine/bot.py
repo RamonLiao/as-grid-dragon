@@ -29,15 +29,14 @@ from .notifier import TelegramNotifier
 from .context import ExchangeContext
 from .locks import SymbolLocks
 from .rest_gateway import RestGateway
+from .order_executor import (
+    OrderExecutor,
+    ORDER_BACKOFF_BASE, ORDER_BACKOFF_CAP,
+    ORDER_CIRCUIT_THRESHOLD, ORDER_CIRCUIT_COOLDOWN,
+)
 
 # 風控警報冷卻秒數預設值（可由 config telegram_risk_alert_cooldown 覆寫）
 RISK_ALERT_COOLDOWN = 300
-
-# 下單失敗退避：首次封鎖秒數、指數退避上限、連續失敗斷路閾值、斷路冷卻秒數
-ORDER_BACKOFF_BASE = 2.0
-ORDER_BACKOFF_CAP = 60.0
-ORDER_CIRCUIT_THRESHOLD = 10
-ORDER_CIRCUIT_COOLDOWN = 300.0
 
 
 def _create_exchange(exchange_id: str, config: dict):
@@ -87,14 +86,16 @@ class MaxGridBot:
             chat_id=config.telegram_chat_id,
             switch_on=getattr(config, "telegram_enabled", True),
         )
+        # 下單/撤單執行組件（斷路器/退避狀態在 executor 內；tasks 傳共享參照）
+        self.order_executor = OrderExecutor(
+            gateway=self.gateway, ctx=self.ctx, state=self.state,
+            notifier=self.notifier, config=self.config, locks=self.locks,
+            stop_event=self._stop_event, tasks=self.tasks,
+        )
+
         self.last_sync_time = 0
         self.last_order_times: Dict[str, float] = {}
         self.last_risk_alert_time = 0.0
-
-        # 下單失敗退避/斷路器（per symbol）
-        self._order_fail_counts: Dict[str, int] = {}
-        self._order_block_until: Dict[str, float] = {}
-        self._order_seq = 0
 
         # 並發鎖：sync 防重入（鎖序固定 _sync_lock → symbol lock）
         self._sync_lock = asyncio.Lock()
@@ -344,7 +345,7 @@ class MaxGridBot:
 
                 if drawdown >= trigger and peak > 0:
                     logger.info(f"[追蹤止盈] {sym_config.symbol} 觸發! 最高:{peak:.2f}, 當前:{current_pnl:.2f}, 回撤:{drawdown:.2f}")
-                    await self._close_symbol_positions(ccxt_symbol, sym_config)
+                    await self.order_executor.close_symbol_positions(ccxt_symbol, sym_config)
                     self.state.trailing_active[ccxt_symbol] = False
                     self.state.peak_pnl[ccxt_symbol] = 0
 
@@ -353,119 +354,6 @@ class MaxGridBot:
                     self.state.trailing_active[ccxt_symbol] = True
                     self.state.peak_pnl[ccxt_symbol] = current_pnl
                     logger.info(f"[追蹤止盈] {sym_config.symbol} 開始追蹤! 浮盈: {current_pnl:.2f}U")
-
-    async def _close_symbol_positions(self, ccxt_symbol: str, sym_config: SymbolConfig):
-        """平倉指定交易對"""
-        async with self.locks.get(ccxt_symbol):
-            try:
-                sym_state = self.state.symbols.get(ccxt_symbol)
-                if not sym_state:
-                    return
-
-                await self.cancel_orders_for_side(ccxt_symbol, 'long')
-                await self.cancel_orders_for_side(ccxt_symbol, 'short')
-
-                if sym_state.long_position > 0:
-                    await self.place_order(
-                        ccxt_symbol, 'sell', 0, sym_state.long_position,
-                        reduce_only=True, position_side='long', order_type='market'
-                    )
-                    logger.info(f"[追蹤止盈] {sym_config.symbol} 市價平多 {sym_state.long_position}")
-
-                if sym_state.short_position > 0:
-                    await self.place_order(
-                        ccxt_symbol, 'buy', 0, sym_state.short_position,
-                        reduce_only=True, position_side='short', order_type='market'
-                    )
-                    logger.info(f"[追蹤止盈] {sym_config.symbol} 市價平空 {sym_state.short_position}")
-
-            except Exception as e:
-                logger.error(f"[追蹤止盈] {sym_config.symbol} 平倉失敗: {e}")
-
-    async def place_order(self, symbol: str, side: str, price: float, quantity: float,
-                    reduce_only: bool = False, position_side: str = None,
-                    order_type: str = 'limit'):
-        # 停機後不再送單（executor 已排入的由 shutdown(cancel_futures) 收掉）
-        if self._stop_event.is_set():
-            return None
-        # 退避封鎖只擋開倉單；reduce_only（止盈/平倉）永遠放行
-        if not reduce_only and time.time() < self._order_block_until.get(symbol, 0):
-            return None
-
-        try:
-            prec = self.precisions.get(symbol, {"price": 4, "amount": 0, "min_amount": 1})
-            price = round(price, prec["price"])
-            quantity = round(quantity, prec["amount"])
-            quantity = max(quantity, prec["min_amount"])
-
-            self._order_seq += 1
-            params = {
-                'reduce_only': reduce_only,
-                # ccxt unified key：binance→newClientOrderId、bybit→orderLinkId 自動映射
-                'clientOrderId': f"asgd_{int(time.time() * 1000)}_{self._order_seq}",
-            }
-            if position_side:
-                params['positionSide'] = position_side.upper()
-
-            if order_type == 'market':
-                result = await self.gateway.call(self.exchange.create_order, symbol, 'market', side, quantity, params=params)
-            else:
-                result = await self.gateway.call(self.exchange.create_order, symbol, 'limit', side, quantity, price, params=params)
-            # 只有開倉單成功才重置退避 — 有倉位時 TP(reduce_only) 成功與補倉失敗
-            # 每輪交錯，若 TP 成功也重置，連續失敗永遠數不到斷路閾值
-            if not reduce_only:
-                self._order_fail_counts[symbol] = 0
-                self._order_block_until.pop(symbol, None)
-            return result
-        except Exception as e:
-            self._register_order_failure(symbol, e)
-            return None
-
-    def _register_order_failure(self, symbol: str, error: Exception):
-        """連續失敗指數退避；達斷路閾值改長冷卻並通知一次"""
-        n = self._order_fail_counts.get(symbol, 0) + 1
-        self._order_fail_counts[symbol] = n
-
-        if n >= ORDER_CIRCUIT_THRESHOLD:
-            block = ORDER_CIRCUIT_COOLDOWN
-            if n == ORDER_CIRCUIT_THRESHOLD:
-                msg = (f"⛔ 下單斷路: {symbol} 連續失敗 {n} 次，"
-                       f"暫停開倉 {int(block)}s\n最後錯誤: {error}")
-                logger.warning(msg)
-                try:
-                    asyncio.get_running_loop()
-                    # 存引用防止 task 在執行前被 GC（斷路通知只發這一次，丟不得）
-                    self.tasks.append(asyncio.create_task(self.notifier.send(msg)))
-                except RuntimeError:
-                    pass  # 無 event loop（同步測試環境）時只留 log
-        else:
-            block = min(ORDER_BACKOFF_BASE * (2 ** (n - 1)), ORDER_BACKOFF_CAP)
-
-        self._order_block_until[symbol] = time.time() + block
-        logger.error(f"下單失敗 {symbol} (連續{n}次, 暫停開倉{block:.0f}s): {error}")
-
-    async def cancel_orders_for_side(self, symbol: str, position_side: str):
-        try:
-            orders = await self.gateway.call(self.exchange.fetch_open_orders, symbol)
-            for order in orders:
-                order_side = order.get('side')
-                order_pos_side = order.get('info', {}).get('positionSide', 'BOTH')
-                reduce_only = order.get('reduceOnly', False)
-
-                should_cancel = False
-                if position_side == 'long':
-                    if (not reduce_only and order_side == 'buy' and order_pos_side == 'LONG') or \
-                       (reduce_only and order_side == 'sell' and order_pos_side == 'LONG'):
-                        should_cancel = True
-                elif position_side == 'short':
-                    if (not reduce_only and order_side == 'sell' and order_pos_side == 'SHORT') or \
-                       (reduce_only and order_side == 'buy' and order_pos_side == 'SHORT'):
-                        should_cancel = True
-
-                if should_cancel:
-                    await self.gateway.call(self.exchange.cancel_order, order['id'], symbol)
-        except Exception as e:
-            logger.error(f"撤單失敗 {symbol}: {e}")
 
     def _build_bundle(self, sym_config: SymbolConfig) -> ManagerBundle:
         """組現有 manager 實例成 ManagerBundle，供 build_snapshot 共用（回測/實盤同源）。"""
@@ -563,11 +451,11 @@ class MaxGridBot:
             logger.info(f"[風控] {sym_config.symbol} 多空持倉均超過 {local_threshold}，開始雙向減倉")
 
             if sym_state.long_position > 0:
-                await self.place_order(ccxt_symbol, 'sell', 0, reduce_qty, True, 'long', 'market')
+                await self.order_executor.place_order(ccxt_symbol, 'sell', 0, reduce_qty, True, 'long', 'market')
                 logger.info(f"[風控] {sym_config.symbol} 市價平多 {reduce_qty}")
 
             if sym_state.short_position > 0:
-                await self.place_order(ccxt_symbol, 'buy', 0, reduce_qty, True, 'short', 'market')
+                await self.order_executor.place_order(ccxt_symbol, 'buy', 0, reduce_qty, True, 'short', 'market')
                 logger.info(f"[風控] {sym_config.symbol} 市價平空 {reduce_qty}")
 
             self.state.last_reduce_time[ccxt_symbol] = time.time()
@@ -652,7 +540,7 @@ class MaxGridBot:
         await self._check_and_reduce_positions(sym_config, sym_state)
 
         # 封鎖期內開倉單必被跳過，無倉位分支撤了單也補不回來 — 直接不動作
-        order_blocked = time.time() < self._order_block_until.get(ccxt_symbol, 0)
+        order_blocked = self.order_executor.is_blocked(ccxt_symbol)
 
         # 有倉位側是否要重掛（純判斷，無 manager 副作用）——決定是否建快照跑純層。
         # 只在至少一側真的要執行時才 build_snapshot，維持 get_signals/ATR 的呼叫時機
@@ -679,9 +567,9 @@ class MaxGridBot:
         if sym_state.long_position == 0:
             if not order_blocked and \
                     time.time() - self.last_order_times.get(f"{ccxt_symbol}_long", 0) > 10:
-                await self.cancel_orders_for_side(ccxt_symbol, 'long')
+                await self.order_executor.cancel_orders_for_side(ccxt_symbol, 'long')
                 qty = self._get_adjusted_quantity(sym_config, sym_state, 'long', False)
-                await self.place_order(ccxt_symbol, 'buy', sym_state.best_bid, qty, False, 'long')
+                await self.order_executor.place_order(ccxt_symbol, 'buy', sym_state.best_bid, qty, False, 'long')
                 self.last_order_times[f"{ccxt_symbol}_long"] = time.time()
                 sym_state.last_grid_price_long = price
         elif need_long:
@@ -693,9 +581,9 @@ class MaxGridBot:
         if sym_state.short_position == 0:
             if not order_blocked and \
                     time.time() - self.last_order_times.get(f"{ccxt_symbol}_short", 0) > 10:
-                await self.cancel_orders_for_side(ccxt_symbol, 'short')
+                await self.order_executor.cancel_orders_for_side(ccxt_symbol, 'short')
                 qty = self._get_adjusted_quantity(sym_config, sym_state, 'short', False)
-                await self.place_order(ccxt_symbol, 'sell', sym_state.best_ask, qty, False, 'short')
+                await self.order_executor.place_order(ccxt_symbol, 'sell', sym_state.best_ask, qty, False, 'short')
                 self.last_order_times[f"{ccxt_symbol}_short"] = time.time()
                 sym_state.last_grid_price_short = price
         elif need_short:
@@ -752,10 +640,10 @@ class MaxGridBot:
             logger.info(f"[MAX] {sym_config.symbol} {side}頭離開裝死模式")
 
         if side_decision.cancel_side:
-            await self.cancel_orders_for_side(ccxt_symbol, side)
+            await self.order_executor.cancel_orders_for_side(ccxt_symbol, side)
 
         for o in side_decision.orders:
-            await self.place_order(ccxt_symbol, o.side, o.price, o.quantity,
+            await self.order_executor.place_order(ccxt_symbol, o.side, o.price, o.quantity,
                                    o.reduce_only, o.position_side)
 
         if side_decision.orders:
@@ -1101,10 +989,10 @@ class MaxGridBot:
             self.gateway.shutdown()
             return
 
-        self.tasks = [
+        self.tasks.extend([
             asyncio.create_task(self._websocket_loop()),
             asyncio.create_task(self._keep_alive_loop()),
-        ]
+        ])
         if self.notifier.enabled:
             self.tasks.append(asyncio.create_task(self._daily_pnl_loop()))
             self.tasks.append(asyncio.create_task(self.notifier.notify_start(

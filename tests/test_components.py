@@ -57,3 +57,25 @@ def test_rest_gateway_shutdown_rejects_new_calls():
             await gw.call(lambda: 1)
 
     asyncio.run(main())
+
+
+# ──────────────────────────── OrderExecutor ────────────────────────────
+
+def _make_executor():
+    from unittest.mock import MagicMock
+    from grid_engine.order_executor import OrderExecutor
+    return OrderExecutor(
+        gateway=MagicMock(), ctx=ExchangeContext(), state=MagicMock(),
+        notifier=MagicMock(), config=MagicMock(), locks=SymbolLocks(),
+        stop_event=asyncio.Event(), tasks=[],
+    )
+
+
+def test_is_blocked_matches_block_until():
+    import time
+    ex = _make_executor()
+    assert ex.is_blocked("X") is False
+    ex._order_block_until["X"] = time.time() + 60
+    assert ex.is_blocked("X") is True
+    ex._order_block_until["X"] = time.time() - 1
+    assert ex.is_blocked("X") is False

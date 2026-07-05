@@ -50,4 +50,4 @@ def test_decision_log_io_failure_does_not_break_trading(tmp_path):
            buy_long_orders=0, sell_long_orders=0)
     import asyncio
     asyncio.run(bot._grid_step("XRP/USDC:USDC", sc))  # 不應拋
-    assert bot.place_order.await_count >= 1
+    assert bot.order_executor.place_order.await_count >= 1

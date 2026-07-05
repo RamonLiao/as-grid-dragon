@@ -89,7 +89,7 @@ class TestAsyncOrderPath:
 
         bot.exchange.create_order = fake_create
         bot.precisions["BNB/USDC:USDC"] = {"price": 2, "amount": 1, "min_amount": 0.1}
-        result = await bot.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0)
+        result = await bot.order_executor.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0)
         assert result == {"id": "1"}
         assert seen["thread"].startswith("ccxt-rest")
 
@@ -98,7 +98,7 @@ class TestAsyncOrderPath:
         """停機後 place_order 直接 return None，不打 exchange。"""
         bot = _make_bot()
         bot._stop_event.set()
-        assert await bot.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0) is None
+        assert await bot.order_executor.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0) is None
         bot.exchange.create_order.assert_not_called()
 
     @pytest.mark.asyncio
@@ -106,8 +106,8 @@ class TestAsyncOrderPath:
         """回歸：executor 內拋例外 → 退避計數照常累加。"""
         bot = _make_bot()
         bot.exchange.create_order = MagicMock(side_effect=RuntimeError("boom"))
-        assert await bot.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0) is None
-        assert bot._order_fail_counts["BNB/USDC:USDC"] == 1
+        assert await bot.order_executor.place_order("BNB/USDC:USDC", "buy", 600.0, 1.0) is None
+        assert bot.order_executor._order_fail_counts["BNB/USDC:USDC"] == 1
 
 
 def _make_synced_bot():
@@ -274,12 +274,12 @@ class TestMonkey:
             side_effect=lambda *a, **kw: (_time.sleep(0.2), {"id": "1"})[1])
         bot.precisions[list(bot.state.symbols)[0]] = {"price": 2, "amount": 1, "min_amount": 0.1}
         sym = list(bot.state.symbols)[0]
-        order_task = asyncio.create_task(bot.place_order(sym, "buy", 600.0, 1.0))
+        order_task = asyncio.create_task(bot.order_executor.place_order(sym, "buy", 600.0, 1.0))
         await asyncio.sleep(0.05)
         await asyncio.wait_for(bot.stop(), timeout=5)
         await asyncio.wait_for(order_task, timeout=5)
         calls_after_stop = bot.exchange.create_order.call_count
-        assert (await bot.place_order(sym, "buy", 600.0, 1.0)) is None
+        assert (await bot.order_executor.place_order(sym, "buy", 600.0, 1.0)) is None
         assert bot.exchange.create_order.call_count == calls_after_stop
 
     @pytest.mark.asyncio
