@@ -274,6 +274,7 @@ class TestRiskAlertSwitch:
         bot.config.risk.margin_threshold = 0.5
         bot.notifier = MagicMock()
         bot.notifier.enabled = True
+        bot.risk_monitor.notifier = bot.notifier  # RiskMonitor 在 __init__ 快照 notifier，替換後需同步
         bot.state.margin_usage = 0.9  # 超標
         return bot
 
@@ -282,7 +283,7 @@ class TestRiskAlertSwitch:
         bot = self._make_risky_bot(True)
         from unittest.mock import AsyncMock
         bot.notifier.notify_risk_alert = AsyncMock()
-        await bot._check_risk_and_notify()
+        await bot.risk_monitor.check_risk_and_notify()
         bot.notifier.notify_risk_alert.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -290,7 +291,7 @@ class TestRiskAlertSwitch:
         bot = self._make_risky_bot(False)
         from unittest.mock import AsyncMock
         bot.notifier.notify_risk_alert = AsyncMock()
-        await bot._check_risk_and_notify()
+        await bot.risk_monitor.check_risk_and_notify()
         bot.notifier.notify_risk_alert.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -299,10 +300,10 @@ class TestRiskAlertSwitch:
         bot = self._make_risky_bot(False)
         from unittest.mock import AsyncMock
         bot.notifier.notify_risk_alert = AsyncMock()
-        await bot._check_risk_and_notify()
-        assert bot.last_risk_alert_time == 0
+        await bot.risk_monitor.check_risk_and_notify()
+        assert bot.risk_monitor.last_risk_alert_time == 0
         bot.config.telegram_risk_alert_enabled = True
-        await bot._check_risk_and_notify()
+        await bot.risk_monitor.check_risk_and_notify()
         bot.notifier.notify_risk_alert.assert_awaited_once()
 
     @pytest.mark.asyncio
@@ -313,9 +314,9 @@ class TestRiskAlertSwitch:
         bot = self._make_risky_bot(True)
         bot.config.telegram_risk_alert_cooldown = 60
         bot.notifier.notify_risk_alert = AsyncMock()
-        await bot._check_risk_and_notify()
-        await bot._check_risk_and_notify()  # 冷卻內 → 不發
+        await bot.risk_monitor.check_risk_and_notify()
+        await bot.risk_monitor.check_risk_and_notify()  # 冷卻內 → 不發
         assert bot.notifier.notify_risk_alert.await_count == 1
-        bot.last_risk_alert_time = _time.time() - 61  # 模擬冷卻已過
-        await bot._check_risk_and_notify()
+        bot.risk_monitor.last_risk_alert_time = _time.time() - 61  # 模擬冷卻已過
+        await bot.risk_monitor.check_risk_and_notify()
         assert bot.notifier.notify_risk_alert.await_count == 2

@@ -34,9 +34,8 @@ from .order_executor import (
     ORDER_BACKOFF_BASE, ORDER_BACKOFF_CAP,
     ORDER_CIRCUIT_THRESHOLD, ORDER_CIRCUIT_COOLDOWN,
 )
-
-# 風控警報冷卻秒數預設值（可由 config telegram_risk_alert_cooldown 覆寫）
-RISK_ALERT_COOLDOWN = 300
+from .risk_monitor import RiskMonitor, RISK_ALERT_COOLDOWN
+from .reporting import DailyReporter
 
 
 def _create_exchange(exchange_id: str, config: dict):
@@ -92,10 +91,18 @@ class MaxGridBot:
             notifier=self.notifier, config=self.config, locks=self.locks,
             stop_event=self._stop_event, tasks=self.tasks,
         )
+        # 風控組件（追蹤止盈/減倉/警報冷卻）與每日損益排程
+        self.risk_monitor = RiskMonitor(
+            config=self.config, state=self.state,
+            order_executor=self.order_executor, notifier=self.notifier,
+        )
+        self.reporter = DailyReporter(
+            config=self.config, state=self.state,
+            notifier=self.notifier, stop_event=self._stop_event,
+        )
 
         self.last_sync_time = 0
         self.last_order_times: Dict[str, float] = {}
-        self.last_risk_alert_time = 0.0
 
         # 並發鎖：sync 防重入（鎖序固定 _sync_lock → symbol lock）
         self._sync_lock = asyncio.Lock()
@@ -303,57 +310,11 @@ class MaxGridBot:
 
             # 風控通知
             if self.notifier.enabled:
-                asyncio.create_task(self._check_risk_and_notify())
+                asyncio.create_task(self.risk_monitor.check_risk_and_notify())
 
-            await self._check_trailing_stop()
+            await self.risk_monitor.check_trailing_stop()
         except Exception as e:
             logger.error(f"同步帳戶失敗: {e}")
-
-    async def _check_trailing_stop(self):
-        """保證金追蹤止盈邏輯"""
-        risk = self.config.risk
-
-        if not risk.enabled:
-            return
-
-        if self.state.margin_usage < risk.margin_threshold:
-            self.state.trailing_active.clear()
-            self.state.peak_pnl.clear()
-            return
-
-        for sym_config in self.config.symbols.values():
-            if not sym_config.enabled:
-                continue
-
-            ccxt_symbol = sym_config.ccxt_symbol
-            sym_state = self.state.symbols.get(ccxt_symbol)
-            if not sym_state:
-                continue
-
-            current_pnl = sym_state.unrealized_pnl
-
-            if self.state.trailing_active.get(ccxt_symbol, False):
-                peak = self.state.peak_pnl.get(ccxt_symbol, 0)
-                if current_pnl > peak:
-                    self.state.peak_pnl[ccxt_symbol] = current_pnl
-                    logger.info(f"[追蹤止盈] {sym_config.symbol} 新高: {current_pnl:.2f}U")
-
-                peak = self.state.peak_pnl.get(ccxt_symbol, 0)
-                drawdown = peak - current_pnl
-
-                trigger = max(risk.trailing_min_drawdown, peak * risk.trailing_drawdown_pct)
-
-                if drawdown >= trigger and peak > 0:
-                    logger.info(f"[追蹤止盈] {sym_config.symbol} 觸發! 最高:{peak:.2f}, 當前:{current_pnl:.2f}, 回撤:{drawdown:.2f}")
-                    await self.order_executor.close_symbol_positions(ccxt_symbol, sym_config)
-                    self.state.trailing_active[ccxt_symbol] = False
-                    self.state.peak_pnl[ccxt_symbol] = 0
-
-            else:
-                if current_pnl >= risk.trailing_start_profit:
-                    self.state.trailing_active[ccxt_symbol] = True
-                    self.state.peak_pnl[ccxt_symbol] = current_pnl
-                    logger.info(f"[追蹤止盈] {sym_config.symbol} 開始追蹤! 浮盈: {current_pnl:.2f}U")
 
     def _build_bundle(self, sym_config: SymbolConfig) -> ManagerBundle:
         """組現有 manager 實例成 ManagerBundle，供 build_snapshot 共用（回測/實盤同源）。"""
@@ -435,31 +396,6 @@ class MaxGridBot:
 
         return max(sym_config.initial_quantity * 0.5, base_qty)
 
-    async def _check_and_reduce_positions(self, sym_config: SymbolConfig, sym_state: SymbolState):
-        """檢查並減倉"""
-        REDUCE_COOLDOWN = 60
-
-        ccxt_symbol = sym_config.ccxt_symbol
-        local_threshold = sym_config.position_threshold * 0.8
-        reduce_qty = sym_config.position_threshold * 0.1
-
-        last_reduce = self.state.last_reduce_time.get(ccxt_symbol, 0)
-        if time.time() - last_reduce < REDUCE_COOLDOWN:
-            return
-
-        if sym_state.long_position >= local_threshold and sym_state.short_position >= local_threshold:
-            logger.info(f"[風控] {sym_config.symbol} 多空持倉均超過 {local_threshold}，開始雙向減倉")
-
-            if sym_state.long_position > 0:
-                await self.order_executor.place_order(ccxt_symbol, 'sell', 0, reduce_qty, True, 'long', 'market')
-                logger.info(f"[風控] {sym_config.symbol} 市價平多 {reduce_qty}")
-
-            if sym_state.short_position > 0:
-                await self.order_executor.place_order(ccxt_symbol, 'buy', 0, reduce_qty, True, 'short', 'market')
-                logger.info(f"[風控] {sym_config.symbol} 市價平空 {reduce_qty}")
-
-            self.state.last_reduce_time[ccxt_symbol] = time.time()
-
     def _should_adjust_grid(self, sym_config: SymbolConfig, sym_state: SymbolState, side: str) -> bool:
         """檢查是否需要調整網格"""
         price = sym_state.latest_price
@@ -537,7 +473,7 @@ class MaxGridBot:
         sym_state.dynamic_take_profit = sym_config.take_profit_spacing
         sym_state.dynamic_grid_spacing = sym_config.grid_spacing
 
-        await self._check_and_reduce_positions(sym_config, sym_state)
+        await self.risk_monitor.check_and_reduce_positions(sym_config, sym_state)
 
         # 封鎖期內開倉單必被跳過，無倉位分支撤了單也補不回來 — 直接不動作
         order_blocked = self.order_executor.is_blocked(ccxt_symbol)
@@ -892,66 +828,6 @@ class MaxGridBot:
             except Exception as e:
                 logger.error(f"更新 listenKey 失敗: {e}")
 
-    async def _daily_pnl_loop(self):
-        """每日 telegram_daily_pnl_hour (Asia/Taipei, UTC+8) 整點發送損益摘要"""
-        while not self._stop_event.is_set():
-            try:
-                now = datetime.utcnow()
-                # Asia/Taipei (UTC+8) 整點 → UTC
-                utc_hour = (self.config.telegram_daily_pnl_hour - 8) % 24
-                target = now.replace(hour=utc_hour, minute=0, second=0, microsecond=0)
-                if now >= target:
-                    from datetime import timedelta
-                    target += timedelta(days=1)
-                wait_seconds = (target - now).total_seconds()
-                await asyncio.sleep(wait_seconds)
-
-                if self._stop_event.is_set():
-                    break
-
-                positions = {}
-                for sym, sym_state in self.state.symbols.items():
-                    if sym_state.long_position > 0 or sym_state.short_position > 0:
-                        positions[sym] = {
-                            "long": sym_state.long_position,
-                            "short": sym_state.short_position,
-                            "pnl": sym_state.unrealized_pnl,
-                        }
-
-                running_hours = 0
-                if self.state.start_time:
-                    running_hours = (datetime.now() - self.state.start_time).total_seconds() / 3600
-
-                pnl_data = {
-                    "total_pnl": self.state.total_unrealized_pnl,
-                    "total_equity": self.state.total_equity,
-                    "margin_usage": self.state.margin_usage,
-                    "total_profit": self.state.total_profit,
-                    "positions": positions,
-                    "running_hours": running_hours,
-                }
-                await self.notifier.notify_daily_pnl(pnl_data)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"每日摘要發送失敗: {e}")
-                await asyncio.sleep(60)
-
-    async def _check_risk_and_notify(self):
-        """檢查風控狀態並通知"""
-        if not self.notifier.enabled or not self.config.risk.enabled:
-            return
-        if not getattr(self.config, "telegram_risk_alert_enabled", True):
-            return
-        if self.state.margin_usage > self.config.risk.margin_threshold:
-            # 冷卻：避免每個 ticker tick 重複轟炸 Telegram
-            cooldown = getattr(self.config, "telegram_risk_alert_cooldown", RISK_ALERT_COOLDOWN)
-            if time.time() - self.last_risk_alert_time < cooldown:
-                return
-            self.last_risk_alert_time = time.time()
-            alert = f"保證金使用率過高: {self.state.margin_usage:.1%} (閾值: {self.config.risk.margin_threshold:.1%})"
-            await self.notifier.notify_risk_alert(alert)
-
     async def run(self):
         try:
             await self.gateway.call(self._init_exchange)
@@ -994,7 +870,7 @@ class MaxGridBot:
             asyncio.create_task(self._keep_alive_loop()),
         ])
         if self.notifier.enabled:
-            self.tasks.append(asyncio.create_task(self._daily_pnl_loop()))
+            self.tasks.append(asyncio.create_task(self.reporter.run()))
             self.tasks.append(asyncio.create_task(self.notifier.notify_start(
                 symbols=list(self.state.symbols.keys()),
                 daily_pnl_hour=self.config.telegram_daily_pnl_hour,
