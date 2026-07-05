@@ -26,12 +26,13 @@ from .notifier import TelegramNotifier
 from .context import ExchangeContext
 from .locks import SymbolLocks
 from .rest_gateway import RestGateway
+# ORDER_* 常數為向後相容 re-export（tests/test_order_guard.py 從 bot 匯入）
 from .order_executor import (
     OrderExecutor,
     ORDER_BACKOFF_BASE, ORDER_BACKOFF_CAP,
     ORDER_CIRCUIT_THRESHOLD, ORDER_CIRCUIT_COOLDOWN,
 )
-from .risk_monitor import RiskMonitor, RISK_ALERT_COOLDOWN
+from .risk_monitor import RiskMonitor
 from .reporting import DailyReporter
 from .sync_service import SyncService
 from .ws_client import WsClient
@@ -62,6 +63,11 @@ class MaxGridBot:
     """MAX 版本網格機器人 - 整合學術模型增強功能"""
 
     def __init__(self, config: GlobalConfig):
+        """組合根。組裝順序（硬約束）：
+        ctx/locks/gateway → notifier → order_executor → risk_monitor/reporter
+        → sync_service（需 risk_monitor）→ ws_client（handlers 綁 bot bound method）。
+        gateway/locks/ctx/_stop_event/tasks 全組件共享單一實例（見 test_components 組裝斷言）。
+        """
         self.config = config
         self.state = GlobalState()
 

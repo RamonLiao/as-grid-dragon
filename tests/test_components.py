@@ -112,3 +112,42 @@ def test_sync_account_triggers_risk_and_trailing():
     asyncio.run(main())
     risk.check_trailing_stop.assert_awaited_once()
     risk.check_risk_and_notify.assert_called_once()
+
+
+# ──────────────────────────── MaxGridBot 組裝斷言 ────────────────────────────
+
+def _make_bot():
+    from grid_engine.bot import MaxGridBot
+    from grid_engine.config import GlobalConfig
+    return MaxGridBot(GlobalConfig())
+
+
+def test_bot_wiring_shares_single_instances():
+    """gateway/locks/ctx/stop_event 必須全組件同一實例——
+    複製成兩份 = ccxt 並發打非 thread-safe Session / 原子區失效 / 停機失效"""
+    bot = _make_bot()
+    assert bot.order_executor.gateway is bot.gateway
+    assert bot.sync_service.gateway is bot.gateway
+    assert bot.ws_client.gateway is bot.gateway
+    assert bot.order_executor.locks is bot.locks
+    assert bot.sync_service.locks is bot.locks
+    assert bot.order_executor.ctx is bot.ctx
+    assert bot.sync_service.ctx is bot.ctx
+    assert bot.ws_client.ctx is bot.ctx
+    assert bot.order_executor._stop_event is bot._stop_event
+    assert bot.ws_client._stop_event is bot._stop_event
+    assert bot.reporter._stop_event is bot._stop_event
+    assert bot.order_executor.tasks is bot.tasks
+    assert bot.sync_service.risk_monitor is bot.risk_monitor
+    assert bot.risk_monitor.order_executor is bot.order_executor
+
+
+def test_bot_two_phase_init_propagates_to_components():
+    """_init_exchange 後組件讀到真 exchange/funding_manager（防 None 快照，spec C1）"""
+    from unittest.mock import MagicMock
+    bot = _make_bot()
+    assert bot.order_executor.ctx.exchange is None
+    bot.exchange = MagicMock()            # 走 property → ctx
+    bot.funding_manager = MagicMock()
+    assert bot.order_executor.ctx.exchange is bot.exchange
+    assert bot.sync_service.ctx.funding_manager is bot.funding_manager
