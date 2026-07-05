@@ -71,6 +71,28 @@ def _make_executor():
     )
 
 
+def test_circuit_notify_task_tracked_then_self_removes():
+    """斷路通知 task：排入 tasks（執行前防 GC + stop 可 cancel），完成後自移除——
+    長跑 bot 每次斷路都 append 卻從不清，tasks 會無限累積（#8 修的洩漏）。"""
+    from unittest.mock import AsyncMock
+
+    from grid_engine.order_executor import ORDER_CIRCUIT_THRESHOLD
+
+    ex = _make_executor()
+    ex.notifier.send = AsyncMock()
+
+    async def main():
+        for _ in range(ORDER_CIRCUIT_THRESHOLD):
+            ex._register_order_failure("X", Exception("boom"))
+        assert len(ex.tasks) == 1               # 已入列（GC 安全）
+        await asyncio.gather(*ex.tasks)         # task 跑完
+        await asyncio.sleep(0)                  # done callback 在下個 tick 觸發
+        assert ex.tasks == []                   # 自移除，不累積
+
+    asyncio.run(main())
+    ex.notifier.send.assert_awaited_once()
+
+
 def test_is_blocked_matches_block_until():
     import time
     ex = _make_executor()
@@ -102,7 +124,7 @@ def test_sync_account_triggers_risk_and_trailing():
 
     svc = SyncService(
         gateway=RestGateway(), ctx=ctx, config=MagicMock(), state=GlobalState(),
-        locks=SymbolLocks(), notifier=notifier, risk_monitor=risk,
+        locks=SymbolLocks(), notifier=notifier, risk_monitor=risk, tasks=[],
     )
 
     async def main():
@@ -112,6 +134,40 @@ def test_sync_account_triggers_risk_and_trailing():
     asyncio.run(main())
     risk.check_trailing_stop.assert_awaited_once()
     risk.check_risk_and_notify.assert_called_once()
+
+
+def test_sync_risk_task_tracked_then_self_removes():
+    """風控通知 fire-and-forget task 必須先入共享 tasks（原版無參照，GC 可能在
+    執行前回收 task）、完成後自移除（每 10s sync 一次，永不清會累積）。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from grid_engine.sync_service import SyncService
+    from grid_engine.state import GlobalState
+
+    risk = MagicMock()
+    risk.check_risk_and_notify = AsyncMock()
+    risk.check_trailing_stop = AsyncMock()
+    notifier = MagicMock()
+    notifier.enabled = True
+    ctx = ExchangeContext()
+    ctx.exchange = MagicMock()
+    ctx.exchange.fetch_balance = MagicMock(return_value={"info": {"assets": []}, "total": {}, "free": {}})
+
+    shared_tasks = []
+    svc = SyncService(
+        gateway=RestGateway(), ctx=ctx, config=MagicMock(), state=GlobalState(),
+        locks=SymbolLocks(), notifier=notifier, risk_monitor=risk, tasks=shared_tasks,
+    )
+
+    async def main():
+        await svc._sync_account()
+        assert len(shared_tasks) == 1           # 已入列（GC 安全）
+        await asyncio.gather(*shared_tasks)     # task 跑完
+        await asyncio.sleep(0)                  # done callback 在下個 tick 觸發
+        assert shared_tasks == []               # 自移除，不累積
+
+    asyncio.run(main())
+    risk.check_risk_and_notify.assert_awaited_once()
 
 
 # ──────────────────────────── MaxGridBot 組裝斷言 ────────────────────────────
@@ -138,6 +194,7 @@ def test_bot_wiring_shares_single_instances():
     assert bot.ws_client._stop_event is bot._stop_event
     assert bot.reporter._stop_event is bot._stop_event
     assert bot.order_executor.tasks is bot.tasks
+    assert bot.sync_service.tasks is bot.tasks
     assert bot.sync_service.risk_monitor is bot.risk_monitor
     assert bot.risk_monitor.order_executor is bot.order_executor
 

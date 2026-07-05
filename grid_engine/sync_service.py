@@ -9,7 +9,7 @@ from .utils import logger
 
 
 class SyncService:
-    def __init__(self, gateway, ctx, config, state, locks, notifier, risk_monitor):
+    def __init__(self, gateway, ctx, config, state, locks, notifier, risk_monitor, tasks):
         self.gateway = gateway
         self.ctx = ctx
         self.config = config
@@ -17,6 +17,7 @@ class SyncService:
         self.locks = locks
         self.notifier = notifier
         self.risk_monitor = risk_monitor
+        self.tasks = tasks      # bot.tasks 共享參照：風控通知 task 防 GC + stop 可 cancel
         # 並發鎖：sync 防重入（鎖序固定 _sync_lock → symbol lock）
         self._sync_lock = asyncio.Lock()
         self.last_sync_time = 0
@@ -142,7 +143,10 @@ class SyncService:
 
             # 風控通知
             if self.notifier.enabled:
-                asyncio.create_task(self.risk_monitor.check_risk_and_notify())
+                # fire-and-forget 需存引用防 GC；完成後自移除避免累積
+                task = asyncio.create_task(self.risk_monitor.check_risk_and_notify())
+                self.tasks.append(task)
+                task.add_done_callback(lambda t: t in self.tasks and self.tasks.remove(t))
 
             await self.risk_monitor.check_trailing_stop()
         except Exception as e:

@@ -73,3 +73,6 @@ Thumbs.db
 log/
 logs/
 *.log
+
+# 診斷 script 生成物
+web_test_report.json

@@ -108,7 +108,7 @@ class MaxGridBot:
         self.sync_service = SyncService(
             gateway=self.gateway, ctx=self.ctx, config=self.config,
             state=self.state, locks=self.locks, notifier=self.notifier,
-            risk_monitor=self.risk_monitor,
+            risk_monitor=self.risk_monitor, tasks=self.tasks,
         )
         # WS 純傳輸組件（handlers 引用 bot bound method，callback 不包 try——
         # ticker 例外必須冒泡到 WsClient 重連迴圈）
@@ -607,11 +607,9 @@ class MaxGridBot:
             realized_pnl = float(order_data.get('rp', 0) or 0)
 
             ccxt_symbol = None
-            sym_config = None
             for cfg in self.config.symbols.values():
                 if cfg.symbol == symbol_raw:
                     ccxt_symbol = cfg.ccxt_symbol
-                    sym_config = cfg
                     break
 
             if not ccxt_symbol or ccxt_symbol not in self.state.symbols:
@@ -756,7 +754,8 @@ class MaxGridBot:
         self._stop_event.set()
         self.state.running = False
 
-        for task in self.tasks:
+        # 迭代快照：done-callback 會在 await 期間從 self.tasks 自移除，直接迭代會跳元素
+        for task in list(self.tasks):
             task.cancel()
             try:
                 await task

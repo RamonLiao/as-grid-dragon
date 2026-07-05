@@ -6,6 +6,10 @@
 測試各交易所適配器的符號轉換功能
 """
 
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from exchanges.binance import BinanceAdapter
 from exchanges.bitget import BitgetAdapter
 from exchanges.bybit import BybitAdapter

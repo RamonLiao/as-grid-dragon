@@ -11,7 +11,7 @@ import time
 from datetime import datetime
 
 # 添加專案路徑
-project_root = Path(__file__).parent
+project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(project_root))
 
 # 測試報告

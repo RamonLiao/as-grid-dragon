@@ -117,7 +117,10 @@ class OrderExecutor:
                 try:
                     asyncio.get_running_loop()
                     # 存引用防止 task 在執行前被 GC（斷路通知只發這一次，丟不得）
-                    self.tasks.append(asyncio.create_task(self.notifier.send(msg)))
+                    task = asyncio.create_task(self.notifier.send(msg))
+                    self.tasks.append(task)
+                    # 完成後自移除，避免長跑累積（stop 可能已在 cancel 流程，故先查在不在）
+                    task.add_done_callback(lambda t: t in self.tasks and self.tasks.remove(t))
                 except RuntimeError:
                     pass  # 無 event loop（同步測試環境）時只留 log
         else:
