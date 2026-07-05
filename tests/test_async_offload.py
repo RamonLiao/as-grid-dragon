@@ -28,7 +28,7 @@ class TestRestHelper:
     @pytest.mark.asyncio
     async def test_rest_runs_fn_and_returns_result(self):
         bot = _make_bot()
-        assert await bot._rest(lambda a, b=0: a + b, 1, b=2) == 3
+        assert await bot.gateway.call(lambda a, b=0: a + b, 1, b=2) == 3
 
     @pytest.mark.asyncio
     async def test_rest_does_not_block_event_loop(self):
@@ -42,7 +42,7 @@ class TestRestHelper:
                 await asyncio.sleep(0.05)
 
         hb = asyncio.create_task(heartbeat())
-        await bot._rest(_time.sleep, 0.3)
+        await bot.gateway.call(_time.sleep, 0.3)
         await hb
         gaps = [b - a for a, b in zip(beats, beats[1:])]
         assert max(gaps) < 0.2, f"event loop 被卡住: gaps={gaps}"
@@ -62,7 +62,7 @@ class TestRestHelper:
             with lk:
                 active[0] -= 1
 
-        await asyncio.gather(*[bot._rest(work) for _ in range(5)])
+        await asyncio.gather(*[bot.gateway.call(work) for _ in range(5)])
         assert peak[0] == 1
 
     @pytest.mark.asyncio
@@ -73,7 +73,7 @@ class TestRestHelper:
             raise ValueError("x")
 
         with pytest.raises(ValueError):
-            await bot._rest(boom)
+            await bot.gateway.call(boom)
 
 
 class TestAsyncOrderPath:
@@ -188,7 +188,7 @@ class TestConcurrencyLocks:
         bot._grid_step = boom
         with pytest.raises(RuntimeError):
             await bot.adjust_grid(sym)
-        assert not bot._symbol_lock(sym).locked()
+        assert not bot.locks.get(sym).locked()
 
     @pytest.mark.asyncio
     async def test_sync_all_no_reentry(self):
@@ -214,7 +214,7 @@ class TestConcurrencyLocks:
         st.buy_long_orders = 99  # adjust 期間的「決策依據」
         bot.exchange.fetch_open_orders.return_value = []
 
-        lock = bot._symbol_lock(sym)
+        lock = bot.locks.get(sym)
         async with lock:  # 模擬 adjust_grid 持鎖中
             sync_task = asyncio.create_task(bot._sync_orders())
             await asyncio.sleep(0.05)
@@ -239,7 +239,7 @@ class TestMonkey:
             ),
             timeout=10,
         )
-        assert not bot._symbol_lock(sym).locked()
+        assert not bot.locks.get(sym).locked()
         assert not bot._sync_lock.locked()
 
     @pytest.mark.asyncio
@@ -257,7 +257,7 @@ class TestMonkey:
             bot.sync_all(),
             return_exceptions=True,
         )
-        assert not bot._symbol_lock(sym).locked()
+        assert not bot.locks.get(sym).locked()
         assert not bot._sync_lock.locked()
         # 復原後可再進入
         bot.exchange.fetch_positions = MagicMock(return_value=[])
@@ -289,5 +289,5 @@ class TestMonkey:
         bot._init_exchange = MagicMock(side_effect=RuntimeError("boom"))
         await bot.run()
         with pytest.raises(RuntimeError):
-            bot._rest_executor.submit(lambda: None)
+            bot.gateway._executor.submit(lambda: None)
 

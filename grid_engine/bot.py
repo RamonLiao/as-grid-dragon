@@ -9,9 +9,7 @@ import math
 import os
 import ssl
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-from functools import partial
 from typing import Optional, List, Dict
 
 import ccxt
@@ -28,6 +26,9 @@ from .enhancements import (
 from .config import GlobalConfig, SymbolConfig
 from .state import GlobalState, SymbolState
 from .notifier import TelegramNotifier
+from .context import ExchangeContext
+from .locks import SymbolLocks
+from .rest_gateway import RestGateway
 
 # 風控警報冷卻秒數預設值（可由 config telegram_risk_alert_cooldown 覆寫）
 RISK_ALERT_COOLDOWN = 300
@@ -67,11 +68,15 @@ class MaxGridBot:
         self.config = config
         self.state = GlobalState()
 
+        # 共享基礎設施（兩階段初始化容器 / per-symbol 鎖註冊表 / 單 worker REST）
+        self.ctx = ExchangeContext()
+        self.locks = SymbolLocks()
+        self.gateway = RestGateway()
+
         for symbol, sym_cfg in config.symbols.items():
             if sym_cfg.enabled:
                 self.state.symbols[sym_cfg.ccxt_symbol] = SymbolState(symbol=sym_cfg.ccxt_symbol)
 
-        self.exchange: Optional[CustomExchange] = None
         self.listen_key: Optional[str] = None
         self.tasks: List[asyncio.Task] = []
         self._stop_event = asyncio.Event()
@@ -82,7 +87,6 @@ class MaxGridBot:
             chat_id=config.telegram_chat_id,
             switch_on=getattr(config, "telegram_enabled", True),
         )
-        self.precisions: Dict[str, dict] = {}
         self.last_sync_time = 0
         self.last_order_times: Dict[str, float] = {}
         self.last_risk_alert_time = 0.0
@@ -92,15 +96,10 @@ class MaxGridBot:
         self._order_block_until: Dict[str, float] = {}
         self._order_seq = 0
 
-        # REST 卸載：單 worker 序列化（同步 ccxt 實例非 thread-safe）
-        self._rest_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ccxt-rest")
-
-        # 並發鎖：per-symbol 網格互斥 + sync 防重入（鎖序固定 _sync_lock → symbol lock）
-        self._symbol_locks: Dict[str, asyncio.Lock] = {}
+        # 並發鎖：sync 防重入（鎖序固定 _sync_lock → symbol lock）
         self._sync_lock = asyncio.Lock()
 
         # MAX 增強模組
-        self.funding_manager: Optional[FundingRateManager] = None
         self.glft_controller = GLFTController()
         self.dynamic_grid_manager = DynamicGridManager()
 
@@ -114,6 +113,30 @@ class MaxGridBot:
         self.leading_indicator = LeadingIndicatorManager(config.leading_indicator)
 
         logger.info(f"[MAX] 初始化完成 - Bandit: {config.bandit.enabled}, Leading: {config.leading_indicator.enabled}")
+
+    @property
+    def exchange(self):
+        return self.ctx.exchange
+
+    @exchange.setter
+    def exchange(self, value):
+        self.ctx.exchange = value
+
+    @property
+    def precisions(self):
+        return self.ctx.precisions
+
+    @precisions.setter
+    def precisions(self, value):
+        self.ctx.precisions = value
+
+    @property
+    def funding_manager(self):
+        return self.ctx.funding_manager
+
+    @funding_manager.setter
+    def funding_manager(self, value):
+        self.ctx.funding_manager = value
 
     def _init_exchange(self):
         exchange_config = {
@@ -160,14 +183,6 @@ class MaxGridBot:
                 except Exception:
                     pass
 
-    async def _rest(self, fn, *args, **kwargs):
-        """在專用單 worker thread 執行同步 REST 呼叫，不阻塞 event loop"""
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._rest_executor, partial(fn, *args, **kwargs))
-
-    def _symbol_lock(self, ccxt_symbol: str) -> asyncio.Lock:
-        return self._symbol_locks.setdefault(ccxt_symbol, asyncio.Lock())
-
     def _get_listen_key(self) -> str:
         response = self.exchange.fapiPrivatePostListenKey()
         return response.get("listenKey")
@@ -188,14 +203,14 @@ class MaxGridBot:
 
         for sym_config in self.config.symbols.values():
             if sym_config.enabled:
-                rate = await self._rest(self.funding_manager.update_funding_rate, sym_config.ccxt_symbol)
+                rate = await self.gateway.call(self.funding_manager.update_funding_rate, sym_config.ccxt_symbol)
                 sym_state = self.state.symbols.get(sym_config.ccxt_symbol)
                 if sym_state:
                     sym_state.current_funding_rate = rate
 
     async def _sync_positions(self):
         try:
-            positions = await self._rest(self.exchange.fetch_positions, params={'type': 'future'})
+            positions = await self.gateway.call(self.exchange.fetch_positions, params={'type': 'future'})
         except Exception as e:
             logger.error(f"同步持倉失敗: {e}")
             return
@@ -214,7 +229,7 @@ class MaxGridBot:
                 agg[symbol][2] += pnl
 
         for symbol, (long_pos, short_pos, upnl) in agg.items():
-            async with self._symbol_lock(symbol):
+            async with self.locks.get(symbol):
                 # 原子 apply：鎖內無其他 await
                 st = self.state.symbols[symbol]
                 st.long_position = long_pos
@@ -228,7 +243,7 @@ class MaxGridBot:
             symbol = sym_config.ccxt_symbol
 
             try:
-                orders = await self._rest(self.exchange.fetch_open_orders, symbol=symbol)
+                orders = await self.gateway.call(self.exchange.fetch_open_orders, symbol=symbol)
                 state = self.state.symbols.get(symbol)
                 if not state:
                     continue
@@ -246,7 +261,7 @@ class MaxGridBot:
                         counts[2] += qty
                     elif side == 'sell' and pos_side == 'SHORT':
                         counts[3] += qty
-                async with self._symbol_lock(symbol):
+                async with self.locks.get(symbol):
                     # 原子 apply：鎖內無其他 await
                     state.buy_long_orders, state.sell_long_orders, \
                         state.buy_short_orders, state.sell_short_orders = counts
@@ -255,7 +270,7 @@ class MaxGridBot:
 
     async def _sync_account(self):
         try:
-            balance = await self._rest(self.exchange.fetch_balance, {'type': 'future'})
+            balance = await self.gateway.call(self.exchange.fetch_balance, {'type': 'future'})
 
             # ccxt 頂層 total=marginBalance(已含浮盈)、free=availableBalance、used=initialMargin，
             # 語意對不上面板欄位，且 equity 公式會重複加浮盈。改從 info.assets 取幣安原值。
@@ -341,7 +356,7 @@ class MaxGridBot:
 
     async def _close_symbol_positions(self, ccxt_symbol: str, sym_config: SymbolConfig):
         """平倉指定交易對"""
-        async with self._symbol_lock(ccxt_symbol):
+        async with self.locks.get(ccxt_symbol):
             try:
                 sym_state = self.state.symbols.get(ccxt_symbol)
                 if not sym_state:
@@ -393,9 +408,9 @@ class MaxGridBot:
                 params['positionSide'] = position_side.upper()
 
             if order_type == 'market':
-                result = await self._rest(self.exchange.create_order, symbol, 'market', side, quantity, params=params)
+                result = await self.gateway.call(self.exchange.create_order, symbol, 'market', side, quantity, params=params)
             else:
-                result = await self._rest(self.exchange.create_order, symbol, 'limit', side, quantity, price, params=params)
+                result = await self.gateway.call(self.exchange.create_order, symbol, 'limit', side, quantity, price, params=params)
             # 只有開倉單成功才重置退避 — 有倉位時 TP(reduce_only) 成功與補倉失敗
             # 每輪交錯，若 TP 成功也重置，連續失敗永遠數不到斷路閾值
             if not reduce_only:
@@ -431,7 +446,7 @@ class MaxGridBot:
 
     async def cancel_orders_for_side(self, symbol: str, position_side: str):
         try:
-            orders = await self._rest(self.exchange.fetch_open_orders, symbol)
+            orders = await self.gateway.call(self.exchange.fetch_open_orders, symbol)
             for order in orders:
                 order_side = order.get('side')
                 order_pos_side = order.get('info', {}).get('positionSide', 'BOTH')
@@ -448,7 +463,7 @@ class MaxGridBot:
                         should_cancel = True
 
                 if should_cancel:
-                    await self._rest(self.exchange.cancel_order, order['id'], symbol)
+                    await self.gateway.call(self.exchange.cancel_order, order['id'], symbol)
         except Exception as e:
             logger.error(f"撤單失敗 {symbol}: {e}")
 
@@ -595,7 +610,7 @@ class MaxGridBot:
             return
 
         # 忙碌時跳過本 tick（ticker 高頻，排隊只會積壓過期決策）
-        lock = self._symbol_lock(ccxt_symbol)
+        lock = self.locks.get(ccxt_symbol)
         if lock.locked():
             return
         async with lock:
@@ -982,8 +997,8 @@ class MaxGridBot:
             try:
                 await asyncio.sleep(1800)
                 if not self._stop_event.is_set():
-                    await self._rest(self.exchange.fapiPrivatePutListenKey)
-                    self.listen_key = await self._rest(self._get_listen_key)
+                    await self.gateway.call(self.exchange.fapiPrivatePutListenKey)
+                    self.listen_key = await self.gateway.call(self._get_listen_key)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1051,10 +1066,9 @@ class MaxGridBot:
 
     async def run(self):
         try:
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(self._rest_executor, self._init_exchange)
-            await loop.run_in_executor(self._rest_executor, self._check_hedge_mode)
-            self.listen_key = await self._rest(self._get_listen_key)
+            await self.gateway.call(self._init_exchange)
+            await self.gateway.call(self._check_hedge_mode)
+            self.listen_key = await self.gateway.call(self._get_listen_key)
 
             self.state.running = True
             self.state.start_time = datetime.now()
@@ -1084,7 +1098,7 @@ class MaxGridBot:
             logger.error(f"[MAX] 初始化失敗: {e}")
             await self.notifier.notify_crash(f"初始化失敗: {e}")
             self.state.running = False
-            self._rest_executor.shutdown(wait=False, cancel_futures=True)
+            self.gateway.shutdown()
             return
 
         self.tasks = [
@@ -1150,4 +1164,4 @@ class MaxGridBot:
                 pass
 
         # 排隊中的 REST 直接取消；in-flight 的自然結束，place_order 入口的停機檢查擋住後續
-        self._rest_executor.shutdown(wait=False, cancel_futures=True)
+        self.gateway.shutdown()
