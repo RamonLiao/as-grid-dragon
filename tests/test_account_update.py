@@ -50,7 +50,7 @@ class TestRESTOwnsAvailableAndMargin:
     async def test_sync_account_sets_available_and_margin(self):
         bot = _make_bot()
         bot.exchange = _fake_exchange(total=100.0, free=80.0)
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         acc = bot.state.get_account("USDC")
         assert acc.wallet_balance == 100.0
         assert acc.available_balance == 80.0
@@ -62,7 +62,7 @@ class TestRESTOwnsAvailableAndMargin:
         bot = _make_bot()
         # 先讓 REST 寫入真值
         bot.exchange = _fake_exchange(total=100.0, free=80.0)
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
 
         # 模擬 WS ACCOUNT_UPDATE，wb 變了，但只該動 wallet_balance
         await bot._handle_account_update({
@@ -78,18 +78,18 @@ class TestRESTOwnsAvailableAndMargin:
     async def test_margin_clamped_to_zero_when_free_ge_total(self):
         bot = _make_bot()
         bot.exchange = _fake_exchange(total=50.0, free=50.0)
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         assert bot.state.get_account("USDC").margin_used == 0
 
         bot.exchange = _fake_exchange(total=50.0, free=60.0)  # free>total（理論上不會，但要防）
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         assert bot.state.get_account("USDC").margin_used == 0
 
     @pytest.mark.asyncio
     async def test_margin_usage_zero_when_no_equity(self):
         bot = _make_bot()
         bot.exchange = _fake_exchange(total=0.0, free=0.0)
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         assert bot.state.margin_usage == 0
 
 
@@ -154,7 +154,7 @@ class TestAccountUpdateMonkey:
         """非數字字串 → float() 拋 → 被 except 接住，不污染狀態。"""
         bot = _make_bot()
         bot.exchange = _fake_exchange(total=100.0, free=80.0)
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         await bot._handle_account_update({"a": {"B": [{"a": "USDC", "wb": "garbage"}]}})
         # 整段失敗被吞，REST 真值不受影響
         acc = bot.state.get_account("USDC")
@@ -180,7 +180,7 @@ class TestRESTNoDoubleCountUnrealized:
             "availableBalance": "15.50",
             "initialMargin": "78.99",
         }])
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         acc = bot.state.get_account("USDC")
         assert acc.wallet_balance == pytest.approx(125.5485)
         assert acc.unrealized_pnl == pytest.approx(-31.0574)
@@ -200,7 +200,7 @@ class TestRESTNoDoubleCountUnrealized:
               "unrealizedProfit": "-10", "availableBalance": "50", "initialMargin": "40"}],
             total=90.0, free=50.0,
         )
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         acc = bot.state.get_account("USDC")
         assert acc.equity == pytest.approx(90.0)  # 100 + (-10)，非 90 + (-10)
 
@@ -209,7 +209,7 @@ class TestRESTNoDoubleCountUnrealized:
         # info.assets 沒有該幣 → fallback：total 視為 marginBalance，還原錢包餘額，equity 不雙算
         bot = _make_bot()
         bot.exchange = _fake_exchange_info([], total=94.49, free=15.50)
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         acc = bot.state.get_account("USDC")
         # 無持倉 upnl=0 → wallet=94.49, equity=94.49（不會變 188）
         assert acc.equity == pytest.approx(94.49)
@@ -220,7 +220,7 @@ class TestSyncAccountInfoMonkey:
     async def test_info_missing_fields_default_zero(self):
         bot = _make_bot()
         bot.exchange = _fake_exchange_info([{"asset": "USDC"}])  # 啥欄位都沒
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         acc = bot.state.get_account("USDC")
         assert acc.wallet_balance == 0
         assert acc.unrealized_pnl == 0
@@ -234,7 +234,7 @@ class TestSyncAccountInfoMonkey:
             "asset": "USDC", "walletBalance": None,
             "unrealizedProfit": None, "availableBalance": None, "initialMargin": None,
         }])
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         assert bot.state.get_account("USDC").equity == 0
 
     @pytest.mark.asyncio
@@ -243,14 +243,14 @@ class TestSyncAccountInfoMonkey:
         ex = MagicMock()
         ex.fetch_balance.return_value = {"info": {"assets": None}, "total": {}, "free": {}}
         bot.exchange = ex
-        await bot._sync_account()  # assets=None → `or []` → fallback，不崩
+        await bot.sync_service._sync_account()  # assets=None → `or []` → fallback，不崩
         assert bot.state.get_account("USDC").equity == 0
 
     @pytest.mark.asyncio
     async def test_garbage_wallet_balance_caught(self):
         bot = _make_bot()
         bot.exchange = _fake_exchange_info([{"asset": "USDC", "walletBalance": "garbage"}])
-        await bot._sync_account()  # float('garbage') 拋 → 被 _sync_account except 吞，不污染
+        await bot.sync_service._sync_account()  # float('garbage') 拋 → 被 _sync_account except 吞，不污染
         assert bot.state.get_account("USDC").equity == 0
 
     @pytest.mark.asyncio
@@ -260,7 +260,7 @@ class TestSyncAccountInfoMonkey:
             "asset": "USDC", "walletBalance": "1e18", "unrealizedProfit": "-5e17",
             "availableBalance": "0", "initialMargin": "0",
         }])
-        await bot._sync_account()
+        await bot.sync_service._sync_account()
         assert bot.state.get_account("USDC").equity == pytest.approx(5e17)
 
 

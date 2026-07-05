@@ -36,6 +36,7 @@ from .order_executor import (
 )
 from .risk_monitor import RiskMonitor, RISK_ALERT_COOLDOWN
 from .reporting import DailyReporter
+from .sync_service import SyncService
 
 
 def _create_exchange(exchange_id: str, config: dict):
@@ -100,12 +101,14 @@ class MaxGridBot:
             config=self.config, state=self.state,
             notifier=self.notifier, stop_event=self._stop_event,
         )
+        # REST 同步組件（建構順序硬約束：需要 RiskMonitor 實例）
+        self.sync_service = SyncService(
+            gateway=self.gateway, ctx=self.ctx, config=self.config,
+            state=self.state, locks=self.locks, notifier=self.notifier,
+            risk_monitor=self.risk_monitor,
+        )
 
-        self.last_sync_time = 0
         self.last_order_times: Dict[str, float] = {}
-
-        # 並發鎖：sync 防重入（鎖序固定 _sync_lock → symbol lock）
-        self._sync_lock = asyncio.Lock()
 
         # MAX 增強模組
         self.glft_controller = GLFTController()
@@ -194,127 +197,6 @@ class MaxGridBot:
     def _get_listen_key(self) -> str:
         response = self.exchange.fapiPrivatePostListenKey()
         return response.get("listenKey")
-
-    async def sync_all(self):
-        if self._sync_lock.locked():
-            return
-        async with self._sync_lock:
-            await self._sync_positions()
-            await self._sync_orders()
-            await self._sync_account()
-            await self._sync_funding_rates()
-
-    async def _sync_funding_rates(self):
-        """同步所有交易對的 funding rate"""
-        if not self.funding_manager:
-            return
-
-        for sym_config in self.config.symbols.values():
-            if sym_config.enabled:
-                rate = await self.gateway.call(self.funding_manager.update_funding_rate, sym_config.ccxt_symbol)
-                sym_state = self.state.symbols.get(sym_config.ccxt_symbol)
-                if sym_state:
-                    sym_state.current_funding_rate = rate
-
-    async def _sync_positions(self):
-        try:
-            positions = await self.gateway.call(self.exchange.fetch_positions, params={'type': 'future'})
-        except Exception as e:
-            logger.error(f"同步持倉失敗: {e}")
-            return
-
-        agg = {s: [0.0, 0.0, 0.0] for s in self.state.symbols}  # long, short, upnl
-        for pos in positions:
-            symbol = pos['symbol']
-            if symbol in agg:
-                contracts = pos.get('contracts', 0)
-                side = pos.get('side')
-                pnl = float(pos.get('unrealizedPnl', 0) or 0)
-                if side == 'long':
-                    agg[symbol][0] = contracts
-                elif side == 'short':
-                    agg[symbol][1] = abs(contracts)
-                agg[symbol][2] += pnl
-
-        for symbol, (long_pos, short_pos, upnl) in agg.items():
-            async with self.locks.get(symbol):
-                # 原子 apply：鎖內無其他 await
-                st = self.state.symbols[symbol]
-                st.long_position = long_pos
-                st.short_position = short_pos
-                st.unrealized_pnl = upnl
-
-    async def _sync_orders(self):
-        for sym_config in self.config.symbols.values():
-            if not sym_config.enabled:
-                continue
-            symbol = sym_config.ccxt_symbol
-
-            try:
-                orders = await self.gateway.call(self.exchange.fetch_open_orders, symbol=symbol)
-                state = self.state.symbols.get(symbol)
-                if not state:
-                    continue
-
-                counts = [0.0, 0.0, 0.0, 0.0]  # buy_long, sell_long, buy_short, sell_short
-                for order in orders:
-                    qty = abs(float(order.get('info', {}).get('origQty', 0)))
-                    side = order.get('side')
-                    pos_side = order.get('info', {}).get('positionSide')
-                    if side == 'buy' and pos_side == 'LONG':
-                        counts[0] += qty
-                    elif side == 'sell' and pos_side == 'LONG':
-                        counts[1] += qty
-                    elif side == 'buy' and pos_side == 'SHORT':
-                        counts[2] += qty
-                    elif side == 'sell' and pos_side == 'SHORT':
-                        counts[3] += qty
-                async with self.locks.get(symbol):
-                    # 原子 apply：鎖內無其他 await
-                    state.buy_long_orders, state.sell_long_orders, \
-                        state.buy_short_orders, state.sell_short_orders = counts
-            except Exception as e:
-                logger.error(f"同步 {symbol} 掛單失敗: {e}")
-
-    async def _sync_account(self):
-        try:
-            balance = await self.gateway.call(self.exchange.fetch_balance, {'type': 'future'})
-
-            # ccxt 頂層 total=marginBalance(已含浮盈)、free=availableBalance、used=initialMargin，
-            # 語意對不上面板欄位，且 equity 公式會重複加浮盈。改從 info.assets 取幣安原值。
-            assets = balance.get('info', {}).get('assets', []) or []
-            asset_map = {a.get('asset'): a for a in assets}
-
-            for currency in ['USDC', 'USDT']:
-                acc = self.state.get_account(currency)
-                info = asset_map.get(currency)
-
-                if info:
-                    # walletBalance 為真實錢包餘額(不含浮盈)；equity = wallet + unrealized 才正確
-                    acc.wallet_balance = float(info.get('walletBalance', 0) or 0)
-                    acc.available_balance = float(info.get('availableBalance', 0) or 0)
-                    acc.margin_used = float(info.get('initialMargin', 0) or 0)
-                    acc.unrealized_pnl = float(info.get('unrealizedProfit', 0) or 0)
-                else:
-                    # fallback：info 缺該資產時退回 ccxt 頂層(total=marginBalance，不再額外加浮盈)
-                    margin_balance = float(balance.get('total', {}).get(currency, 0) or 0)
-                    free = float(balance.get('free', {}).get(currency, 0) or 0)
-                    upnl = sum(s.unrealized_pnl for s in self.state.symbols.values()
-                               if currency in s.symbol)
-                    acc.wallet_balance = margin_balance - upnl  # 還原成錢包餘額
-                    acc.available_balance = free
-                    acc.margin_used = margin_balance - free if margin_balance > free else 0
-                    acc.unrealized_pnl = upnl
-
-            self.state.update_totals()
-
-            # 風控通知
-            if self.notifier.enabled:
-                asyncio.create_task(self.risk_monitor.check_risk_and_notify())
-
-            await self.risk_monitor.check_trailing_stop()
-        except Exception as e:
-            logger.error(f"同步帳戶失敗: {e}")
 
     def _build_bundle(self, sym_config: SymbolConfig) -> ManagerBundle:
         """組現有 manager 實例成 ManagerBundle，供 build_snapshot 共用（回測/實盤同源）。"""
@@ -642,9 +524,7 @@ class MaxGridBot:
                     await self.adjust_grid(ccxt_symbol)
                 break
 
-        if time.time() - self.last_sync_time > self.config.sync_interval:
-            await self.sync_all()
-            self.last_sync_time = time.time()
+        await self.sync_service.maybe_sync()
 
     async def _handle_account_update(self, data: dict):
         """處理 ACCOUNT_UPDATE 事件"""
@@ -857,7 +737,7 @@ class MaxGridBot:
                 ):
                     self._bandit_last_saved_pulls = self.bandit_optimizer.total_pulls
 
-            await self.sync_all()
+            await self.sync_service.sync_all()
         except Exception as e:
             logger.error(f"[MAX] 初始化失敗: {e}")
             await self.notifier.notify_crash(f"初始化失敗: {e}")

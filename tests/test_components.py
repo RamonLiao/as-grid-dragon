@@ -79,3 +79,36 @@ def test_is_blocked_matches_block_until():
     assert ex.is_blocked("X") is True
     ex._order_block_until["X"] = time.time() - 1
     assert ex.is_blocked("X") is False
+
+
+# ──────────────────────────── SyncService × RiskMonitor 整合 ────────────────────────────
+
+def test_sync_account_triggers_risk_and_trailing():
+    """_sync_account 成功路徑必觸發 check_risk_and_notify(create_task) 與
+    check_trailing_stop(await)——跨組件接線斷掉時全套 patch 遷移抓不到這條。"""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from grid_engine.sync_service import SyncService
+    from grid_engine.state import GlobalState
+
+    risk = MagicMock()
+    risk.check_risk_and_notify = AsyncMock()
+    risk.check_trailing_stop = AsyncMock()
+    notifier = MagicMock()
+    notifier.enabled = True
+    ctx = ExchangeContext()
+    ctx.exchange = MagicMock()
+    ctx.exchange.fetch_balance = MagicMock(return_value={"info": {"assets": []}, "total": {}, "free": {}})
+
+    svc = SyncService(
+        gateway=RestGateway(), ctx=ctx, config=MagicMock(), state=GlobalState(),
+        locks=SymbolLocks(), notifier=notifier, risk_monitor=risk,
+    )
+
+    async def main():
+        await svc._sync_account()
+        await asyncio.sleep(0)   # 讓 fire-and-forget create_task 跑起來
+
+    asyncio.run(main())
+    risk.check_trailing_stop.assert_awaited_once()
+    risk.check_risk_and_notify.assert_called_once()

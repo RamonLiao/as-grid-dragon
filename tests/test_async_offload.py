@@ -140,7 +140,7 @@ class TestAsyncSync:
         bot.exchange.fetch_balance = MagicMock(
             side_effect=lambda *a, **kw: (threads.add(threading.current_thread().name),
                                           {"info": {"assets": []}, "total": {}, "free": {}})[1])
-        await bot.sync_all()
+        await bot.sync_service.sync_all()
         assert threads and all(t.startswith("ccxt-rest") for t in threads)
 
     @pytest.mark.asyncio
@@ -152,7 +152,7 @@ class TestAsyncSync:
             {"side": "buy", "info": {"origQty": "2", "positionSide": "LONG"}},
             {"side": "sell", "info": {"origQty": "3", "positionSide": "LONG"}},
         ]
-        await bot._sync_orders()
+        await bot.sync_service._sync_orders()
         st = bot.state.symbols[sym]
         assert st.buy_long_orders == 2 and st.sell_long_orders == 3
 
@@ -202,7 +202,7 @@ class TestConcurrencyLocks:
             return []
 
         bot.exchange.fetch_positions = slow_fetch
-        await asyncio.gather(bot.sync_all(), bot.sync_all(), bot.sync_all())
+        await asyncio.gather(bot.sync_service.sync_all(), bot.sync_service.sync_all(), bot.sync_service.sync_all())
         assert len(calls) == 1
 
     @pytest.mark.asyncio
@@ -216,7 +216,7 @@ class TestConcurrencyLocks:
 
         lock = bot.locks.get(sym)
         async with lock:  # 模擬 adjust_grid 持鎖中
-            sync_task = asyncio.create_task(bot._sync_orders())
+            sync_task = asyncio.create_task(bot.sync_service._sync_orders())
             await asyncio.sleep(0.05)
             assert st.buy_long_orders == 99, "sync 在 adjust 持鎖期間改寫了掛單計數"
         await sync_task
@@ -235,12 +235,12 @@ class TestMonkey:
         await asyncio.wait_for(
             asyncio.gather(
                 *[bot.adjust_grid(sym) for _ in range(50)],
-                bot.sync_all(), bot.sync_all(), bot.sync_all(),
+                bot.sync_service.sync_all(), bot.sync_service.sync_all(), bot.sync_service.sync_all(),
             ),
             timeout=10,
         )
         assert not bot.locks.get(sym).locked()
-        assert not bot._sync_lock.locked()
+        assert not bot.sync_service._sync_lock.locked()
 
     @pytest.mark.asyncio
     async def test_rest_exception_storm_releases_all_locks(self):
@@ -254,17 +254,17 @@ class TestMonkey:
             setattr(bot.exchange, m, MagicMock(side_effect=RuntimeError("boom")))
         await asyncio.gather(
             *[bot.adjust_grid(sym) for _ in range(10)],
-            bot.sync_all(),
+            bot.sync_service.sync_all(),
             return_exceptions=True,
         )
         assert not bot.locks.get(sym).locked()
-        assert not bot._sync_lock.locked()
+        assert not bot.sync_service._sync_lock.locked()
         # 復原後可再進入
         bot.exchange.fetch_positions = MagicMock(return_value=[])
         bot.exchange.fetch_open_orders = MagicMock(return_value=[])
         bot.exchange.fetch_balance = MagicMock(
             return_value={"info": {"assets": []}, "total": {}, "free": {}})
-        await bot.sync_all()
+        await bot.sync_service.sync_all()
 
     @pytest.mark.asyncio
     async def test_stop_mid_flight(self):
