@@ -7,14 +7,11 @@ import dataclasses
 import json
 import math
 import os
-import ssl
 import time
 from datetime import datetime
-from typing import Optional, List, Dict
+from typing import List, Dict
 
 import ccxt
-import certifi
-import websockets
 
 from .utils import logger
 from .decision import decide, DecisionInputs
@@ -37,6 +34,7 @@ from .order_executor import (
 from .risk_monitor import RiskMonitor, RISK_ALERT_COOLDOWN
 from .reporting import DailyReporter
 from .sync_service import SyncService
+from .ws_client import WsClient
 
 
 def _create_exchange(exchange_id: str, config: dict):
@@ -76,7 +74,6 @@ class MaxGridBot:
             if sym_cfg.enabled:
                 self.state.symbols[sym_cfg.ccxt_symbol] = SymbolState(symbol=sym_cfg.ccxt_symbol)
 
-        self.listen_key: Optional[str] = None
         self.tasks: List[asyncio.Task] = []
         self._stop_event = asyncio.Event()
 
@@ -106,6 +103,17 @@ class MaxGridBot:
             gateway=self.gateway, ctx=self.ctx, config=self.config,
             state=self.state, locks=self.locks, notifier=self.notifier,
             risk_monitor=self.risk_monitor,
+        )
+        # WS 純傳輸組件（handlers 引用 bot bound method，callback 不包 try——
+        # ticker 例外必須冒泡到 WsClient 重連迴圈）
+        self.ws_client = WsClient(
+            gateway=self.gateway, ctx=self.ctx, config=self.config,
+            state=self.state, stop_event=self._stop_event,
+            handlers={
+                'bookTicker': self._handle_ticker,
+                'ACCOUNT_UPDATE': self._handle_account_update,
+                'ORDER_TRADE_UPDATE': self._handle_order_update,
+            },
         )
 
         self.last_order_times: Dict[str, float] = {}
@@ -193,10 +201,6 @@ class MaxGridBot:
                         break
                 except Exception:
                     pass
-
-    def _get_listen_key(self) -> str:
-        response = self.exchange.fapiPrivatePostListenKey()
-        return response.get("listenKey")
 
     def _build_bundle(self, sym_config: SymbolConfig) -> ManagerBundle:
         """組現有 manager 實例成 ManagerBundle，供 build_snapshot 共用（回測/實盤同源）。"""
@@ -654,65 +658,11 @@ class MaxGridBot:
         except Exception as e:
             logger.error(f"[userData] ORDER_TRADE_UPDATE 處理失敗: {e}")
 
-    async def _websocket_loop(self):
-        ssl_context = ssl.create_default_context(cafile=certifi.where())
-
-        while not self._stop_event.is_set():
-            try:
-                async with websockets.connect(self.config.websocket_url, ssl=ssl_context) as ws:
-                    self.state.connected = True
-
-                    streams = []
-                    for cfg in self.config.symbols.values():
-                        if cfg.enabled:
-                            streams.append(f"{cfg.ws_symbol}@bookTicker")
-
-                    if streams:
-                        await ws.send(json.dumps({"method": "SUBSCRIBE", "params": streams, "id": 1}))
-
-                    if self.listen_key:
-                        await ws.send(json.dumps({"method": "SUBSCRIBE", "params": [self.listen_key], "id": 2}))
-                        logger.info("[WebSocket] 已訂閱 userData stream")
-
-                    while not self._stop_event.is_set():
-                        try:
-                            msg = await asyncio.wait_for(ws.recv(), timeout=30)
-                            data = json.loads(msg)
-
-                            event_type = data.get('e', '')
-
-                            if event_type == 'bookTicker':
-                                await self._handle_ticker(data)
-                            elif event_type == 'ACCOUNT_UPDATE':
-                                await self._handle_account_update(data)
-                            elif event_type == 'ORDER_TRADE_UPDATE':
-                                await self._handle_order_update(data)
-
-                        except asyncio.TimeoutError:
-                            await ws.ping()
-            except Exception as e:
-                self.state.connected = False
-                if not self._stop_event.is_set():
-                    logger.error(f"WebSocket 錯誤: {e}")
-                    await asyncio.sleep(5)
-
-    async def _keep_alive_loop(self):
-        while not self._stop_event.is_set():
-            try:
-                await asyncio.sleep(1800)
-                if not self._stop_event.is_set():
-                    await self.gateway.call(self.exchange.fapiPrivatePutListenKey)
-                    self.listen_key = await self.gateway.call(self._get_listen_key)
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"更新 listenKey 失敗: {e}")
-
     async def run(self):
         try:
             await self.gateway.call(self._init_exchange)
             await self.gateway.call(self._check_hedge_mode)
-            self.listen_key = await self.gateway.call(self._get_listen_key)
+            await self.ws_client.acquire_listen_key()
 
             self.state.running = True
             self.state.start_time = datetime.now()
@@ -746,8 +696,8 @@ class MaxGridBot:
             return
 
         self.tasks.extend([
-            asyncio.create_task(self._websocket_loop()),
-            asyncio.create_task(self._keep_alive_loop()),
+            asyncio.create_task(self.ws_client.run()),
+            asyncio.create_task(self.ws_client.keep_alive_loop()),
         ])
         if self.notifier.enabled:
             self.tasks.append(asyncio.create_task(self.reporter.run()))

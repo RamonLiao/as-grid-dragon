@@ -243,7 +243,7 @@ def test_bot_functionality():
                     f"已配置 {len(config.symbols)} 個交易對，{len(enabled)} 個已啟用")
         
         # 測試 Bot 類結構
-        required_methods = ["run", "stop", "reload_config", "_websocket_loop", "_place_grid"]
+        required_methods = ["run", "stop", "reload_config", "_place_grid"]
         for method in required_methods:
             if hasattr(MaxGridBot, method):
                 log_test("Bot 結構", f"方法 {method}", "PASS", "存在")
