@@ -566,7 +566,9 @@ git commit -m "refactor: #7 RiskMonitor + DailyReporter 拆出（追蹤止盈/�
 
 （Step 3 命中的測試檔一併 add 明確檔名。）
 
----### Task 4: SyncService（+ maybe_sync 收編 ticker gating）+ 跨組件整合測試
+---
+
+### Task 4: SyncService（+ maybe_sync 收編 ticker gating）+ 跨組件整合測試
 
 **Files:**
 - Create: `grid_engine/sync_service.py`
