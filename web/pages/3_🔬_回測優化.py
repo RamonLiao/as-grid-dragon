@@ -66,6 +66,8 @@ def render_symbol_input():
     # 選擇已有或輸入新的
     tab1, tab2 = st.tabs(["已配置交易對", "自訂交易對"])
 
+    result = None
+
     with tab1:
         if config.symbols:
             symbol = st.selectbox(
@@ -76,7 +78,7 @@ def render_symbol_input():
             if symbol:
                 cfg = config.symbols[symbol]
                 st.caption(f"止盈: {cfg.take_profit_spacing*100:.2f}% | 補倉: {cfg.grid_spacing*100:.2f}%")
-                return symbol, cfg.ccxt_symbol, cfg
+                result = (symbol, cfg.ccxt_symbol, cfg)
         else:
             st.info("尚未配置交易對")
 
@@ -88,11 +90,11 @@ def render_symbol_input():
                 st.success(f"識別為: {coin}/{quote}")
                 # 使用預設配置
                 cfg = SymbolConfig(symbol=raw, ccxt_symbol=ccxt_sym)
-                return raw, ccxt_sym, cfg
+                result = (raw, ccxt_sym, cfg)
             else:
                 st.error("無法識別交易對格式")
 
-    return None, None, None
+    return result if result else (None, None, None)
 
 
 def render_date_range():
@@ -1279,24 +1281,33 @@ def main():
             end_date = st.session_state.backtest_end
             exchange_type = st.session_state.get("selected_exchange_type", "binance")
 
-            if mode == "單筆回測":
-                result = run_single_backtest(
-                    loader, symbol, ccxt_symbol, sym_config, start_date, end_date,
-                    exchange_type=exchange_type
-                )
-                if result:
-                    render_backtest_result(result)
+            if start_date >= end_date:
+                st.error(f"⚠️ 日期範圍無效：開始日期（{start_date}）必須早於結束日期（{end_date}）")
+            elif mode == "單筆回測":
+                try:
+                    result = run_single_backtest(
+                        loader, symbol, ccxt_symbol, sym_config, start_date, end_date,
+                        exchange_type=exchange_type
+                    )
+                    if result:
+                        render_backtest_result(result)
+                except ValueError as e:
+                    st.error(f"⚠️ {e}")
             else:
                 use_smart = st.session_state.get("use_smart", False)
                 n_trials = st.session_state.get("n_trials", 100)
                 objective = st.session_state.get("objective", "sharpe")
                 trading_mode = st.session_state.get("trading_mode", None)
 
-                results_df, opt_df = run_optimization(
-                    loader, symbol, ccxt_symbol, sym_config, start_date, end_date,
-                    use_smart=use_smart, n_trials=n_trials, objective=objective,
-                    trading_mode=trading_mode, exchange_type=exchange_type
-                )
+                try:
+                    results_df, opt_df = run_optimization(
+                        loader, symbol, ccxt_symbol, sym_config, start_date, end_date,
+                        use_smart=use_smart, n_trials=n_trials, objective=objective,
+                        trading_mode=trading_mode, exchange_type=exchange_type
+                    )
+                except ValueError as e:
+                    st.error(f"⚠️ {e}")
+                    results_df, opt_df = None, None
                 if results_df is not None:
                     # 保存到 session state 供蒙特卡羅模擬使用
                     st.session_state.opt_results_df = results_df
