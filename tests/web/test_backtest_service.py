@@ -10,6 +10,7 @@ import pytest
 
 from web.services import backtest_service
 from grid_engine.config import SymbolConfig
+from backtest.optimizer import GridOptimizer
 
 
 SYM = SymbolConfig(
@@ -33,6 +34,23 @@ def test_to_backtest_config_golden():
     # 成本模型：單次回測用引擎預設（保真）
     assert cfg.fee_pct == 0.0004
     assert cfg.funding_enabled is True
+    assert cfg.position_threshold == 0.0
+    assert cfg.position_limit == 0.0
+
+
+def test_grid_optimizer_create_config_preserves_multiplier_fields():
+    """回歸測試：Config.to_dict()→from_dict() round-trip 曾漏序列化
+    initial_quantity/limit_multiplier/threshold_multiplier/terminal_ui_mode，
+    導致 GridOptimizer._create_config 產出的 config 這四欄被打回預設值，
+    initial_quantity 3.0→0.0 令 GridBacktester.run() 誤判走 legacy 引擎，
+    使用者 multiplier 配置全丟。"""
+    base_config = backtest_service.to_backtest_config(SYM)
+    optimizer = GridOptimizer(_make_df(), base_config=base_config)
+    config = optimizer._create_config({})
+    assert config.initial_quantity == 3.0
+    assert config.threshold_multiplier == 20.0
+    assert config.limit_multiplier == 5.0
+    assert config.terminal_ui_mode is True
 
 
 def test_to_backtest_config_rejects_zero_quantity():
