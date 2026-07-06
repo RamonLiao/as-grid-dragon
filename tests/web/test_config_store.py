@@ -134,3 +134,18 @@ def test_roundtrip_real_config_no_field_loss():
 
         missing = keys_recursive(before) - keys_recursive(after)
         assert missing == set(), f"存檔遺失欄位: {missing}"
+
+
+def test_save_atomic_write_no_tmp_residue(cfg_file):
+    """驗證原子寫：存檔後同目錄沒有 .tmp 殘留檔、JSON 可正常 parse（replace 完成）。"""
+    config = config_store.load_config(path=cfg_file)
+    config.symbols["XRP/USDC:USDC"].leverage = 40
+    config_store.save_config(config, path=cfg_file)
+
+    # 驗證無 .tmp 殘留
+    tmp_file = cfg_file.with_suffix(cfg_file.suffix + ".tmp")
+    assert not tmp_file.exists(), f"tmp 檔殘留：{tmp_file}"
+
+    # 驗證主檔可正常 parse 且變更生效
+    raw = json.loads(cfg_file.read_text())
+    assert raw["symbols"]["XRP/USDC:USDC"]["leverage"] == 40

@@ -6,6 +6,7 @@ trading_mode（頁3 優化器用）、risk hard_stop 三欄、exchange_type/test
 等欄位。直接覆寫會把它們永久抹掉。這裡以 raw JSON 為底做欄位級 merge。
 """
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Optional
@@ -83,5 +84,10 @@ def save_config(config: GlobalConfig,
             merged["symbols"][sym_key].update(extras)
 
     _ensure_backup(p)
-    with open(p, "w", encoding="utf-8") as f:
+    # 原子寫：tmp + os.replace 防止 crash/disk-full 導致檔案截斷
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(merged, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
