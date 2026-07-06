@@ -64,3 +64,22 @@
 
 ### #9 Task 8 裁決（2026-07-06，使用者拍板）
 對比 FAIL（return 方向相反）→ **接受新引擎為基準，進 Phase 2**。根因非映射 bug（position_threshold/limit 核對一致），是 #4 刻意撮合重設計：舊引擎同根 high/low 盤中觸發（look-ahead 傾向），新引擎追價語意+settle-then-decide 鏡像實盤 decide()（replay zero-diff 守門的那套）。±0.1% 微利量級下撮合時機差異足以翻方向。舊引擎正因不忠於實盤而被刪，不是基準。FIDELITY_NOTES 已有「crossing 只看 close」揭露項。
+
+### #9 fee 對齊修正後重跑（2026-07-06，Critical review finding 修復）
+
+**發現**：`compare_backtest_engines.py` 原本設 `new_cfg.fee_pct = 0.0008` 的推論依據是 backtester.py:282/324 的 fee/2，但那段是 `_run_legacy_mode`（未執行路徑）。新引擎實際跑的是 `_run_terminal_ui_mode`（backtester.py:540 起），其 `_open`/`_close` 內 `fee = qty * fill_price * fee_pct`（line 587,606,616）——**無 /2**，每邊直接收整個 `fee_pct`。舊引擎每邊收 0.0004（core/backtest.py:230）。故正確對齊值是 `fee_pct = 0.0004`，原本的 0.0008 讓新引擎多付一倍手續費，在 ±0.1% 微利量級足以是翻方向的混雜變量。
+
+**修正**：`new_cfg.fee_pct` 0.0008 → 0.0004，同步修正註解與 docstring usage 範例。
+
+**重跑結果（同兩組區間）**：
+
+| Symbol/區間 | 舊 return% | 新 return%（修正前 -0.1083） | 新 return%（修正後） | 舊筆數 | 新筆數 |
+|---|---|---|---|---|---|
+| ETHUSDC 2026-01-25~31 | +0.1163 | -0.1083 | **-0.0824** | 60 | 23 |
+| BNBUSDC 2025-11-17~23 | +0.0949 | -0.0504 | **-0.0350** | 35 | 11 |
+
+maxDD：ETHUSDC 舊 0.1162% vs 新 0.3326%；BNBUSDC 舊 0.0949% vs 新 0.2267%（皆略降但仍 2-3 倍於舊引擎，符合 fee 減半後虧損規模同步縮小的預期）。
+
+**判讀**：fee 修正後 return **方向仍相反**（舊賺新虧，兩組區間皆然），只是虧損量級縮小（fee 減半後虧得少一點，符合預期，但方向不變）。這證實了先前 FAIL 的主因**不是** fee 對齊 bug，而是既有判讀成立的撮合語意差異（同根 high/low vs 追價 settle-then-decide）——修正後結論更穩固，#9 Phase 2 裁決（接受新引擎為基準）維持不變，無需回頭修正該裁決。
+
+全套回歸：`uv run pytest tests/ -q` → 294 passed（unchanged）。

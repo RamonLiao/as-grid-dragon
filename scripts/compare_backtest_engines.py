@@ -5,7 +5,8 @@
 比純網格邏輯的收益率/回撤量級。差一個數量級 = 參數映射 bug。
 
 注意：Phase 2 刪 core/ 後本 script 的舊引擎路徑失效，僅留存歷史。
-用法: uv run python scripts/compare_backtest_engines.py BNBUSDC 2026-06-11 2026-06-15
+用法: uv run python scripts/compare_backtest_engines.py ETHUSDC 2026-01-25 2026-01-31
+      uv run python scripts/compare_backtest_engines.py BNBUSDC 2025-11-17 2025-11-23
 """
 import sys
 from pathlib import Path
@@ -34,14 +35,15 @@ def main(symbol: str, start: str, end: str):
 
     # --- 成本對齊策略 ---
     # 舊引擎 fee 寫死每邊 0.0004（core/backtest.py:230，無法參數關閉）；
-    # 新引擎每邊收 fee_pct/2（backtester.py:282）。
-    # → fee 用「對齊」：新引擎 fee_pct=0.0008 ⇒ 每邊 0.0004 = 舊引擎。
+    # 新引擎實際執行路徑 _run_terminal_ui_mode（backtester.py:540,587,606,616）
+    # 每邊直接收整個 fee_pct（無 /2；帶 /2 的 282/324 等行屬未執行的 _run_legacy_mode）。
+    # → fee 對齊：新引擎 fee_pct=0.0004 ⇒ 每邊 0.0004 = 舊引擎（同構，非兩倍）。
     # 滑價/funding/hard_stop 兩邊皆可關 → 全關。
 
     # --- 新引擎 ---
     from backtest.backtester import GridBacktester
     new_cfg = backtest_service.to_backtest_config(sym_config, zero_costs=True)
-    new_cfg.fee_pct = 0.0008  # 每邊 0.0004，對齊舊引擎寫死值
+    new_cfg.fee_pct = 0.0004  # 每邊 0.0004，對齊舊引擎寫死值（terminal_ui_mode 路徑無 /2）
     new_result = GridBacktester(df, new_cfg).run()
 
     # --- 舊引擎（成本經由 run_backtest kwargs 關閉，core/backtest.py:194-198） ---
