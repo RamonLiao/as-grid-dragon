@@ -33,6 +33,19 @@ def load_config(path: Optional[Path] = None) -> GlobalConfig:
     return GlobalConfig.from_dict(load_raw(path))
 
 
+def get_mtime(path: Optional[Path] = None) -> int:
+    """回傳設定檔目前的 mtime（ns），檔案不存在回 0。
+
+    用於跨頁配置同步判斷（見 web/state.py check_config_updated）：
+    比對檔案是否真的被寫入過，而非逐欄位比對 session 內的 config 物件
+    （後者會被頁內 widget 對 session config 的暫時性寫入誤判為外部更新）。
+    """
+    p = _resolve(path)
+    if not p.exists():
+        return 0
+    return p.stat().st_mtime_ns
+
+
 def get_symbol_extra(ccxt_symbol: str, key: str, default=None,
                      path: Optional[Path] = None):
     raw = load_raw(path)

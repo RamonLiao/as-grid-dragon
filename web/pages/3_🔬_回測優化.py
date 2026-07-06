@@ -1207,7 +1207,7 @@ def main():
     """主函數"""
     # 先渲染側邊欄（確保不被 st.stop() 阻擋）
     render_sidebar()
-    
+
     # 檢查配置是否被其他頁面更新
     if check_config_updated():
         st.info("✅ 檢測到配置已更新，正在刷新...")
