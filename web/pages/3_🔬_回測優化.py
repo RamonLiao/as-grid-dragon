@@ -26,17 +26,14 @@ from components.sidebar import render_sidebar
 apply_custom_theme()
 
 from state import init_session_state, get_config, save_config, check_config_updated
-from config.models import SymbolConfig
+from grid_engine.config import SymbolConfig
+from backtest.data_loader import DataLoader
+from web.services import backtest_service, config_store
 from utils import normalize_symbol
-from core.backtest import BacktestManager
 
 # 檢查智能優化是否可用
 try:
-    from backtest.smart_optimizer import (
-        SmartOptimizer, OptimizationObjective, OptimizationMethod,
-        TradingMode, MODE_INFO
-    )
-    from backtest.config import Config as BacktestConfig
+    from backtest.smart_optimizer import TradingMode, MODE_INFO
     SMART_OPTIMIZER_AVAILABLE = True
 except ImportError:
     SMART_OPTIMIZER_AVAILABLE = False
@@ -55,9 +52,9 @@ SUPPORTED_EXCHANGES = {
 
 
 @st.cache_resource
-def get_backtest_manager():
-    """取得回測管理器 (快取)"""
-    return BacktestManager()
+def get_data_loader():
+    """取得資料載入器 (快取)"""
+    return DataLoader()
 
 
 def render_symbol_input():
@@ -216,34 +213,34 @@ def render_backtest_params(sym_config: SymbolConfig):
     return sym_config
 
 
-def run_single_backtest(manager: BacktestManager, symbol: str, ccxt_symbol: str,
+def _ensure_data_loaded(loader: DataLoader, symbol: str, start_date: str, end_date: str,
+                        exchange_type: str = "binance"):
+    """檢查並下載數據（單筆回測與優化共用），回傳載入後的 DataFrame。"""
+    date_range = loader.get_date_range(symbol)
+    need_download = True
+    if date_range is not None:
+        have_start, have_end = date_range
+        need_download = not (str(have_start) <= start_date and str(have_end) >= end_date)
+
+    if need_download:
+        st.info(f"從 {exchange_type.upper()} 下載歷史數據中...")
+        loader.download(symbol, start_date, end_date, exchange_type=exchange_type)
+
+    with st.spinner("載入數據..."):
+        df = loader.load(symbol, start_date, end_date)
+
+    return df
+
+
+def run_single_backtest(loader: DataLoader, symbol: str, ccxt_symbol: str,
                         sym_config: SymbolConfig, start_date: str, end_date: str,
                         exchange_type: str = "binance"):
     """執行單筆回測"""
     # 顯示使用的交易所
     st.info(f"📡 數據來源: **{SUPPORTED_EXCHANGES.get(exchange_type, exchange_type)}**")
 
-    # 檢查並下載數據
-    available_dates = manager.get_available_dates(symbol)
-
     with st.spinner("檢查數據..."):
-        # 計算需要的日期
-        start = datetime.strptime(start_date, "%Y-%m-%d")
-        end = datetime.strptime(end_date, "%Y-%m-%d")
-        days = (end - start).days + 1
-
-        need_download = any(
-            (start + timedelta(days=i)).strftime("%Y-%m-%d") not in available_dates
-            for i in range(days)
-        )
-
-        if need_download:
-            st.info(f"從 {exchange_type.upper()} 下載歷史數據中...")
-            manager.download_data(symbol, ccxt_symbol, start_date, end_date, exchange_type)
-
-    # 載入數據
-    with st.spinner("載入數據..."):
-        df = manager.load_data(symbol, start_date, end_date)
+        df = _ensure_data_loaded(loader, symbol, start_date, end_date, exchange_type)
 
     if df is None or df.empty:
         st.error("載入數據失敗")
@@ -253,7 +250,11 @@ def run_single_backtest(manager: BacktestManager, symbol: str, ccxt_symbol: str,
 
     # 執行回測
     with st.spinner("執行回測..."):
-        result = manager.run_backtest(sym_config, df)
+        try:
+            result = backtest_service.run_single_backtest(sym_config, df)
+        except ValueError as e:
+            st.error(str(e))
+            return None
 
     return result
 
@@ -303,10 +304,10 @@ def render_backtest_result(result: dict):
         st.metric("總交易數", result.get('trades_count', 0))
 
     with col2:
-        st.metric("多單成交", result.get('long_trades', 0))
+        st.metric("已實現盈虧", f"{result.get('realized_pnl', 0):.2f} U")
 
     with col3:
-        st.metric("空單成交", result.get('short_trades', 0))
+        st.metric("未實現盈虧", f"{result.get('unrealized_pnl', 0):.2f} U")
 
     with col4:
         pf = result.get('profit_factor', 0)
@@ -341,290 +342,248 @@ def render_backtest_result(result: dict):
     return result
 
 
-def run_optimization(manager: BacktestManager, symbol: str, ccxt_symbol: str,
+def run_optimization(loader: DataLoader, symbol: str, ccxt_symbol: str,
                      sym_config: SymbolConfig, start_date: str, end_date: str,
                      use_smart: bool = True, n_trials: int = 100,
                      objective: str = "sharpe", trading_mode=None,
                      exchange_type: str = "binance"):
-    """執行參數優化 - 支援智能優化與傳統網格搜索"""
+    """執行參數優化 - 支援智能優化與傳統網格搜索。回傳 (results_df, df)。"""
     # 顯示使用的交易所
     st.info(f"📡 數據來源: **{SUPPORTED_EXCHANGES.get(exchange_type, exchange_type)}**")
 
-    # 載入數據 (與單筆回測相同)
-    available_dates = manager.get_available_dates(symbol)
-
-    start = datetime.strptime(start_date, "%Y-%m-%d")
-    end = datetime.strptime(end_date, "%Y-%m-%d")
-    days = (end - start).days + 1
-
-    need_download = any(
-        (start + timedelta(days=i)).strftime("%Y-%m-%d") not in available_dates
-        for i in range(days)
-    )
-
-    if need_download:
-        with st.spinner(f"從 {exchange_type.upper()} 下載歷史數據中..."):
-            manager.download_data(symbol, ccxt_symbol, start_date, end_date, exchange_type)
-
-    with st.spinner("載入數據..."):
-        df = manager.load_data(symbol, start_date, end_date)
+    with st.spinner("檢查數據..."):
+        df = _ensure_data_loaded(loader, symbol, start_date, end_date, exchange_type)
 
     if df is None or df.empty:
         st.error("載入數據失敗")
-        return None, None, None, None
+        return None, None
 
     st.success(f"載入 {len(df):,} 條 K 線")
 
     # 智能優化模式
     if use_smart and SMART_OPTIMIZER_AVAILABLE:
-        results, smart_result, optimizer = run_smart_optimization(
-            df, sym_config, n_trials, objective, trading_mode
-        )
-        return results, smart_result, optimizer, df
+        # 交易模式以 config_store 中該交易對的設定為準（與實盤一致），
+        # 不使用 UI 選擇器（僅供顯示參考）
+        effective_mode = config_store.get_symbol_extra(
+            ccxt_symbol, "trading_mode", default="swing")
+        if TradingMode is not None:
+            mode_info = MODE_INFO[TradingMode(effective_mode)]
+            st.info(f"🎯 交易模式: {mode_info['name']} | {mode_info['description']}")
+
+        progress_bar = st.progress(0, text="智能優化中...")
+        status_text = st.empty()
+
+        def update_progress_smart(current, total, best_value):
+            progress_bar.progress(current / total, text=f"智能優化中... {current}/{total}")
+            status_text.caption(f"當前最佳值: {best_value:.4f}")
+
+        try:
+            results_df = backtest_service.run_smart_optimization(
+                sym_config, df, n_trials=n_trials, objective=objective,
+                trading_mode=effective_mode, progress_callback=update_progress_smart)
+        except ValueError as e:
+            st.error(str(e))
+            return None, None
+
+        progress_bar.progress(1.0, text="智能優化完成!")
+        status_text.empty()
+
+        return results_df, df
     else:
         # 傳統網格優化
         if use_smart and not SMART_OPTIMIZER_AVAILABLE:
             st.warning("⚠️ 智能優化不可用 (請安裝 Optuna: pip install optuna)，改用傳統網格優化")
-        
+
         progress_bar = st.progress(0, text="網格優化中...")
 
         def update_progress(current, total):
             progress_bar.progress(current / total, text=f"網格優化中... {current}/{total}")
 
-        results = manager.optimize_params(sym_config, df, update_progress)
+        try:
+            results_df = backtest_service.run_grid_optimization(
+                sym_config, df, progress_callback=update_progress)
+        except ValueError as e:
+            st.error(str(e))
+            return None, None
         progress_bar.progress(1.0, text="優化完成!")
-        
-        return results, None, None, df
+
+        return results_df, df
 
 
-def run_smart_optimization(df: pd.DataFrame, sym_config: SymbolConfig,
-                           n_trials: int, objective: str, trading_mode=None):
-    """執行智能優化 (使用 Optuna TPE)"""
-    # 轉換配置
-    base_config = BacktestConfig(
-        symbol=sym_config.symbol,
-        initial_quantity=sym_config.initial_quantity,
-        leverage=sym_config.leverage,
-        take_profit_spacing=sym_config.take_profit_spacing,
-        grid_spacing=sym_config.grid_spacing,
-    )
-
-    # 選擇優化目標
-    objective_map = {
-        "return": OptimizationObjective.RETURN,
-        "sharpe": OptimizationObjective.SHARPE,
-        "sortino": OptimizationObjective.SORTINO,
-        "calmar": OptimizationObjective.CALMAR,
-        "profit_factor": OptimizationObjective.PROFIT_FACTOR,
-        "risk_adjusted": OptimizationObjective.RISK_ADJUSTED,
-    }
-    opt_objective = objective_map.get(objective, OptimizationObjective.SHARPE)
-
-    # 創建優化器（傳入交易模式）
-    optimizer = SmartOptimizer(df, base_config, trading_mode=trading_mode)
-
-    # 顯示使用的模式
-    if trading_mode is not None:
-        mode_info = MODE_INFO[trading_mode]
-        st.info(f"🎯 交易模式: {mode_info['name']} | {mode_info['description']}")
-    
-    progress_bar = st.progress(0, text="智能優化中...")
-    status_text = st.empty()
-    
-    def update_progress(current, total, best_value):
-        progress_bar.progress(current / total, text=f"智能優化中... {current}/{total}")
-        status_text.caption(f"當前最佳值: {best_value:.4f}")
-    
-    # 執行優化
-    result = optimizer.optimize(
-        n_trials=n_trials,
-        objective=opt_objective,
-        method=OptimizationMethod.TPE,
-        progress_callback=update_progress,
-        show_progress=False
-    )
-    
-    progress_bar.progress(1.0, text="智能優化完成!")
-    status_text.empty()
-    
-    # 轉換結果格式以兼容現有顯示
-    results = []
-    for trial in result.all_trials:
-        results.append({
-            "take_profit_spacing": trial.params.get("take_profit_spacing", sym_config.take_profit_spacing),
-            "grid_spacing": trial.params.get("grid_spacing", sym_config.grid_spacing),
-            "limit_multiplier": trial.params.get("limit_multiplier", 5.0),
-            "threshold_multiplier": trial.params.get("threshold_multiplier", 14.0),
-            "return_pct": trial.metrics.get("return_pct", 0),
-            "max_drawdown": trial.metrics.get("max_drawdown", 0),
-            "win_rate": trial.metrics.get("win_rate", 0),
-            "trades_count": trial.metrics.get("trades_count", 0),
-            "sharpe_ratio": trial.metrics.get("sharpe_ratio", 0),
-            "objective_value": trial.objective_value,
-        })
-    
-    # 按收益率排序
-    results.sort(key=lambda x: x["return_pct"], reverse=True)
-    
-    # 返回結果、SmartOptimizationResult 和 optimizer（用於獲取 study）
-    return results, result, optimizer
-
-
-def render_optimization_results(results: list, symbol: str, smart_result=None, optimizer=None, 
+def render_optimization_results(results_df: pd.DataFrame, symbol: str,
                                 df=None, sym_config=None):
-    """渲染優化結果"""
+    """渲染優化結果。
+
+    `results_df` 為 backtest_service 兩個優化器共用的歸一 DataFrame：
+    - 網格搜尋：各參數欄 + 指標欄，已按 return_pct 降序，best 用 iloc[0]。
+    - 智能優化：每 trial 一列（參數欄 + objective_value），best 由
+      `results_df.attrs["best_params"]`/`["best_metrics"]` 提供。
+    以 attrs 是否帶 best_params 判斷來源，只有智能優化才有 attrs。
+    """
     st.subheader("🏆 優化結果 (Top 10)")
 
-    if not results:
+    if results_df is None or results_df.empty:
         st.warning("無優化結果")
         return
 
-    # 顯示優化摘要（如果是智能優化）
-    if smart_result is not None:
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("總試驗數", smart_result.n_trials)
-        with col2:
-            st.metric("優化耗時", f"{smart_result.optimization_time:.1f}s")
-        with col3:
-            st.metric("最佳目標值", f"{smart_result.best_objective:.4f}")
-        with col4:
-            st.metric("優化方法", smart_result.method.upper())
-        st.divider()
+    is_smart = bool(results_df.attrs.get("best_params"))
 
-    # 轉換為 DataFrame
+    if is_smart:
+        best_params = dict(results_df.attrs.get("best_params") or {})
+        best_metrics = dict(results_df.attrs.get("best_metrics") or {})
+        param_importance = dict(results_df.attrs.get("param_importance") or {})
+        top_df = results_df.sort_values("objective_value", ascending=False)
+        best_objective = top_df.iloc[0]["objective_value"]
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("總試驗數", len(results_df))
+        with col2:
+            st.metric("最佳目標值", f"{best_objective:.4f}")
+        with col3:
+            st.metric("優化方法", "TPE")
+        st.divider()
+    else:
+        best_params = results_df.iloc[0].to_dict()
+        best_metrics = best_params
+        param_importance = {}
+        top_df = results_df
+
+    # Top 10 表格
     rows = []
-    for r in results[:10]:
-        row = {
-            "排名": len(rows) + 1,
-            "止盈%": f"{r['take_profit_spacing']*100:.2f}",
-            "補倉%": f"{r['grid_spacing']*100:.2f}",
-            "收益率%": f"{r['return_pct']*100:.2f}",
-            "回撤%": f"{r['max_drawdown']*100:.1f}",
-            "勝率%": f"{r['win_rate']*100:.1f}",
-            "交易數": r['trades_count'],
-        }
-        # 智能優化額外顯示 Sharpe
-        if "sharpe_ratio" in r and r["sharpe_ratio"]:
+    for _, r in top_df.head(10).iterrows():
+        row = {"排名": len(rows) + 1}
+        if "take_profit_spacing" in r:
+            row["止盈%"] = f"{r['take_profit_spacing']*100:.2f}"
+        if "grid_spacing" in r:
+            row["補倉%"] = f"{r['grid_spacing']*100:.2f}"
+        if "return_pct" in r and pd.notna(r["return_pct"]):
+            row["收益率%"] = f"{r['return_pct']*100:.2f}"
+        if "max_drawdown" in r and pd.notna(r["max_drawdown"]):
+            row["回撤%"] = f"{r['max_drawdown']*100:.1f}"
+        if "win_rate" in r and pd.notna(r["win_rate"]):
+            row["勝率%"] = f"{r['win_rate']*100:.1f}"
+        trades_val = r["trades"] if "trades" in r else r.get("trades_count")
+        if trades_val is not None and pd.notna(trades_val):
+            row["交易數"] = int(trades_val)
+        if "sharpe_ratio" in r and pd.notna(r["sharpe_ratio"]):
             row["Sharpe"] = f"{r['sharpe_ratio']:.2f}"
-        # 顯示新參數（如果被優化）
         if "limit_multiplier" in r:
             row["加倍倍數"] = f"{r['limit_multiplier']:.1f}"
         if "threshold_multiplier" in r:
             row["裝死倍數"] = f"{r['threshold_multiplier']:.1f}"
+        if "objective_value" in r:
+            row["目標值"] = f"{r['objective_value']:.4f}"
         rows.append(row)
 
-    results_df = pd.DataFrame(rows)
-    st.dataframe(results_df, width='stretch', hide_index=True)
+    table_df = pd.DataFrame(rows)
+    st.dataframe(table_df, width='stretch', hide_index=True)
 
     # 顯示參數重要性（智能優化）
-    if smart_result and smart_result.param_importance:
+    if param_importance:
         st.divider()
         st.markdown("**📊 參數重要性分析**")
-        
+
         import plotly.express as px
         importance_df = pd.DataFrame([
             {"參數": k, "重要性": v}
-            for k, v in smart_result.param_importance.items()
+            for k, v in param_importance.items()
         ]).sort_values("重要性", ascending=True)
-        
+
         fig = px.bar(importance_df, x="重要性", y="參數", orientation="h",
                      color="重要性", color_continuous_scale="Blues")
         fig.update_layout(height=200, margin=dict(l=0, r=0, t=10, b=0))
         st.plotly_chart(fig, width='stretch')
 
-    # 智能優化進階視覺化（需要 optimizer 對象）
-    if optimizer is not None and SMART_OPTIMIZER_AVAILABLE:
-        render_advanced_visualizations(optimizer, smart_result, df, sym_config)
+    # 智能優化進階視覺化（需要逐 trial 資料，僅智能優化提供）
+    if is_smart and SMART_OPTIMIZER_AVAILABLE:
+        render_advanced_visualizations(results_df, best_params, best_metrics, df, sym_config)
 
     # 應用最佳參數
-    if results:
-        best = results[0]
-        st.divider()
+    st.divider()
 
-        col1, col2 = st.columns([3, 1])
+    col1, col2 = st.columns([3, 1])
 
-        with col1:
-            params_str = f"**最佳參數:** 止盈 {best['take_profit_spacing']*100:.2f}%, 補倉 {best['grid_spacing']*100:.2f}%"
-            if "limit_multiplier" in best:
-                params_str += f", 加倍 {best['limit_multiplier']:.1f}x"
-            if "threshold_multiplier" in best:
-                params_str += f", 裝死 {best['threshold_multiplier']:.1f}x"
-            st.markdown(params_str)
+    with col1:
+        params_str = f"**最佳參數:** 止盈 {best_params['take_profit_spacing']*100:.2f}%, 補倉 {best_params['grid_spacing']*100:.2f}%"
+        if "limit_multiplier" in best_params:
+            params_str += f", 加倍 {best_params['limit_multiplier']:.1f}x"
+        if "threshold_multiplier" in best_params:
+            params_str += f", 裝死 {best_params['threshold_multiplier']:.1f}x"
+        st.markdown(params_str)
 
-        with col2:
-            if st.button("套用最佳參數", type="primary"):
-                config = get_config()
-                if symbol not in config.symbols:
-                    # 新增
-                    config.symbols[symbol] = SymbolConfig(symbol=symbol)
+    with col2:
+        if st.button("套用最佳參數", type="primary"):
+            config = get_config()
+            if symbol not in config.symbols:
+                # 新增
+                config.symbols[symbol] = SymbolConfig(symbol=symbol)
 
-                config.symbols[symbol].take_profit_spacing = best['take_profit_spacing']
-                config.symbols[symbol].grid_spacing = best['grid_spacing']
-                if "limit_multiplier" in best:
-                    config.symbols[symbol].limit_multiplier = best['limit_multiplier']
-                if "threshold_multiplier" in best:
-                    config.symbols[symbol].threshold_multiplier = best['threshold_multiplier']
-                save_config()
+            config.symbols[symbol].take_profit_spacing = best_params['take_profit_spacing']
+            config.symbols[symbol].grid_spacing = best_params['grid_spacing']
+            if "limit_multiplier" in best_params:
+                config.symbols[symbol].limit_multiplier = best_params['limit_multiplier']
+            if "threshold_multiplier" in best_params:
+                config.symbols[symbol].threshold_multiplier = best_params['threshold_multiplier']
+            save_config()
 
-                st.success("已套用最佳參數!")
-                st.rerun()
+            st.success("已套用最佳參數!")
+            st.rerun()
 
 
-def render_advanced_visualizations(optimizer, smart_result, df=None, sym_config=None):
-    """渲染進階優化視覺化圖表"""
-    import plotly.express as px
-    import plotly.graph_objects as go
-    
+def render_advanced_visualizations(trials_df: pd.DataFrame, best_params: dict,
+                                   best_metrics: dict, df=None, sym_config=None):
+    """渲染進階優化視覺化圖表（資料來源改為 backtest_service 回傳的逐 trial DataFrame）"""
     st.divider()
     st.markdown("### 📈 進階優化分析")
-    
-    # 獲取 Optuna study 對象
-    study = optimizer.get_study()
-    if study is None:
+
+    if trials_df is None or trials_df.empty:
         st.warning("無法獲取優化歷史數據")
         return
-    
+
+    best_objective = best_metrics.get(
+        "objective_value", trials_df["objective_value"].max())
+
     # 使用 tabs 組織不同的視覺化
     tab1, tab2, tab3, tab4 = st.tabs([
-        "🔥 參數熱力圖", 
-        "📉 收斂曲線", 
+        "🔥 參數熱力圖",
+        "📉 收斂曲線",
         "📊 平行座標圖",
         "🎲 蒙特卡羅模擬"
     ])
-    
+
     with tab1:
-        render_contour_plot(study, smart_result)
-    
+        render_contour_plot(trials_df, best_params)
+
     with tab2:
-        render_optimization_history(study, smart_result)
-    
+        render_optimization_history(trials_df, best_objective)
+
     with tab3:
-        render_parallel_coordinate(study, smart_result)
-    
+        render_parallel_coordinate(trials_df)
+
     with tab4:
-        render_monte_carlo_simulation(smart_result, df, sym_config)
+        render_monte_carlo_simulation(best_params, best_metrics, df, sym_config)
 
 
-def render_contour_plot(study, smart_result):
+def render_contour_plot(trials_df: pd.DataFrame, best_params: dict):
     """渲染參數熱力圖 (Contour Plot)"""
     import plotly.graph_objects as go
-    import numpy as np
-    
+
     st.markdown("**參數空間熱力圖**")
     st.caption("顯示兩個參數組合對目標值的影響。寬廣的高值區域表示參數穩健，小範圍高峰可能過擬合。")
-    
+
     try:
         # 從所有試驗中提取數據
-        trials_data = []
-        for trial in study.trials:
-            if trial.state.name == "COMPLETE":
-                trials_data.append({
-                    "take_profit": trial.params.get("take_profit_spacing", 0) * 100,
-                    "grid_spacing": trial.params.get("grid_spacing", 0) * 100,
-                    "objective": trial.value
-                })
-        
+        trials_data = [
+            {
+                "take_profit": row.get("take_profit_spacing", 0) * 100,
+                "grid_spacing": row.get("grid_spacing", 0) * 100,
+                "objective": row["objective_value"],
+            }
+            for _, row in trials_df.iterrows()
+            if pd.notna(row.get("objective_value"))
+        ]
+
         if len(trials_data) < 10:
             st.info("試驗數據不足，無法生成熱力圖 (需要至少 10 個完成的試驗)")
             return
@@ -651,8 +610,8 @@ def render_contour_plot(study, smart_result):
         ))
         
         # 標記最佳點
-        best_tp = smart_result.best_params.get("take_profit_spacing", 0) * 100
-        best_gs = smart_result.best_params.get("grid_spacing", 0) * 100
+        best_tp = best_params.get("take_profit_spacing", 0) * 100
+        best_gs = best_params.get("grid_spacing", 0) * 100
         
         fig.add_trace(go.Scatter(
             x=[best_tp],
@@ -673,21 +632,22 @@ def render_contour_plot(study, smart_result):
         )
         
         st.plotly_chart(fig, width='stretch')
-        
+
         # 過擬合風險評估
-        render_overfitting_assessment(trials_data, smart_result)
-        
+        best_objective = trials_df["objective_value"].max()
+        render_overfitting_assessment(trials_data, best_objective)
+
     except Exception as e:
         st.error(f"生成熱力圖時發生錯誤: {str(e)}")
 
 
-def render_overfitting_assessment(trials_data, smart_result):
+def render_overfitting_assessment(trials_data, best_objective: float):
     """評估過擬合風險"""
     import numpy as np
-    
+
     obj_values = [d["objective"] for d in trials_data]
-    best_obj = smart_result.best_objective
-    
+    best_obj = best_objective
+
     # 計算統計數據
     mean_obj = np.mean(obj_values)
     std_obj = np.std(obj_values)
@@ -731,33 +691,30 @@ def render_overfitting_assessment(trials_data, smart_result):
     """, unsafe_allow_html=True)
 
 
-def render_optimization_history(study, smart_result):
+def render_optimization_history(trials_df: pd.DataFrame, best_objective: float):
     """渲染優化收斂曲線"""
     import plotly.graph_objects as go
-    
+
     st.markdown("**優化收斂曲線**")
     st.caption("顯示優化過程中目標值的變化。曲線趨於平穩表示已收斂。")
-    
+
     try:
-        # 提取試驗歷史
-        trial_numbers = []
-        trial_values = []
+        # 提取試驗歷史（依 DataFrame 原始順序視為試驗順序）
+        values = trials_df["objective_value"].dropna().tolist()
+        trial_numbers = list(range(1, len(values) + 1))
+        trial_values = values
         best_values = []
         current_best = float('-inf')
-        
-        for trial in study.trials:
-            if trial.state.name == "COMPLETE" and trial.value is not None:
-                trial_numbers.append(trial.number + 1)
-                trial_values.append(trial.value)
-                current_best = max(current_best, trial.value)
-                best_values.append(current_best)
-        
+        for v in values:
+            current_best = max(current_best, v)
+            best_values.append(current_best)
+
         if not trial_numbers:
             st.info("無試驗數據可顯示")
             return
-        
+
         fig = go.Figure()
-        
+
         # 所有試驗點
         fig.add_trace(go.Scatter(
             x=trial_numbers,
@@ -767,7 +724,7 @@ def render_optimization_history(study, smart_result):
             marker=dict(size=6, color='lightblue', opacity=0.6),
             hovertemplate="試驗 #%{x}<br>目標值: %{y:.4f}<extra></extra>"
         ))
-        
+
         # 最佳值曲線
         fig.add_trace(go.Scatter(
             x=trial_numbers,
@@ -777,11 +734,11 @@ def render_optimization_history(study, smart_result):
             line=dict(color='#00CC96', width=3),
             hovertemplate="試驗 #%{x}<br>最佳值: %{y:.4f}<extra></extra>"
         ))
-        
+
         # 標記最終最佳值
-        fig.add_hline(y=smart_result.best_objective, line_dash="dash", 
-                      line_color="gold", annotation_text=f"最佳: {smart_result.best_objective:.4f}")
-        
+        fig.add_hline(y=best_objective, line_dash="dash",
+                      line_color="gold", annotation_text=f"最佳: {best_objective:.4f}")
+
         fig.update_layout(
             xaxis_title="試驗次數",
             yaxis_title="目標值",
@@ -789,29 +746,28 @@ def render_optimization_history(study, smart_result):
             margin=dict(l=0, r=0, t=30, b=0),
             legend=dict(yanchor="bottom", y=0.01, xanchor="right", x=0.99)
         )
-        
+
         st.plotly_chart(fig, width='stretch')
-        
+
         # 收斂分析
         if len(best_values) >= 10:
             # 檢查最後 20% 的試驗是否有改善
             cutoff = int(len(best_values) * 0.8)
             early_best = best_values[cutoff] if cutoff < len(best_values) else best_values[-1]
-            improvement = (smart_result.best_objective - early_best) / abs(early_best) * 100 if early_best != 0 else 0
-            
+            improvement = (best_objective - early_best) / abs(early_best) * 100 if early_best != 0 else 0
+
             if improvement < 1:
                 st.success(f"✅ 優化已收斂：最後 20% 試驗改善幅度僅 {improvement:.2f}%")
             else:
                 st.warning(f"⚠️ 優化可能未完全收斂：最後 20% 試驗仍有 {improvement:.2f}% 改善，建議增加試驗次數")
-        
+
     except Exception as e:
         st.error(f"生成收斂曲線時發生錯誤: {str(e)}")
 
 
-def render_parallel_coordinate(study, smart_result):
+def render_parallel_coordinate(trials_df: pd.DataFrame):
     """渲染平行座標圖"""
     import plotly.express as px
-    import pandas as pd
 
     st.markdown("**平行座標圖**")
     st.caption("同時顯示所有參數與目標值的關係。追蹤高目標值的線條可以看出參數偏好。")
@@ -819,16 +775,16 @@ def render_parallel_coordinate(study, smart_result):
     try:
         # 從試驗中提取數據
         data = []
-        for trial in study.trials:
-            if trial.state.name == "COMPLETE" and trial.value is not None:
-                row = {
-                    "止盈%": trial.params.get("take_profit_spacing", 0) * 100,
-                    "補倉%": trial.params.get("grid_spacing", 0) * 100,
-                    "加倍倍數": trial.params.get("limit_multiplier", 5.0),
-                    "裝死倍數": trial.params.get("threshold_multiplier", 14.0),
-                    "目標值": trial.value
-                }
-                data.append(row)
+        for _, r in trials_df.iterrows():
+            if pd.isna(r.get("objective_value")):
+                continue
+            data.append({
+                "止盈%": r.get("take_profit_spacing", 0) * 100,
+                "補倉%": r.get("grid_spacing", 0) * 100,
+                "加倍倍數": r.get("limit_multiplier", 5.0),
+                "裝死倍數": r.get("threshold_multiplier", 14.0),
+                "目標值": r["objective_value"],
+            })
 
         if len(data) < 5:
             st.info("試驗數據不足，無法生成平行座標圖")
@@ -865,30 +821,28 @@ def render_parallel_coordinate(study, smart_result):
         st.error(f"生成平行座標圖時發生錯誤: {str(e)}")
 
 
-def render_monte_carlo_simulation(smart_result, df=None, sym_config=None):
+def render_monte_carlo_simulation(best_params: dict, best_metrics: dict, df=None, sym_config=None):
     """渲染蒙特卡羅模擬分析"""
-    import plotly.graph_objects as go
-    import plotly.express as px
-    import numpy as np
-    
     st.markdown("**蒙特卡羅模擬**")
     st.caption("使用最佳參數在多個隨機時間窗口進行回測，評估策略穩健性。結果分布越集中，策略越穩健。")
-    
+
     # 優先使用 session state 中的數據（解決按鈕點擊後數據丟失問題）
     if df is None:
         df = st.session_state.get("opt_df")
     if sym_config is None:
         sym_config = st.session_state.get("opt_sym_config")
-    if smart_result is None:
-        smart_result = st.session_state.get("opt_smart_result")
-    
-    if df is None or sym_config is None or smart_result is None:
+    if not best_params:
+        best_params = st.session_state.get("opt_best_params")
+    if not best_metrics:
+        best_metrics = st.session_state.get("opt_best_metrics")
+
+    if df is None or sym_config is None or not best_params:
         st.warning("⚠️ 請先執行智能優化，才能進行蒙特卡羅模擬。")
         return
-    
+
     # 顯示數據信息
     st.info(f"📊 可用數據：{len(df):,} 條 K 線")
-    
+
     # 模擬設定
     col1, col2 = st.columns(2)
     with col1:
@@ -906,7 +860,7 @@ def render_monte_carlo_simulation(smart_result, df=None, sym_config=None):
             key="mc_window",
             help="每次模擬使用的數據比例"
         )
-    
+
     # 顯示已有結果或執行按鈕
     if st.session_state.get("mc_results") is not None:
         # 已有結果，顯示結果和重新執行按鈕
@@ -915,26 +869,26 @@ def render_monte_carlo_simulation(smart_result, df=None, sym_config=None):
             if st.button("🔄 重新模擬", key="rerun_mc"):
                 st.session_state.mc_results = None
                 st.rerun()
-        
-        render_monte_carlo_results(st.session_state.mc_results, smart_result)
+
+        render_monte_carlo_results(st.session_state.mc_results, best_metrics)
     else:
         # 沒有結果，顯示執行按鈕
         if st.button("🎲 執行蒙特卡羅模擬", key="run_mc", type="primary"):
-            results = run_monte_carlo(smart_result, df, sym_config, n_simulations, window_pct)
+            results = run_monte_carlo(best_params, df, sym_config, n_simulations, window_pct)
             if results:
                 st.session_state.mc_results = results
                 st.rerun()
 
 
-def run_monte_carlo(smart_result, df, sym_config, n_simulations, window_pct):
+def run_monte_carlo(best_params: dict, df, sym_config, n_simulations, window_pct):
     """執行蒙特卡羅模擬，返回結果列表"""
     import numpy as np
     from backtest.backtester import GridBacktester
     from backtest.config import Config as BacktestConfig
 
     # 獲取優化後的 multiplier 參數
-    limit_mult = smart_result.best_params.get("limit_multiplier", 5.0)
-    threshold_mult = smart_result.best_params.get("threshold_multiplier", 14.0)
+    limit_mult = best_params.get("limit_multiplier", 5.0)
+    threshold_mult = best_params.get("threshold_multiplier", 14.0)
 
     # 計算 position_limit 和 position_threshold
     initial_qty = sym_config.initial_quantity
@@ -950,8 +904,8 @@ def run_monte_carlo(smart_result, df, sym_config, n_simulations, window_pct):
         symbol=sym_config.symbol,
         initial_quantity=sym_config.initial_quantity,
         leverage=sym_config.leverage,  # 槓桿使用原始設定
-        take_profit_spacing=smart_result.best_params.get("take_profit_spacing", sym_config.take_profit_spacing),
-        grid_spacing=smart_result.best_params.get("grid_spacing", sym_config.grid_spacing),
+        take_profit_spacing=best_params.get("take_profit_spacing", sym_config.take_profit_spacing),
+        grid_spacing=best_params.get("grid_spacing", sym_config.grid_spacing),
         limit_multiplier=limit_mult,
         threshold_multiplier=threshold_mult,
         position_limit=position_limit,
@@ -1013,7 +967,7 @@ def run_monte_carlo(smart_result, df, sym_config, n_simulations, window_pct):
     return results
 
 
-def render_monte_carlo_results(results, smart_result):
+def render_monte_carlo_results(results, best_metrics: dict):
     """渲染蒙特卡羅模擬結果"""
     import numpy as np
     import pandas as pd
@@ -1083,7 +1037,7 @@ def render_monte_carlo_results(results, smart_result):
     )
     
     # 添加原始回測結果線（如果有）
-    original_return = smart_result.best_metrics.get("return_pct", 0) * 100
+    original_return = (best_metrics or {}).get("return_pct", 0) * 100
     if original_return:
         fig.add_vline(
             x=original_return,
@@ -1253,7 +1207,7 @@ def main():
     st.title("🔬 回測 / 優化")
     st.divider()
 
-    manager = get_backtest_manager()
+    loader = get_data_loader()
 
     # 左側：配置
     # 右側：結果
@@ -1318,7 +1272,7 @@ def main():
 
             if mode == "單筆回測":
                 result = run_single_backtest(
-                    manager, symbol, ccxt_symbol, sym_config, start_date, end_date,
+                    loader, symbol, ccxt_symbol, sym_config, start_date, end_date,
                     exchange_type=exchange_type
                 )
                 if result:
@@ -1329,37 +1283,35 @@ def main():
                 objective = st.session_state.get("objective", "sharpe")
                 trading_mode = st.session_state.get("trading_mode", None)
 
-                results, smart_result, optimizer, opt_df = run_optimization(
-                    manager, symbol, ccxt_symbol, sym_config, start_date, end_date,
+                results_df, opt_df = run_optimization(
+                    loader, symbol, ccxt_symbol, sym_config, start_date, end_date,
                     use_smart=use_smart, n_trials=n_trials, objective=objective,
                     trading_mode=trading_mode, exchange_type=exchange_type
                 )
-                if results:
+                if results_df is not None:
                     # 保存到 session state 供蒙特卡羅模擬使用
-                    st.session_state.opt_results = results
-                    st.session_state.opt_smart_result = smart_result
-                    st.session_state.opt_optimizer = optimizer
+                    st.session_state.opt_results_df = results_df
+                    st.session_state.opt_best_params = results_df.attrs.get("best_params")
+                    st.session_state.opt_best_metrics = results_df.attrs.get("best_metrics")
                     st.session_state.opt_df = opt_df
                     st.session_state.opt_sym_config = sym_config
                     st.session_state.opt_symbol = symbol
-                    
+
                     render_optimization_results(
-                        results, symbol, smart_result, optimizer, 
+                        results_df, symbol,
                         df=opt_df, sym_config=sym_config
                     )
 
             st.session_state.run_backtest = False
-        elif st.session_state.get("opt_results") is not None:
+        elif st.session_state.get("opt_results_df") is not None:
             # 已有優化結果，從 session state 恢復顯示
-            results = st.session_state.opt_results
+            results_df = st.session_state.opt_results_df
             symbol = st.session_state.opt_symbol
-            smart_result = st.session_state.opt_smart_result
-            optimizer = st.session_state.opt_optimizer
             opt_df = st.session_state.opt_df
             sym_config = st.session_state.opt_sym_config
-            
+
             render_optimization_results(
-                results, symbol, smart_result, optimizer,
+                results_df, symbol,
                 df=opt_df, sym_config=sym_config
             )
         else:
