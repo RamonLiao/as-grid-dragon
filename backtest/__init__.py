@@ -28,18 +28,6 @@ AS 網格交易回測系統
     result = optimizer.quick_optimize(n_trials=50, objective="sharpe")
 """
 
-# 確保可以找到 core 模組 (跨模組導入)
-import sys
-from pathlib import Path
-_project_root = Path(__file__).resolve().parent.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
-
-# 預先導入 core.strategy 以避免循環導入問題
-import importlib
-if 'core.strategy' not in sys.modules:
-    importlib.import_module('core.strategy')
-
 from .config import Config
 from .data_loader import DataLoader
 from .backtester import GridBacktester, BacktestResult
