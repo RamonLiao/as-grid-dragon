@@ -23,8 +23,11 @@ def load_decisions(path: Optional[Path] = None,
         return pd.DataFrame()
 
     rows = []
-    with open(p, encoding="utf-8", errors="replace") as f:
-        tail = deque(f, maxlen=max_lines)
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            tail = deque(f, maxlen=max_lines)
+    except OSError:
+        return pd.DataFrame()
     for line in tail:
         line = line.strip()
         if not line:
@@ -32,6 +35,8 @@ def load_decisions(path: Optional[Path] = None,
         try:
             rec = json.loads(line)
         except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(rec, dict):
             continue
         inputs = rec.get("inputs", {}) or {}
         rows.append({

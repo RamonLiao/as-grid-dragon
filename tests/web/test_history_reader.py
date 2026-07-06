@@ -66,6 +66,27 @@ def test_load_bandit_state(tmp_path):
     assert history_reader.load_bandit_state(path=p) == {}
 
 
+def test_load_decisions_skips_non_dict_json(tmp_path):
+    """JSON parse 成功但非 dict（如引擎並發寫入的 scalar/array）必須跳過，不能 AttributeError。"""
+    p = _write_jsonl(tmp_path, [
+        json.dumps(GOOD),
+        "5",                  # 合法 JSON scalar，但無 .get() 方法
+        "null",               # 合法 JSON null
+        "[1,2]",              # 合法 JSON array
+        json.dumps(GOOD),
+    ])
+    df = history_reader.load_decisions(path=p)
+    # 只有兩筆正常記錄，其他三行跳過
+    assert len(df) == 2
+    assert not df.empty
+
+
+def test_load_decisions_directory_path(tmp_path):
+    """path 傳入目錄而非檔案時，應返回空 DataFrame，不 raise OSError。"""
+    df = history_reader.load_decisions(path=tmp_path)
+    assert df.empty
+
+
 def test_last_activity(tmp_path):
     p = _write_jsonl(tmp_path, [json.dumps(GOOD)])
     df = history_reader.load_decisions(path=p)
