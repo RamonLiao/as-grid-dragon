@@ -22,7 +22,7 @@ from theme import apply_custom_theme
 from components.sidebar import render_sidebar
 apply_custom_theme()
 
-from state import init_session_state, get_config, save_config, reload_config
+from state import init_session_state, get_config, save_config, reload_config, check_config_updated
 
 init_session_state()
 
@@ -462,6 +462,11 @@ def main():
     """主函數"""
     # 先渲染側邊欄
     render_sidebar()
+
+    # 檢查配置是否被其他頁面更新
+    if check_config_updated():
+        st.info("✅ 檢測到配置已更新，正在刷新...")
+        st.rerun()
 
     st.title("🛠️ 設定")
 
