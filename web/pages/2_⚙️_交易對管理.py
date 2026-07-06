@@ -23,7 +23,8 @@ from components.sidebar import render_sidebar
 apply_custom_theme()
 
 from state import init_session_state, get_config, save_config, check_config_updated
-from config.models import SymbolConfig
+from grid_engine.config import SymbolConfig
+from web.services import config_store
 from utils import normalize_symbol
 
 init_session_state()
@@ -48,7 +49,7 @@ def render_symbols_list():
 
     for symbol, cfg in list(config.symbols.items()):
         status_icon = "🟢" if cfg.enabled else "⚪"
-        mode_key = getattr(cfg, 'trading_mode', 'swing')
+        mode_key = config_store.get_symbol_extra(symbol, "trading_mode", default="swing")
         mode_info = TRADING_MODES.get(mode_key, TRADING_MODES['swing'])
 
         with st.expander(f"{status_icon} {symbol}  {mode_info['name']}", expanded=False):
@@ -200,9 +201,8 @@ def render_add_symbol():
                 leverage=leverage,
                 limit_multiplier=limit_mult,
                 threshold_multiplier=threshold_mult,
-                trading_mode=trading_mode,
             )
-            save_config()
+            save_config(symbol_extras={ccxt_sym: {"trading_mode": trading_mode}})
 
             st.success(f"已新增 {raw} ({coin}/{quote})")
             st.rerun()
@@ -280,7 +280,7 @@ def render_edit_symbol():
 
         # 交易模式選擇
         st.markdown("**交易模式**")
-        current_mode = getattr(cfg, 'trading_mode', 'swing')
+        current_mode = config_store.get_symbol_extra(symbol, "trading_mode", default="swing")
         mode_keys = list(TRADING_MODES.keys())
         current_idx = mode_keys.index(current_mode) if current_mode in mode_keys else 1
 
@@ -306,8 +306,7 @@ def render_edit_symbol():
                 cfg.leverage = leverage
                 cfg.limit_multiplier = limit_mult
                 cfg.threshold_multiplier = threshold_mult
-                cfg.trading_mode = trading_mode
-                save_config()
+                save_config(symbol_extras={symbol: {"trading_mode": trading_mode}})
 
                 st.session_state.editing_symbol = None
                 st.success("已保存")
