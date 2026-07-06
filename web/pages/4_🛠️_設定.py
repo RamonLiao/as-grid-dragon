@@ -421,34 +421,27 @@ def render_risk_settings():
                 risk.trailing_drawdown_pct = new_drawdown
                 save_config()
 
-        # === 硬止損設定 ===
+        # === 硬止損設定（唯讀揭露，grid_engine 尚未實作） ===
         st.markdown("##### 🚨 硬止損")
-        
-        col1, col2 = st.columns(2)
+
+        from web.services import config_store
+        raw = config_store.load_raw()
+        raw_risk = raw.get("risk", {})
+        hard_stop_enabled = raw_risk.get("hard_stop_enabled", False)
+        max_loss_pct = raw_risk.get("max_loss_pct", 0.0)
+        max_position_loss_pct = raw_risk.get("max_position_loss_pct", 0.0)
+
+        st.warning(
+            "⚠️ 硬止損設定僅保存於配置檔，**生產引擎（grid_engine）尚未實作此功能**"
+            "——實際交易中不會生效。"
+        )
+        col1, col2, col3 = st.columns(3)
         with col1:
-            hard_stop = st.checkbox(
-                "啟用硬止損",
-                value=risk.hard_stop_enabled,
-                help="當單方向浮虧超過閾值時強制平倉"
-            )
-            if hard_stop != risk.hard_stop_enabled:
-                risk.hard_stop_enabled = hard_stop
-                save_config()
-        
+            st.metric("啟用硬止損", "是" if hard_stop_enabled else "否")
         with col2:
-            if risk.hard_stop_enabled:
-                max_loss = st.slider(
-                    "最大虧損 (%)",
-                    min_value=1,
-                    max_value=10,
-                    value=int(risk.max_loss_pct * 100),
-                    step=1,
-                    help="單邊虧損達此比例時強制平倉"
-                )
-                new_max_loss = max_loss / 100
-                if new_max_loss != risk.max_loss_pct:
-                    risk.max_loss_pct = new_max_loss
-                    save_config()
+            st.metric("最大虧損 (%)", f"{max_loss_pct * 100:.0f}%")
+        with col3:
+            st.metric("最大持倉虧損 (%)", f"{max_position_loss_pct * 100:.0f}%")
 
         # === 趨勢過濾器 (實驗性) ===
         st.markdown("##### 🧪 趨勢過濾器 (實驗性)")
