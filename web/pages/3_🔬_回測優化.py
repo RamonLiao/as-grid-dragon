@@ -362,13 +362,9 @@ def run_optimization(loader: DataLoader, symbol: str, ccxt_symbol: str,
 
     # 智能優化模式
     if use_smart and SMART_OPTIMIZER_AVAILABLE:
-        # 交易模式以 config_store 中該交易對的設定為準（與實盤一致），
-        # 不使用 UI 選擇器（僅供顯示參考）
-        effective_mode = config_store.get_symbol_extra(
-            ccxt_symbol, "trading_mode", default="swing")
-        if TradingMode is not None:
-            mode_info = MODE_INFO[TradingMode(effective_mode)]
-            st.info(f"🎯 交易模式: {mode_info['name']} | {mode_info['description']}")
+        # 交易模式以使用者在優化設定面板選擇的 radio 為準（單一顯示來源，
+        # 見 render_optimization_settings），未帶入時退回 swing。
+        effective_mode = trading_mode if trading_mode is not None else "swing"
 
         progress_bar = st.progress(0, text="智能優化中...")
         status_text = st.empty()
@@ -1125,7 +1121,7 @@ def render_monte_carlo_results(results, best_metrics: dict):
         st.dataframe(display_df, width='stretch', hide_index=True)
 
 
-def render_optimization_settings():
+def render_optimization_settings(ccxt_symbol=None):
     """渲染優化設定"""
     st.subheader("🧠 優化設定")
 
@@ -1150,12 +1146,24 @@ def render_optimization_settings():
             TradingMode.LONG_CYCLE,
         ]
 
+        # 預設選中值取自 config_store 該交易對設定（與實盤一致），
+        # 使用者仍可在此改選，改選後的值才是實際生效的模式。
+        default_mode_str = config_store.get_symbol_extra(
+            ccxt_symbol, "trading_mode", default="swing") if ccxt_symbol else "swing"
+        try:
+            default_mode = TradingMode(default_mode_str)
+        except ValueError:
+            st.warning(f"⚠️ 未知交易模式設定 `{default_mode_str}`，已退回「波動」模式")
+            default_mode = TradingMode.SWING
+        default_index = trading_mode_options.index(default_mode) if default_mode in trading_mode_options else 1
+
         selected_mode = st.radio(
             "選擇交易模式",
             options=trading_mode_options,
+            index=default_index,
             format_func=lambda m: f"{MODE_INFO[m]['name']} ({MODE_INFO[m]['timeframe']})",
             horizontal=True,
-            help="不同模式有不同的參數範圍，適合不同的持倉週期"
+            help="不同模式有不同的參數範圍，適合不同的持倉週期（預設值取自該交易對設定，實際生效以此處選擇為準）"
         )
 
         # 顯示模式說明
@@ -1241,7 +1249,7 @@ def main():
         use_smart, n_trials, objective, trading_mode = False, 21, "return", None
         if mode == "參數優化":
             st.divider()
-            use_smart, n_trials, objective, trading_mode = render_optimization_settings()
+            use_smart, n_trials, objective, trading_mode = render_optimization_settings(ccxt_symbol)
 
         st.divider()
 
