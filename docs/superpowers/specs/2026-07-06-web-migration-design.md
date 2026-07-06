@@ -52,10 +52,13 @@
 ### 頁1 交易監控 → 歷史檢視
 - 資料源：`logs/decisions.jsonl`（tail 解析成 DataFrame：決策時間軸、per-symbol 事件）+ `logs/bandit_state.json`（bandit 臂權重）。
 - 保留頁面圖表結構，只換資料層。檔案不存在/為空時顯示引導訊息。
-- GCE 遠端檔案存取不在本次範圍。
+- GCE 遠端檔案存取不在本次範圍。**操作缺口明寫（conscious decision）**：實盤即時可觀測性（保證金/爆倉風險）不靠 web——告警管道是 grid_engine 內建的 Telegram notifier（`grid_engine/notifier.py`），web 只是事後歷史檢視，不是監控台。頁1 頂部放一行說明避免誤用。
 
 ### 頁2 交易對管理
 - `SymbolConfig` 改用 `grid_engine.config.SymbolConfig`，讀寫同一份 trading_config_max.json。
+- **存檔採 merge-preserve，不做整檔改寫**（review finding #1/#4/#5 的統一解）：`grid_engine.from_dict()` 會過濾未知欄位，直接 `to_dict()` 覆寫會把 JSON 裡引擎 schema 沒有的欄位靜默抹掉——已確認會死的有 per-symbol `trading_mode`（頁3 拿它選優化參數 bounds，`web/pages/3:381,424`）、risk 的 `hard_stop_enabled/max_loss_pct/max_position_loss_pct`、top-level `exchange_type/testnet`。web 存檔改成：讀原始 JSON → 只更新編輯過的已知欄位 → 未知 key 原樣保留寫回。此機制放 service/state 層，**零改動 grid_engine**（符合硬約束）；#4 驗收完成後可另開任務把 `trading_mode` 正式收編進引擎 schema。
+- 一次性驗收：首次存檔前備份 trading_config_max.json；用現況 JSON 副本跑 merge-preserve 存檔 → diff，斷言零欄位遺失。
+- **Conscious decision 明寫**：config 裡的硬止損（hard_stop）只有舊 core/bot 實作（`core/bot.py:1634`），生產 grid_engine 的 risk_monitor 根本不讀——即「你以為有的硬止損在生產上本來就沒生效」。本任務只保欄位不丟；生產引擎要不要補 hard_stop 另開任務決定。
 
 ### 頁3 回測優化
 新增薄服務層 `web/services/backtest_service.py`（頁面導向新接口，非舊介面相容層），集中所有轉換邏輯，可脫離 Streamlit 單測：
@@ -69,7 +72,7 @@
 | `optimize_params(cfg, df, cb)` | UI「優化模式」radio：網格搜尋 → `optimizer.py`；智能優化 → `SmartOptimizer(df, base_config, param_bounds…).optimize(progress_callback=…)` |
 
 三個轉換函數（各配黃金測試）：
-1. `to_backtest_config(SymbolConfig) -> backtest.Config` — 單位陷阱集中地（舊 `take_profit_spacing` 存百分比小數 0.004=0.4%，新系統單位需驗證），已知輸入→已知輸出鎖死映射。
+1. `to_backtest_config(SymbolConfig) -> backtest.Config` — 已知輸入→已知輸出鎖死映射。**真正的語義陷阱（review 修正）**：`take_profit_spacing` 兩邊單位其實一致（皆小數比例 0.004=0.4%），危險在 `backtest/config.py:45-48`——`position_threshold` 預設絕對值 500、`position_limit` 預設 100，**必須顯式設 0 才會走 `initial_quantity×multiplier` 自動計算**；且 `initial_quantity` 預設 0.0，忘了帶入=空回測。黃金測試必須斷言 `position_threshold==0 and position_limit==0` 且 `initial_quantity` 正確帶入。另把頁3 用的 `trading_mode` 一併傳給優化器（見頁2 merge-preserve）。
 2. `backtest_result_to_view(BacktestResult) -> dict` — 對齊頁面現有渲染欄位。
 3. `optimization_to_view(OptimizationResult | SmartOptimizationResult) -> DataFrame` — 兩種優化結果歸一成單一結果表 + param_importance，頁面單一渲染路徑（不在頁面 isinstance 分流）。
 
@@ -91,19 +94,29 @@
 - `scripts/check_web_system.py`：core.bot/exchanges 檢查項換成新系統對應物。
 - `README.md`：移除舊入口啟動方式。
 
-**不動**：`asBack/`；根目錄 `utils.py`/`constants.py` 刪除階段 grep 確認，仍有新系統引用就留。
+**不動**：`asBack/` — 注意它是 **load-bearing 資料目錄**而非無關備份：`backtest/data_loader.py:71,83-89`、`grid_engine/utils.py:30`、`constants.py:40` 都指向 `asBack/data` 當 K 線資料源，頁3 的 download/load 目標目錄必須對到它。根目錄 `utils.py`/`constants.py` 刪除階段 grep 確認，仍有新系統引用就留（已知：`config/models.py:15` import constants；`web/pages/3:30` 用 `utils.normalize_symbol`——Phase 1 隨頁3 重寫一併遷到 service 層或確認保留）。
 
 ## 測試與驗收
 
 - **單元（TDD）**：service 層三個轉換函數黃金測試；config round-trip 測試（現有 JSON 副本 → load → save → load，斷言 symbols 數量與關鍵欄位不遺失）。
-- **功能對等對比（僅 Phase 1 期間可做，必須在刪碼前）**：同一 symbol+日期，舊 BacktestManager vs 新路徑各跑一次單次回測，對比收益率/回撤方向與量級（不要求 zero-diff，差數量級=單位映射炸）。
+- **功能對等對比（僅 Phase 1 期間可做，必須在刪碼前）**：同一 symbol+日期，舊 BacktestManager vs 新路徑各跑一次單次回測。**必須先做成本歸零對齊（review 修正）**，否則對比無效——兩引擎成本模型是設計性不同：手續費舊每邊 0.04%（`core/backtest.py:230,339`）vs 新每邊減半、滑價舊隨機 `uniform(0,0.05%)` vs 新確定性 bps、資金費率舊固定值 vs 新讀真實 CSV、舊有 `hard_stop_pct=0.03` 砍倉 vs 新引擎無 hard_stop。對比時兩邊 fee/滑價/funding 全設 0、舊引擎 hard_stop 關閉，只比純網格邏輯的收益率/回撤；這樣殘餘的量級差才能歸因到參數映射 bug。
 - **回歸**：每 Phase 結尾全套 pytest，報數字（基線 270 passed）。
 - **Playwright 實點**（hard-reload 後）：頁1 載歷史、頁2 建/改/存後驗 JSON、頁3 完整流程（載資料→單次回測→兩種優化各一輪小 trial→Monte Carlo）、頁4 測連線含無 key 錯誤路徑。
 - **Monkey testing**：空日期範圍、無資料 symbol、trials=0、decisions.jsonl 損毀行/空檔、config JSON 手刪欄位、優化中途關頁。目標：友善錯誤，不噴 traceback。
 - **驗收**：fresh-context verifier（重讀檔+實跑測試）→ dual-review 兩輪。
 
-## 風險 Top 3（scout 盤點）
+## 風險 Top 3（scout 盤點 + 量化 review 修正，2026-07-06）
 
-1. 頁1 資料源全換（bot.state → decisions.jsonl），頁面結構性重寫量最大。
-2. 頁3 新舊引擎不相容：參數轉換、結果欄位、優化接口全要適配。
-3. SymbolConfig↔backtest.Config 單位/欄位不一致（take_profit_spacing 等），錯了不會炸只會給錯回測結論——黃金測試 + 新舊對比防禦。
+1. **config 存檔靜默丟欄位**：grid_engine schema 缺 `trading_mode`/hard_stop 三欄/`exchange_type`，整檔覆寫即抹掉且不可逆——merge-preserve 存檔 + 備份 + diff 驗收防禦。
+2. **`to_backtest_config` 語義映射**：`position_threshold/limit` 不設 0 就走絕對值 500/100 而非 multiplier、`initial_quantity` 預設 0=空回測——錯了不會炸只會給錯回測結論，黃金測試鎖死。
+3. **功能對等對比被成本模型差異污染**：兩引擎 fee/滑價/funding/hard_stop 設計性不同，不歸零對齊就無法區分「正常差異」與「映射 bug」。
+
+（頁1 資料源全換、頁3 接口全適配仍是工作量大頭，但屬可控重寫，非隱性風險。）
+
+## 量化 review 紀錄（2026-07-06，reviewer/opus，實讀 code 驗證）
+
+- 3 must-fix 已修入上文（trading_mode 丟失→merge-preserve；成本歸零對齊；position_threshold/initial_quantity 黃金測試）。
+- 2 should-fix 已修入（hard_stop 欄位流失標為 conscious decision + 生產無 hard_stop 事實揭露；首次存檔 schema 改寫加備份+diff 驗收）。
+- take_profit_spacing 單位經查兩邊一致（原 spec 誤判為頭號陷阱，已更正）。
+- 已驗證：tests/ 零依賴舊系統成立；刪除清單無漏網 import；asBack/ 是資料源依賴非備份。
+- 遺留另開任務：生產 grid_engine 是否補 hard_stop 實作；trading_mode 正式收編引擎 schema（#4 驗收後）。
