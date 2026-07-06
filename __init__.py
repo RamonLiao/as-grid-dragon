@@ -16,26 +16,3 @@ AS 刷怪籠 - 網格交易系統 MAX 版本
 
 __version__ = "2.0.0"
 __author__ = "AS Grid Trading"
-
-# 延遲載入避免循環依賴
-__all__ = [
-    "GridStrategy",
-    "MaxGridBot", 
-    "GlobalConfig",
-    "SymbolConfig",
-]
-
-def __getattr__(name):
-    if name == "GridStrategy":
-        from .core.strategy import GridStrategy
-        return GridStrategy
-    elif name == "MaxGridBot":
-        from .core.bot import MaxGridBot
-        return MaxGridBot
-    elif name == "GlobalConfig":
-        from .config.models import GlobalConfig
-        return GlobalConfig
-    elif name == "SymbolConfig":
-        from .config.models import SymbolConfig
-        return SymbolConfig
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

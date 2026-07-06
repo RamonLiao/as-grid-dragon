@@ -13,17 +13,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
-# 嘗試導入統一路徑解析器（2025 最佳實踐）
-try:
-    # 需要先將項目根目錄加入 sys.path
-    _project_root = Path(__file__).parent.parent.parent
-    if str(_project_root) not in sys.path:
-        sys.path.insert(0, str(_project_root))
-    from core.path_resolver import get_backtest_data_dir, get_asback_path
-    _PATH_RESOLVER_AVAILABLE = True
-except ImportError:
-    _PATH_RESOLVER_AVAILABLE = False
-    logger.debug("core.path_resolver 不可用，使用備用路徑解析")
+_PATH_RESOLVER_AVAILABLE = False
+logger.debug("core.path_resolver 不可用，使用備用路徑解析")
 
 
 class DataLoader:

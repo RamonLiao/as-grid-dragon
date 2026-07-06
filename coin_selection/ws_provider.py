@@ -32,25 +32,12 @@ from typing import Dict, List, Optional, Any, Callable, Set
 from dataclasses import dataclass, field
 from collections import defaultdict
 
-# 嘗試使用改進的日誌和錯誤處理
-try:
-    from core.logging_setup import get_logger
-    from core.error_handler import CCXTErrorHandler, ErrorSeverity
-    from core.constants import Constants
-    logger = get_logger("ws_provider")
-    _error_handler = CCXTErrorHandler(logger)
-    # 使用統一常量
-    DEFAULT_RECONNECT_DELAY = Constants.WS_RECONNECT_DELAY
-    DEFAULT_MAX_RECONNECT = Constants.WS_MAX_RECONNECT_ATTEMPTS
-    DEFAULT_PING_INTERVAL = Constants.WS_PING_INTERVAL
-    CORE_AVAILABLE = True
-except ImportError:
-    logger = logging.getLogger(__name__)
-    _error_handler = None
-    DEFAULT_RECONNECT_DELAY = 5
-    DEFAULT_MAX_RECONNECT = 10
-    DEFAULT_PING_INTERVAL = 20
-    CORE_AVAILABLE = False
+logger = logging.getLogger(__name__)
+_error_handler = None
+DEFAULT_RECONNECT_DELAY = 5
+DEFAULT_MAX_RECONNECT = 10
+DEFAULT_PING_INTERVAL = 20
+CORE_AVAILABLE = False
 
 
 @dataclass

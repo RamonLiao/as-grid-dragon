@@ -30,30 +30,24 @@ from dataclasses import dataclass, field
 from collections import defaultdict
 import numpy as np
 
-# 嘗試使用改進的錯誤處理
-try:
-    from core.error_handler import CCXTErrorHandler, retry_on_network_error
-    from core.logging_setup import get_logger
-    logger = get_logger("symbol_scanner")
-    _error_handler = CCXTErrorHandler(logger)
-    CORE_AVAILABLE = True
-except ImportError:
-    logger = logging.getLogger(__name__)
-    _error_handler = None
-    CORE_AVAILABLE = False
-    # Fallback: 簡單重試裝飾器
-    def retry_on_network_error(max_retries=3, base_delay=1.0, max_delay=60.0, exponential=True):
-        def decorator(func):
-            async def wrapper(*args, **kwargs):
-                for attempt in range(max_retries + 1):
-                    try:
-                        return await func(*args, **kwargs)
-                    except Exception as e:
-                        if attempt >= max_retries:
-                            raise
-                        await asyncio.sleep(base_delay * (2 ** attempt) if exponential else base_delay)
-            return wrapper
-        return decorator
+logger = logging.getLogger(__name__)
+_error_handler = None
+CORE_AVAILABLE = False
+
+
+# Fallback: 簡單重試裝飾器
+def retry_on_network_error(max_retries=3, base_delay=1.0, max_delay=60.0, exponential=True):
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    if attempt >= max_retries:
+                        raise
+                    await asyncio.sleep(base_delay * (2 ** attempt) if exponential else base_delay)
+        return wrapper
+    return decorator
 
 
 @dataclass

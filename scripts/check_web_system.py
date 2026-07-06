@@ -58,7 +58,7 @@ def test_imports():
         log_test("導入測試", "Pandas", "FAIL", str(e))
     
     try:
-        from config.models import GlobalConfig, SymbolConfig
+        from grid_engine.config import GlobalConfig, SymbolConfig
         log_test("導入測試", "Config Models", "PASS", "配置模型正常")
     except Exception as e:
         log_test("導入測試", "Config Models", "FAIL", str(e))
@@ -89,14 +89,14 @@ def test_config_system():
     print("="*60)
     
     try:
-        from config.models import GlobalConfig, SymbolConfig
+        from grid_engine.config import GlobalConfig, SymbolConfig
         
         # 測試配置載入
         config = GlobalConfig.load()
         log_test("配置系統", "配置載入", "PASS", f"已載入 {len(config.symbols)} 個交易對")
         
         # 測試配置屬性
-        attrs = ["exchange_type", "api_key", "api_secret", "symbols"]
+        attrs = ["exchange_id", "api_key", "api_secret", "symbols"]
         for attr in attrs:
             if hasattr(config, attr):
                 log_test("配置系統", f"屬性 {attr}", "PASS", "存在")
