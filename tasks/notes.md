@@ -61,3 +61,6 @@
 **Blocker for #9 Phase 2**：在此差異被判讀（是否為刻意重新設計、可接受）或修正之前，不建議直接刪 `core/backtest.py` 作為唯一對照組——建議先讓使用者決策：(a) 接受新引擎的追價語意為既定重新設計並記錄差異，或 (b) 修 `backtest/backtester.py` 觸發邏輯貼近舊引擎同根 high/low 判定後重跑本 script 驗證。
 
 全套回歸：`uv run pytest tests/ -q` → 294 passed（unchanged，本次僅新增 script，未動任何 src）。
+
+### #9 Task 8 裁決（2026-07-06，使用者拍板）
+對比 FAIL（return 方向相反）→ **接受新引擎為基準，進 Phase 2**。根因非映射 bug（position_threshold/limit 核對一致），是 #4 刻意撮合重設計：舊引擎同根 high/low 盤中觸發（look-ahead 傾向），新引擎追價語意+settle-then-decide 鏡像實盤 decide()（replay zero-diff 守門的那套）。±0.1% 微利量級下撮合時機差異足以翻方向。舊引擎正因不忠於實盤而被刪，不是基準。FIDELITY_NOTES 已有「crossing 只看 close」揭露項。
