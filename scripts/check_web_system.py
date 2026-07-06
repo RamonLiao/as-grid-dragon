@@ -70,10 +70,16 @@ def test_imports():
         log_test("導入測試", "State Management", "FAIL", str(e))
     
     try:
-        from core.bot import MaxGridBot
-        log_test("導入測試", "MaxGridBot", "PASS", "交易機器人模組正常")
+        from grid_engine.config import GlobalConfig
+        log_test("導入測試", "GlobalConfig (grid_engine)", "PASS", "網格引擎配置模組正常")
     except Exception as e:
-        log_test("導入測試", "MaxGridBot", "FAIL", str(e))
+        log_test("導入測試", "GlobalConfig (grid_engine)", "FAIL", str(e))
+
+    try:
+        from backtest.data_loader import DataLoader
+        log_test("導入測試", "DataLoader", "PASS", "回測資料載入模組正常")
+    except Exception as e:
+        log_test("導入測試", "DataLoader", "FAIL", str(e))
 
 
 def test_config_system():
@@ -115,37 +121,15 @@ def test_exchange_adapters():
     print("="*60)
     
     try:
-        from exchanges import list_supported_exchanges, get_adapter, get_exchange_display_name
-        
-        # 測試交易所列表
-        exchanges = list_supported_exchanges()
-        log_test("交易所適配器", "支援列表", "PASS", f"支援 {len(exchanges)} 個交易所: {', '.join(exchanges)}")
-        
-        # 測試每個交易所的適配器
-        for exchange in exchanges:
-            try:
-                adapter = get_adapter(exchange)
-                display_name = get_exchange_display_name(exchange)
-                
-                # 檢查必要方法
-                required_methods = [
-                    "init_exchange", "load_markets", "fetch_balance",
-                    "fetch_positions", "create_order", "cancel_order"
-                ]
-                
-                missing = []
-                for method in required_methods:
-                    if not hasattr(adapter, method):
-                        missing.append(method)
-                
-                if missing:
-                    log_test("交易所適配器", f"{display_name}", "FAIL", f"缺少方法: {', '.join(missing)}")
-                else:
-                    log_test("交易所適配器", f"{display_name}", "PASS", "所有必要方法存在")
-                    
-            except Exception as e:
-                log_test("交易所適配器", f"{exchange}", "FAIL", str(e))
-                
+        import ccxt
+        log_test("交易所適配器", "ccxt 套件", "PASS", f"版本 {ccxt.__version__}")
+
+        # 檢查 binance 交易所類別存在性（現行系統唯一使用的交易所）
+        if hasattr(ccxt, "binance"):
+            log_test("交易所適配器", "ccxt.binance", "PASS", "類別存在")
+        else:
+            log_test("交易所適配器", "ccxt.binance", "FAIL", "類別不存在")
+
     except Exception as e:
         log_test("交易所適配器", "總體測試", "FAIL", str(e))
 
@@ -216,42 +200,44 @@ def test_components():
 
 
 def test_bot_functionality():
-    """測試 6: 交易機器人功能測試"""
+    """測試 6: 網格引擎核心模組測試"""
     print("\n" + "="*60)
-    print("測試 6: 交易機器人功能測試")
+    print("測試 6: 網格引擎核心模組測試")
     print("="*60)
-    
+
     try:
-        from core.bot import MaxGridBot
-        from config.models import GlobalConfig
-        
-        # 測試機器人創建（不實際連接）
+        from grid_engine.config import GlobalConfig
+        from backtest.data_loader import DataLoader
+
+        # 測試配置載入（現行系統）
         config = GlobalConfig.load()
-        
-        # 檢查必要配置
-        if not config.api_key:
-            log_test("Bot 功能", "API 配置", "WARNING", "API Key 未設定，跳過連接測試")
-        else:
-            log_test("Bot 功能", "API 配置", "PASS", "API Key 已設定")
-        
+
         # 檢查交易對配置
         if not config.symbols:
-            log_test("Bot 功能", "交易對配置", "WARNING", "無配置的交易對")
+            log_test("網格引擎", "交易對配置", "WARNING", "無配置的交易對")
         else:
             enabled = [s for s in config.symbols.values() if s.enabled]
-            log_test("Bot 功能", "交易對配置", "PASS", 
+            log_test("網格引擎", "交易對配置", "PASS",
                     f"已配置 {len(config.symbols)} 個交易對，{len(enabled)} 個已啟用")
-        
-        # 測試 Bot 類結構
-        required_methods = ["run", "stop", "reload_config", "_place_grid"]
-        for method in required_methods:
-            if hasattr(MaxGridBot, method):
-                log_test("Bot 結構", f"方法 {method}", "PASS", "存在")
+
+        # 測試 GlobalConfig 類結構
+        required_config_methods = ["load", "save", "to_dict", "from_dict"]
+        for method in required_config_methods:
+            if hasattr(GlobalConfig, method):
+                log_test("網格引擎結構", f"GlobalConfig.{method}", "PASS", "存在")
             else:
-                log_test("Bot 結構", f"方法 {method}", "FAIL", "不存在")
-                
+                log_test("網格引擎結構", f"GlobalConfig.{method}", "FAIL", "不存在")
+
+        # 測試 DataLoader 類結構
+        required_loader_methods = ["load", "load_symbol_data", "list_available_data"]
+        for method in required_loader_methods:
+            if hasattr(DataLoader, method):
+                log_test("網格引擎結構", f"DataLoader.{method}", "PASS", "存在")
+            else:
+                log_test("網格引擎結構", f"DataLoader.{method}", "FAIL", "不存在")
+
     except Exception as e:
-        log_test("Bot 功能", "總體測試", "FAIL", str(e))
+        log_test("網格引擎", "總體測試", "FAIL", str(e))
 
 
 def test_utils():
