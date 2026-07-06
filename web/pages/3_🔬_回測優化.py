@@ -135,7 +135,7 @@ def render_exchange_selector():
     st.subheader("🏦 數據來源")
 
     config = get_config()
-    default_exchange = config.exchange_type
+    default_exchange = config.exchange_id
 
     # 提示說明
     st.caption("💡 CCXT 下載歷史數據不需要 API Key，可以自由選擇交易所")
@@ -189,9 +189,10 @@ def render_backtest_params(sym_config: SymbolConfig):
     with col2:
         quantity = st.number_input(
             "每單數量",
-            min_value=1.0,
+            min_value=0.0001,
             value=float(sym_config.initial_quantity),
-            step=1.0,
+            step=0.001,
+            format="%.4f",
             help="每次開倉的數量"
         )
 
