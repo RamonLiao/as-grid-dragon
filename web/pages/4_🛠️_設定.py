@@ -33,31 +33,9 @@ def render_api_settings():
 
     config = get_config()
 
-    # 導入交易所列表
-    from exchanges import list_supported_exchanges, get_exchange_display_name
-
-    # === 交易所選擇 ===
-    st.markdown("**選擇交易所**")
-
-    # 只顯示已支援的交易所
-    supported = list_supported_exchanges()
-    current_idx = supported.index(config.exchange_type) if config.exchange_type in supported else 0
-
-    selected_exchange = st.selectbox(
-        "選擇交易所",
-        options=supported,
-        format_func=lambda x: get_exchange_display_name(x),
-        index=current_idx,
-        help="選擇要連接的交易所"
-    )
-
-    if selected_exchange != config.exchange_type:
-        config.exchange_type = selected_exchange
-        # 切換交易所時重置驗證狀態
-        st.session_state.api_verified = False
-        save_config()
-        st.success(f"已切換至 {get_exchange_display_name(selected_exchange)}")
-        st.rerun()
+    # === 交易所 ===
+    st.markdown("**交易所**")
+    st.info("🏦 Binance USDⓈ-M Futures（生產引擎唯一支援）")
 
     # Testnet 開關
     testnet = st.toggle(
@@ -77,7 +55,7 @@ def render_api_settings():
 
     if config.api_key:
         if api_verified:
-            st.success(f"✅ API 已驗證 | {get_exchange_display_name(config.exchange_type)} | Key: {config.api_key[:8]}...{config.api_key[-4:]}")
+            st.success(f"✅ API 已驗證 | Binance | Key: {config.api_key[:8]}...{config.api_key[-4:]}")
         else:
             st.warning(f"⚠️ API 未驗證 | Key: {config.api_key[:8]}...{config.api_key[-4:]} | 請點擊「驗證並保存」")
     else:
@@ -96,33 +74,16 @@ def render_api_settings():
             type="password",
         )
 
-        # Bitget 專用 Passphrase 欄位
-        api_password = ""
-        if config.exchange_type == "bitget":
-            st.info("Bitget 需要額外的 Passphrase（創建 API 時設定的密碼短語）")
-            api_password = st.text_input(
-                "Passphrase (密碼短語)",
-                value=config.api_password or "",
-                type="password",
-                help="Bitget 官方 API 的三因素認證要求"
-            )
-
         # 驗證並保存按鈕
         if st.button("🔐 驗證並保存 API", type="primary", width='stretch'):
             if not api_key or not api_secret:
                 st.error("請先填入 API Key 和 Secret")
-            elif config.exchange_type == "bitget" and not api_password:
-                st.error("Bitget 需要填入 Passphrase")
             else:
                 # 先驗證，驗證成功才保存
-                verified = verify_and_save_api(
-                    api_key, api_secret, config.exchange_type, api_password
-                )
+                verified = verify_and_save_api(api_key, api_secret)
                 if verified:
                     config.api_key = api_key
                     config.api_secret = api_secret
-                    if config.exchange_type == "bitget":
-                        config.api_password = api_password
                     save_config()
                     st.session_state.api_verified = True
                     st.rerun()
@@ -135,76 +96,56 @@ def render_api_settings():
             if st.button("🧪 僅測試連線"):
                 if not api_key or not api_secret:
                     st.error("請先填入 API Key 和 Secret")
-                elif config.exchange_type == "bitget" and not api_password:
-                    st.error("Bitget 需要填入 Passphrase")
                 else:
-                    test_api_connection(api_key, api_secret, config.exchange_type, api_password)
+                    verify_and_save_api(api_key, api_secret)
 
         with col2:
             if st.button("💾 僅保存（跳過驗證）"):
                 config.api_key = api_key
                 config.api_secret = api_secret
-                if config.exchange_type == "bitget":
-                    config.api_password = api_password
                 st.session_state.api_verified = False  # 標記為未驗證
                 save_config()
                 st.warning("⚠️ API 已保存但未驗證，建議執行驗證")
                 st.rerun()
 
 
-def verify_and_save_api(api_key: str, api_secret: str, exchange_type: str = "binance", password: str = "") -> bool:
-    """驗證 API 連線，成功返回 True"""
+def _binance_client(api_key: str, api_secret: str):
+    import ccxt
+    return ccxt.binance({
+        "apiKey": api_key,
+        "secret": api_secret,
+        "options": {"defaultType": "future"},
+    })
+
+
+def verify_and_save_api(api_key: str, api_secret: str) -> bool:
+    """驗證 Binance API 連線，成功返回 True"""
     try:
-        from exchanges import get_adapter, get_exchange_display_name
-
-        with st.spinner(f"🔄 驗證 {get_exchange_display_name(exchange_type)} API 連線..."):
-            adapter = get_adapter(exchange_type)
-            # Bitget 需要額外的 password 參數
-            if exchange_type == "bitget":
-                adapter.init_exchange(api_key, api_secret, password=password)
-            else:
-                adapter.init_exchange(api_key, api_secret)
-            adapter.load_markets()
-
-            # 測試讀取餘額
-            balances = adapter.fetch_balance()
-
-            # 測試期貨權限
+        with st.spinner("🔄 驗證 Binance API 連線..."):
+            exchange = _binance_client(api_key, api_secret)
+            exchange.load_markets()
+            balance = exchange.fetch_balance()
             try:
-                positions = adapter.fetch_positions()
+                exchange.fetch_positions()
                 futures_ok = True
             except Exception:
                 futures_ok = False
 
-        # 顯示驗證結果
-        st.success(f"✅ {get_exchange_display_name(exchange_type)} API 驗證成功!")
-
-        # 顯示餘額摘要
-        total_balance = 0
-        balance_info = []
-        for currency in ["USDC", "USDT", "BTC", "ETH"]:
-            if currency in balances:
-                bal = balances[currency]
-                if bal.wallet_balance > 0:
-                    balance_info.append(f"{currency}: {bal.wallet_balance:.4f}")
-                    if currency in ["USDC", "USDT"]:
-                        total_balance += bal.wallet_balance
-
+        st.success("✅ Binance API 驗證成功!")
+        totals = balance.get("total", {}) or {}
+        balance_info = [f"{c}: {totals[c]:.4f}"
+                        for c in ("USDC", "USDT", "BTC", "ETH")
+                        if totals.get(c, 0) > 0]
         if balance_info:
             st.info(f"💰 餘額: {' | '.join(balance_info[:3])}")
-
         if futures_ok:
             st.success("✅ 期貨交易權限正常")
         else:
             st.warning("⚠️ 無期貨交易權限，請確認 API 設定")
-
         return True
-
     except Exception as e:
         error_msg = str(e)
         st.error(f"❌ API 驗證失敗: {error_msg}")
-
-        # 提供常見錯誤的解決建議
         if "Invalid API" in error_msg or "invalid" in error_msg.lower():
             st.warning("💡 建議: 請檢查 API Key 和 Secret 是否正確")
         elif "permission" in error_msg.lower() or "403" in error_msg:
@@ -213,52 +154,7 @@ def verify_and_save_api(api_key: str, api_secret: str, exchange_type: str = "bin
             st.warning("💡 建議: 請確認當前 IP 在 API 白名單中")
         elif "timestamp" in error_msg.lower() or "time" in error_msg.lower():
             st.warning("💡 建議: 請確認系統時間是否正確")
-
         return False
-
-
-def test_api_connection(api_key: str, api_secret: str, exchange_type: str = "binance", password: str = ""):
-    """測試 API 連線 (使用 Adapter)"""
-    try:
-        from exchanges import get_adapter, get_exchange_display_name
-
-        with st.spinner(f"連接 {get_exchange_display_name(exchange_type)}..."):
-            adapter = get_adapter(exchange_type)
-            # Bitget 需要額外的 password 參數
-            if exchange_type == "bitget":
-                adapter.init_exchange(api_key, api_secret, password=password)
-            else:
-                adapter.init_exchange(api_key, api_secret)
-            adapter.load_markets()
-
-            balances = adapter.fetch_balance()
-
-        st.success(f"✅ {get_exchange_display_name(exchange_type)} 連線成功!")
-
-        # 顯示餘額
-        col1, col2, col3 = st.columns(3)
-        cols = [col1, col2, col3]
-
-        for i, currency in enumerate(["USDC", "USDT", "BNB"]):
-            if currency in balances:
-                bal = balances[currency]
-                if bal.wallet_balance > 0:
-                    with cols[i % 3]:
-                        st.metric(
-                            currency,
-                            f"{bal.wallet_balance:.4f}",
-                            delta=f"可用: {bal.available_balance:.4f}"
-                        )
-
-        # 測試期貨權限
-        try:
-            positions = adapter.fetch_positions()
-            st.success("✅ 期貨交易權限正常")
-        except Exception:
-            st.warning("⚠️ 無法讀取期貨倉位")
-
-    except Exception as e:
-        st.error(f"❌ 連線失敗: {str(e)}")
 
 
 def render_max_enhancement():
