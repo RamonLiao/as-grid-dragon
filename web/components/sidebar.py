@@ -59,41 +59,25 @@ def render_sidebar():
             from pathlib import Path
             sys.path.insert(0, str(Path(__file__).parent.parent))
 
-            from state import get_config, is_trading_active
+            from state import get_config
 
             config = get_config()
             max_cfg = config.max_enhancement
 
             st.markdown("**系統狀態**")
-
-            if is_trading_active():
-                st.markdown("""
-                <span style="
-                    display: inline-flex;
-                    align-items: center;
-                    padding: 6px 12px;
-                    border-radius: 20px;
-                    font-size: 13px;
-                    font-weight: 600;
-                    background: rgba(0, 214, 143, 0.15);
-                    color: #00D68F;
-                    border: 1px solid rgba(0, 214, 143, 0.3);
-                ">交易運行中</span>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown("""
-                <span style="
-                    display: inline-flex;
-                    align-items: center;
-                    padding: 6px 12px;
-                    border-radius: 20px;
-                    font-size: 13px;
-                    font-weight: 600;
-                    background: rgba(139, 141, 151, 0.15);
-                    color: #8B8D97;
-                    border: 1px solid rgba(139, 141, 151, 0.3);
-                ">待命中</span>
-                """, unsafe_allow_html=True)
+            st.markdown("""
+            <span style="
+                display: inline-flex;
+                align-items: center;
+                padding: 6px 12px;
+                border-radius: 20px;
+                font-size: 13px;
+                font-weight: 600;
+                background: rgba(108, 99, 255, 0.15);
+                color: #6C63FF;
+                border: 1px solid rgba(108, 99, 255, 0.3);
+            ">引擎於 GCE 運行</span>
+            """, unsafe_allow_html=True)
 
             st.divider()
 

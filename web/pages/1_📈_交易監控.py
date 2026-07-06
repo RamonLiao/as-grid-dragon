@@ -1,20 +1,18 @@
+"""交易歷史檢視頁
+================
+資料源：grid_engine 落地檔（logs/decisions.jsonl + logs/bandit_state.json）。
+非即時監控——實盤告警走 Telegram（grid_engine notifier），
+本頁為事後歷史檢視。
 """
-交易監控頁面
-============
-即時持倉、浮盈、成交記錄
-"""
-
 import streamlit as st
 import pandas as pd
-from datetime import datetime
 
 st.set_page_config(
-    page_title="交易監控 - AS 網格",
+    page_title="交易歷史 - AS 網格",
     page_icon="📈",
     layout="wide",
 )
 
-# 導入狀態管理
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -23,188 +21,92 @@ from theme import apply_custom_theme
 from components.sidebar import render_sidebar
 apply_custom_theme()
 
-from state import (
-    init_session_state,
-    is_trading_active,
-    get_trading_stats,
-    get_trading_duration,
-    get_bot,
-    get_config,
-    stop_trading,
-    check_config_updated,  # 新增：檢查配置是否更新
-)
+from state import init_session_state, get_config, check_config_updated
+from web.services import history_reader
 
 init_session_state()
 
 
-def render_header():
-    """渲染標題"""
-    col1, col2, col3 = st.columns([3, 1, 1])
-
+def render_header(df: pd.DataFrame):
+    col1, col2 = st.columns([3, 2])
     with col1:
-        st.title("📈 交易監控")
-
+        st.title("📈 交易歷史檢視")
     with col2:
-        if is_trading_active():
-            duration = get_trading_duration()
-            st.metric("運行時間", duration or "00:00:00")
-
-    with col3:
-        if is_trading_active():
-            if st.button("⏹️ 停止", type="secondary"):
-                success, msg = stop_trading()
-                if success:
-                    st.success(msg)
-                    st.rerun()
-                else:
-                    st.error(msg)
+        last = history_reader.last_activity(df)
+        if last is not None:
+            st.metric("最後決策時間", last.strftime("%m-%d %H:%M:%S"))
+    st.caption("⚠️ 本頁為引擎落地檔的歷史檢視，非即時監控；實盤告警走 Telegram。")
 
 
-def render_positions_table():
-    """渲染持倉表格"""
-    st.subheader("📊 當前持倉")
-
-    if not is_trading_active():
-        st.info("交易未運行")
+def render_position_timeline(df: pd.DataFrame):
+    st.subheader("📊 持倉軌跡")
+    if df.empty:
+        st.info("無決策記錄（logs/decisions.jsonl 不存在或為空）。"
+                "引擎在本機跑過後才會有資料。")
         return
-
-    stats = get_trading_stats()
-    symbols = stats.get("symbols", {})
-
-    if not symbols:
-        st.info("等待數據...")
+    symbols = sorted(df["symbol"].dropna().unique())
+    symbol = st.selectbox("交易對", options=symbols, key="hist_symbol")
+    sdf = df[df["symbol"] == symbol].set_index("ts")
+    if sdf.empty:
+        st.info("此交易對無記錄")
         return
-
-    # 轉換為 DataFrame
-    rows = []
-    for name, data in symbols.items():
-        long_pnl = 0
-        short_pnl = 0
-
-        # 計算多空浮盈 (簡化計算)
-        if data['long_position'] > 0 and data['long_avg_price'] > 0:
-            long_pnl = (data['price'] - data['long_avg_price']) * data['long_position']
-        if data['short_position'] > 0 and data['short_avg_price'] > 0:
-            short_pnl = (data['short_avg_price'] - data['price']) * data['short_position']
-
-        rows.append({
-            "交易對": name,
-            "當前價格": f"{data['price']:.6f}",
-            "多單持倉": f"{data['long_position']:.2f}",
-            "多單均價": f"{data['long_avg_price']:.6f}" if data['long_avg_price'] > 0 else "-",
-            "空單持倉": f"{data['short_position']:.2f}",
-            "空單均價": f"{data['short_avg_price']:.6f}" if data['short_avg_price'] > 0 else "-",
-            "浮盈(U)": f"{data['unrealized_pnl']:+.2f}",
-        })
-
-    df = pd.DataFrame(rows)
-    st.dataframe(df, width='stretch', hide_index=True)
-
-    # 總計
-    total_pnl = sum(d['unrealized_pnl'] for d in symbols.values())
-    color = "green" if total_pnl >= 0 else "red"
-    st.markdown(f"**總浮盈: :{color}[{total_pnl:+.2f} U]**")
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**價格**")
+        st.line_chart(sdf["price"])
+    with c2:
+        st.markdown("**多/空持倉**")
+        st.line_chart(sdf[["long_position", "short_position"]])
+    # 裝死模式事件
+    dead = sdf[(sdf["long_dead_mode"] == True) | (sdf["short_dead_mode"] == True)]  # noqa: E712
+    if not dead.empty:
+        st.warning(f"⚠️ 期間出現裝死模式 {len(dead)} 筆決策記錄"
+                   f"（最近: {dead.index.max().strftime('%m-%d %H:%M')}）")
 
 
-def render_account_balances():
-    """渲染帳戶餘額"""
-    st.subheader("💰 帳戶餘額")
-
-    if not is_trading_active():
-        st.info("交易未運行")
+def render_latest_snapshot(df: pd.DataFrame):
+    st.subheader("🔍 各交易對最新狀態")
+    if df.empty:
+        st.info("無決策記錄")
         return
+    latest = df.sort_values("ts").groupby("symbol").tail(1)
+    rows = [{
+        "交易對": r["symbol"],
+        "時間": r["ts"].strftime("%m-%d %H:%M:%S"),
+        "價格": f"{r['price']:.6f}" if pd.notna(r["price"]) else "-",
+        "多單": f"{r['long_position']:.2f}" if pd.notna(r["long_position"]) else "-",
+        "空單": f"{r['short_position']:.2f}" if pd.notna(r["short_position"]) else "-",
+    } for _, r in latest.iterrows()]
+    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
-    stats = get_trading_stats()
-    accounts = stats.get("accounts", {})
 
-    if not accounts:
-        st.info("等待數據...")
+def render_bandit_state():
+    st.subheader("🎰 Bandit 狀態")
+    state = history_reader.load_bandit_state()
+    if not state:
+        st.info("無 bandit 狀態檔（logs/bandit_state.json）")
         return
-
-    cols = st.columns(len(accounts))
-    for i, (name, acc) in enumerate(accounts.items()):
-        with cols[i]:
-            st.metric(
-                name,
-                f"{acc['wallet_balance']:.2f}",
-                delta=f"可用: {acc['available_balance']:.2f}",
-                delta_color="off"
-            )
+    st.json(state, expanded=False)
 
 
-def render_recent_trades():
-    """渲染最近成交"""
-    st.subheader("📝 最近成交")
-
-    bot = get_bot()
-    if not bot or not is_trading_active():
-        st.info("交易未運行")
-        return
-
-    # 收集所有交易對的最近成交
-    all_trades = []
-    for name, sym_state in bot.state.symbols.items():
-        for trade in sym_state.recent_trades:
-            all_trades.append({
-                "時間": trade.get("time", "-"),
-                "交易對": name,
-                "方向": trade.get("side", "-"),
-                "數量": trade.get("qty", 0),
-                "價格": trade.get("price", 0),
-                "盈虧": trade.get("pnl", 0),
-            })
-
-    if not all_trades:
-        st.info("暫無成交記錄")
-        return
-
-    # 按時間排序
-    all_trades.sort(key=lambda x: x["時間"], reverse=True)
-
-    # 顯示最近 20 條
-    df = pd.DataFrame(all_trades[:20])
-    st.dataframe(df, width='stretch', hide_index=True)
-
-
-def render_symbol_details():
-    """渲染交易對詳情"""
-    st.subheader("🔍 交易對詳情")
-
+def render_symbol_config():
+    st.subheader("⚙️ 交易對配置")
     config = get_config()
     if not config.symbols:
         st.info("未配置交易對")
         return
-
-    # 選擇交易對
-    symbol = st.selectbox(
-        "選擇交易對",
-        options=list(config.symbols.keys()),
-        key="detail_symbol"
-    )
-
+    symbol = st.selectbox("選擇交易對", options=list(config.symbols.keys()),
+                          key="cfg_symbol")
     if not symbol:
         return
-
     cfg = config.symbols[symbol]
-
-    # 交易模式標籤
-    mode_labels = {
-        "high_freq": "🚀 次高頻",
-        "swing": "📊 波動",
-        "long_cycle": "🌊 大週期",
-    }
-    mode_label = mode_labels.get(getattr(cfg, 'trading_mode', 'swing'), "📊 波動")
-    st.info(f"**交易模式**: {mode_label}")
-
     col1, col2 = st.columns(2)
-
     with col1:
         st.markdown("**策略參數**")
         st.write(f"- 止盈間距: {cfg.take_profit_spacing*100:.2f}%")
         st.write(f"- 補倉間距: {cfg.grid_spacing*100:.2f}%")
         st.write(f"- 每單數量: {cfg.initial_quantity}")
         st.write(f"- 槓桿: {cfg.leverage}x")
-
     with col2:
         st.markdown("**倉位控制**")
         st.write(f"- 加倍止盈觸發: {cfg.position_limit:.1f}")
@@ -212,72 +114,29 @@ def render_symbol_details():
         st.write(f"- 加倍倍數: {cfg.limit_multiplier}x")
         st.write(f"- 裝死倍數: {cfg.threshold_multiplier}x")
 
-    # 如果交易中，顯示即時狀態
-    if is_trading_active():
-        bot = get_bot()
-        if bot and symbol in bot.state.symbols:
-            sym_state = bot.state.symbols[symbol]
-
-            st.divider()
-            st.markdown("**即時狀態**")
-
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                st.metric("最新價", f"{sym_state.latest_price:.6f}")
-            with c2:
-                st.metric("買一價", f"{sym_state.best_bid:.6f}")
-            with c3:
-                st.metric("賣一價", f"{sym_state.best_ask:.6f}")
-            with c4:
-                spread = sym_state.best_ask - sym_state.best_bid
-                spread_pct = (spread / sym_state.latest_price * 100) if sym_state.latest_price > 0 else 0
-                st.metric("價差", f"{spread_pct:.4f}%")
-
-            # 裝死模式狀態
-            if sym_state.long_dead_mode or sym_state.short_dead_mode:
-                st.warning(
-                    f"⚠️ 裝死模式: "
-                    f"{'多單' if sym_state.long_dead_mode else ''}"
-                    f"{'空單' if sym_state.short_dead_mode else ''}"
-                )
-
 
 def main():
-    """主函數"""
-    # 先渲染側邊欄
     render_sidebar()
-    
-    # 檢查配置是否被其他頁面更新
     if check_config_updated():
         st.info("✅ 檢測到配置已更新，正在刷新...")
         st.rerun()
 
-    render_header()
+    df = history_reader.load_decisions()
+    render_header(df)
     st.divider()
 
-    # 主要區域
     left, right = st.columns([2, 1])
-
     with left:
-        render_positions_table()
-        st.divider()
-        render_recent_trades()
-
+        render_position_timeline(df)
     with right:
-        render_account_balances()
+        render_latest_snapshot(df)
         st.divider()
-        render_symbol_details()
+        render_bandit_state()
+        st.divider()
+        render_symbol_config()
 
-    # 自動刷新
-    if is_trading_active():
-        try:
-            from streamlit_autorefresh import st_autorefresh
-            st_autorefresh(interval=2000, key="monitor_refresh")
-        except ImportError:
-            st.caption("提示: 安裝 streamlit-autorefresh 可自動刷新")
-            if st.button("🔄 手動刷新"):
-                st.rerun()
+    if st.button("🔄 重新載入"):
+        st.rerun()
 
 
-# 執行頁面
 main()
