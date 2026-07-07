@@ -31,6 +31,8 @@ def load_raw(path) -> dict:
 def merge_preserve(raw: dict, new: dict,
                    symbol_extras: Optional[dict] = None) -> dict:
     merged = dict(raw)  # raw 為底，保留未知 top-level key
+    if "symbols" in merged:
+        merged["symbols"] = {k: dict(v) for k, v in merged["symbols"].items()}
     for k, v in new.items():
         if k == "symbols":
             merged_symbols = {}

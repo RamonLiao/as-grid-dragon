@@ -64,6 +64,16 @@ def test_symbol_extras_overlay():
     assert merged["symbols"]["X/USDC:USDC"]["trading_mode"] == "high_freq"
 
 
+def test_merge_preserve_pure_no_raw_mutation_with_extras():
+    """new 不含 symbols + symbol_extras 命中 raw-only symbol 時，raw 不可被原地變異。"""
+    raw = {"symbols": {"X/USDC:USDC": {"leverage": 20}}}
+    new = {"api_key": "k"}  # 不含 symbols
+    merged = config_io.merge_preserve(
+        raw, new, symbol_extras={"X/USDC:USDC": {"trading_mode": "swing"}})
+    assert merged["symbols"]["X/USDC:USDC"]["trading_mode"] == "swing"   # extras 生效
+    assert "trading_mode" not in raw["symbols"]["X/USDC:USDC"]            # raw 未被污染
+
+
 def test_atomic_write_no_tmp_residue(tmp_path):
     p = tmp_path / "trading_config_max.json"
     config_io._atomic_write_json(p, {"a": 1})
