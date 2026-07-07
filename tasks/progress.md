@@ -1,7 +1,33 @@
 # Progress
 
 ## Current Task
-無進行中任務。**#8 清理剛完成（2026-07-05，未 push——連同 #7 共 13+ 本地 commits）**。剩 #9（長期）與 #4 人工 Task 10（部署後 ≥24h replay zero-diff——部署新版可同時驗收 #4+#7+#8）。下一步建議：**push origin/main + 部署 GCE 跑 24h replay 驗收**，或直接開 #9 前置調查（web 回測頁遷移方案）。
+**#10-A config 寫入原子/merge/跨進程鎖（2026-07-08，實作完成待 dual-review）**：branch `fix/10a-atomic-config-save`，base c9c33f7。SDD 4 實作 task 全 spec ✅ review clean，全套 310 passed（294 基線+16 新）。抽 `grid_engine/config_io.py` 共用底層（merge-preserve + pid tmp 原子寫 + fcntl.flock sidecar 鎖），`GlobalConfig.save()` 與 `web/services/config_store.py` 皆 delegate，兩份邏輯合一。修三缺陷：撕裂讀（os.replace）、抹 extras（merge-preserve）、lost-update（flock 序列化 RMW）。順修 config_store 固定 tmp 潛伏 bug + web 側原無跨進程鎖。併發測試證 flock-off 穩定 FAIL（235/300 key 遺失）、flock-on PASS。Monkey：真實 config round-trip 零遺失、損毀檔 raise 不截斷。**待跑 verifier + dual-review 才算完成；B（hard_stop 實作）另開 cycle。**
+
+**#9 web/ 遷移完成（2026-07-06）**：23 commits c924947..1b2dd59，全套 294 passed（270 基線+24 新）。SDD 11 task + final whole-branch review（Ready to merge）+ verifier（ACCEPT 8/8）+ dual-review（Ship as-is）全收斂。**未 push**。剩 #4 人工 Task 10（GCE 部署 ≥24h replay zero-diff）照舊卡人工前置。
+
+### #9 成果摘要
+- web 全遷新系統：新增 `web/services/`（config_store merge-preserve+原子寫 / history_reader 容錯讀 / backtest_service 黃金映射+雙優化器歸一）+ tests/web/ 24 測試；砍 bot 生命週期；頁1 降級讀 logs/decisions.jsonl；頁2-4 改接；刪 core/ ui/ exchanges/ main.py（~3千行）；config/models.py 瘦身留 4 indicator config。
+- 過程抓到的真 bug（部分現存生產）：Config.to_dict 漏序列化 4 欄致網格優化掉 legacy 引擎（同源 bug 曾影響 as_terminal_max optimize_params，已修）；頁3 exchange_type AttributeError；每單數量 min_value=1.0 擋掉所有真實配置；頁3 clamp 寫回 session 致 check_config_updated rerun 風暴（整頁互動失效，改 mtime 比對修）；頁4 風控 tab hard_stop 回歸（唯讀揭露）；頁4 缺同步防護（lost-update 窗口）。
+- Task 8 對比裁決：新舊引擎成本對齊後 return 方向仍相反 → 歸因 #4 刻意撮合重設計（新=實盤等價），使用者裁決接受新引擎為基準（tasks/notes.md）。
+- **重要事實**：生產 JSON 已是純 engine schema——trading_mode/hard_stop/exchange_type 在 #9 前就被引擎終端選單 save() 抹掉。merge-preserve 是正確防禦碼但只守 web 側。
+
+### #9 Follow-up backlog（非阻擋）
+1. **#10 候選（實盤安全，優先）**：as_terminal_max 終端選單 `GlobalConfig.save()` 非原子+抹 extras → 改走 merge-preserve+原子寫或砍終端 config 選單；同捆「生產 grid_engine 補 hard_stop 實作」（現況硬止損無效，spec 揭露）。
+2. trading_mode 收編 engine schema（#4 驗收後）。
+3. 頁3「clamp 後寫回 session」模式未全站排查；scripts/compare_backtest_engines.py 的 core import 已死（plan 明定保留歷史）；各 task Minor 累積見 .superpowers/sdd/progress.md。
+
+
+### #9 brainstorming 補充事實（2026-07-06，修正前置調查）
+- 前置調查兩點已過時：core/ 現只剩 bot/backtest/strategy 三檔（無 path_resolver/logging_setup）；coin_selection 的 core import 是 try/except 死分支（模組不存在，恆走 fallback），Phase 2 清死碼即可。
+- tests/ 零依賴舊系統（270 tests 全綁新系統），刪舊碼無測試連坐。
+- 兩套系統共用 `config/trading_config_max.json`（grid_engine/utils.py:29）；grid_engine 落地檔：logs/decisions.jsonl、logs/bandit_state.json、log/*.log（snapshot 僅記憶體）。
+- grid_engine 是 ccxt 直連 Binance（ws_client.py:79 fapiPrivatePutListenKey），exchanges/ adapter 層只剩頁4 在用。
+
+### #9 前置調查 — web/舊系統依賴盤點（2026-07-05，scout 完成，未動碼）
+- **web/ 對舊系統的依賴只有 5 個 import 點**：`web/state.py:21`(config.models.GlobalConfig) + `:148`(core.bot.MaxGridBot)、`web/pages/2_⚙️_交易對管理.py:26`(config.models.SymbolConfig)、`web/pages/3_🔬_回測優化.py:29,31`(SymbolConfig + core.backtest.BacktestManager)、`web/pages/4_🛠️_設定.py:37`(exchanges list/display_name)。app.py/theme.py/sidebar.py 乾淨；頁1 只間接經 state.py。
+- **回測頁遷移缺口（≤5 條初判）**：① BacktestManager 統一抽象消失，新系統要分別接 `backtest/data_loader.py:DataLoader`(download:376/load:158) + `backtest/backtester.py:GridBacktester.run():504`，需包裝層或改寫（★★★）；② `get_available_dates()` 回傳 List[str] vs 新 `get_date_range():313` 回 (start,end) 元組，頁內邏輯要改（★★）；③ `optimize_params()` 拆成 optimizer.py/smart_optimizer.py 兩套，接口不同（★★★）；④ SymbolConfig → backtest/config.py:Config 參數映射需驗證（★★）；⑤ Monte Carlo 段（line 929-1013）**已經在用新系統 GridBacktester**，只需驗證（★）。
+- **重要：刪 core/ 不只是 web 的事** — 新系統自身也踩著 core/：`backtest/data_loader.py` import `core.path_resolver`、`coin_selection/ws_provider.py` import core.logging_setup/error_handler/constants、`indicators/*.py`(dgt/funding/leading/bandit) import config.models、`ui/menu.py` import core.bot+core.backtest（舊終端 UI 整個要一起淘汰或遷移）。#9 範圍應含這些工具模組的去留（path_resolver/logging_setup 等宜先搬出 core/ 成獨立 utils）。
+- web 啟動入口 `streamlit run web/app.py`（README 方式2）；健檢 `scripts/check_web_system.py`（45 項，前次 37 pass/4 fail 非阻塞）。scout 未實跑 web，可用性數字來自 WEB_TEST_REPORT.md（2026-01-13，偏舊）。
 
 ### #8 清理 — 完成（2026-07-05）
 - 全套 **270 passed**（268+2 新測試）。reviewer(opus) LGTM 無 must-fix + verifier ACCEPT 5/5（含 revert 驗證新測試會紅、還原乾淨）。
@@ -35,7 +61,7 @@
 - [x] **#6 (P1) Bandit 狀態持久化** — 完成，11 commits 65c0c71..e6c9849，全套 **220 passed**，SDD 六 task + final whole-branch review(opus) + dual-review 全收斂 Ship as-is，已 push。純層 `grid_engine/bandit_persistence.py`(save 原子寫+fsync／load 永不 raise 冷啟動兜底) + `enhancements.py`(live class)/`indicators/bandit.py` 加 `arm_signature` + bot 接線(run 載入／每評估後 total_pulls 變才存／stop 收尾) + `grid_engine/config.py` 加 `bandit_state_path`/`bandit_state_max_age_sec`。**review 抓修 3 個 async-loop crash 洞**：pull_counts 整表取代→select_arm KeyError(final-review)、thompson 有限≤0→np.random.beta ValueError(dual R1 reproduced)、load_state 竄改例外穿透違反永不 raise(task4 review)。**重大：計畫全程誤指 `indicators/bandit.py`(舊 core)，live bot 用 `grid_engine/enhancements.py` 重複 class — 同 GlobalConfig 兩份陷阱，實作者抓到修正**。Follow-up(非阻擋)見 `.superpowers/sdd/progress.md` #6 段(save fsync 阻塞 event loop 宜 offload／load 尾端未 select_arm／context_rewards 未持久化／重複 class 收斂屬#8/#9)。原始問題(bot 從未呼叫 to_dict/load_state→重啟歸零)已解。spec `docs/superpowers/specs/2026-07-04-bandit-state-persistence-design.md`、plan `docs/superpowers/plans/2026-07-04-bandit-state-persistence.md`（6 tasks TDD）。設計：純層 `grid_engine/bandit_persistence.py`(save/load 原子寫+fsync) + bandit.py 加 `arm_signature` + bot 接線 3 處（run 載入/每 10 筆評估後條件存/stop 收尾）；`grid_engine/config.py` 加 `bandit_state_path`/`bandit_state_max_age_sec`。量化 review 折入：arm_signature 不簽 sizing（reward 已驗 scale-invariant，砍 reward_signature）、只復原學到統計不復原瞬時選擇、非有限值 sanitize、max_age 過期冷啟動、replay-invariant 守門。**注意 live config 是 `grid_engine/config.py` 非 `config/models.py`（舊 core）**
 - [x] **#7 (P1) MaxGridBot god class 拆分** — 完成，8 commits cf3e10d..51def8c，全套 **268 passed**，SDD 7 task + final review + dual-review + verifier ACCEPT 全收斂 Ship as-is（未 push）。詳見上方 Current Task。
 - [x] **#8 (P2) 清理** — 完成（2026-07-05），270 passed，reviewer LGTM + verifier ACCEPT。範圍修正：grid_engine/backtest.py **保留**（live 入口 as_terminal_max.py 在用，「無人引用」是誤記）；頂層診斷 script 移 scripts/check_*.py；task 生命週期修復（GC 風險 + 累積洩漏）。詳見上方 Current Task。
-- [ ] **#9 (長期) 淘汰舊系統**：web 依賴遷移後刪 core/ + exchanges/（~6000 行，需先確認 web 回測頁遷移方案）
+- [~] **#9 (長期) 淘汰舊系統**：前置調查完成（2026-07-05，見 Current Task）——web 依賴面 5 個 import 點 + 回測頁 5 缺口初判；**範圍擴大：backtest/coin_selection/indicators/ui 也依賴 core/，需一併處理**。下一步：brainstorming 定遷移方案（Plan track，需使用者確認）
 
 ## TODO — 部署（先前遺留）
 - [ ] 建立 GCE VM (e2-small, Ubuntu 22.04, 固定外部 IP)
