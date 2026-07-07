@@ -5,8 +5,19 @@
 
 原子性與併發：
 - os.replace 給「可見性原子」→ 防撕裂讀。
-- fcntl.flock(LOCK_EX) 包住整個 read-modify-write → 防跨進程 lost-update。
+- fcntl.flock(LOCK_EX) 包住整個 read-modify-write → 序列化併發寫入。
 - tmp 檔 pid 唯一化 → crash 殘留不互撞、不被誤 replace（flock 之外的 defense-in-depth）。
+
+lost-update 保護「範圍」（重要，勿誤讀為全面）：
+- 有保護：top-level 未知欄位、symbol 內未知欄位（如 trading_mode）——鎖內
+  重讀 raw 後 merge-preserve，另一進程的寫入不會被抹掉。
+- 無保護（accepted risk）：symbols「集合」的新增/刪除。merge_preserve 把
+  new["symbols"] 當該次呼叫的 symbols 全集權威——raw 有、new 沒有的 symbol
+  一律移除（刻意的刪除語意）。若呼叫端持鎖外的過期記憶體快照（尤其終端選單
+  長時間持有 self.config），併發被別的進程新增的 symbol 會被丟失、被刪除的會
+  被復活（last-writer-wins）。flock 無法補此類「呼叫端快照過期」的應用層 race；
+  真正修復需 save 前 reload-and-remerge 或刪除協定，屬 workflow 決策，見
+  #10-A follow-up。
 """
 import fcntl
 import json
