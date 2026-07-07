@@ -142,9 +142,9 @@ def test_save_atomic_write_no_tmp_residue(cfg_file):
     config.symbols["XRP/USDC:USDC"].leverage = 40
     config_store.save_config(config, path=cfg_file)
 
-    # 驗證無 .tmp 殘留
-    tmp_file = cfg_file.with_suffix(cfg_file.suffix + ".tmp")
-    assert not tmp_file.exists(), f"tmp 檔殘留：{tmp_file}"
+    # 驗證無 .tmp 殘留（pid 唯一化後用 glob）
+    residue = list(cfg_file.parent.glob(cfg_file.name + ".tmp*"))
+    assert residue == [], f"tmp 檔殘留：{residue}"
 
     # 驗證主檔可正常 parse 且變更生效
     raw = json.loads(cfg_file.read_text())

@@ -4,17 +4,17 @@
 engine schema 認識的欄位，而 config/trading_config_max.json 還有
 trading_mode（頁3 優化器用）、risk hard_stop 三欄、exchange_type/testnet
 等欄位。直接覆寫會把它們永久抹掉。這裡以 raw JSON 為底做欄位級 merge。
+
+merge/原子寫/tmp 邏輯已下沉到 grid_engine.config_io（單一真相，engine
+與 web 共用），本模組僅 delegate。
 """
-import json
-import os
-import shutil
 from pathlib import Path
 from typing import Optional
 
 from grid_engine.config import GlobalConfig
 from grid_engine.utils import CONFIG_FILE
-
-BACKUP_SUFFIX = ".bak-pre-web-migration"
+from grid_engine import config_io
+from grid_engine.config_io import BACKUP_SUFFIX  # 對外相容 re-export
 
 
 def _resolve(path: Optional[Path]) -> Path:
@@ -22,11 +22,7 @@ def _resolve(path: Optional[Path]) -> Path:
 
 
 def load_raw(path: Optional[Path] = None) -> dict:
-    p = _resolve(path)
-    if not p.exists():
-        return {}
-    with open(p, encoding="utf-8") as f:
-        return json.load(f)
+    return config_io.load_raw(_resolve(path))
 
 
 def load_config(path: Optional[Path] = None) -> GlobalConfig:
@@ -52,55 +48,14 @@ def get_symbol_extra(ccxt_symbol: str, key: str, default=None,
     return raw.get("symbols", {}).get(ccxt_symbol, {}).get(key, default)
 
 
-def _ensure_backup(p: Path) -> None:
-    if not p.exists():
-        return
-    bak = p.with_name(p.name + BACKUP_SUFFIX)
-    if not bak.exists():
-        shutil.copy(p, bak)
-
-
 def save_config(config: GlobalConfig,
                 symbol_extras: Optional[dict] = None,
                 path: Optional[Path] = None) -> None:
-    """merge-preserve 存檔。
+    """merge-preserve + 原子寫 + 跨進程鎖 存檔（delegate config_io，單一真相）。
 
-    - top-level：raw 有、engine to_dict 沒有的 key 原樣保留。
-    - symbols：以 config.symbols 為準（新增進檔、刪除移除），
-      每個 symbol 內 raw 有、engine 沒有的 key（如 trading_mode）保留。
-    - risk 等巢狀 dict：同樣欄位級 merge。
-    - symbol_extras：{ccxt_symbol: {key: value}} 顯式覆寫（頁2 編輯 trading_mode 用）。
+    首次存檔前建一次性 .bak-pre-web-migration 備份。symbol_extras
+    {ccxt_symbol: {key: value}} 顯式覆寫（頁2 編輯 trading_mode 用）。
     """
-    p = _resolve(path)
-    raw = load_raw(p)
-    new = config.to_dict()
-
-    merged = dict(raw)  # raw 為底，保留未知 top-level key
-    for k, v in new.items():
-        if k == "symbols":
-            merged_symbols = {}
-            raw_symbols = raw.get("symbols", {})
-            for sym_key, sym_new in v.items():
-                sym_merged = dict(raw_symbols.get(sym_key, {}))
-                sym_merged.update(sym_new)
-                merged_symbols[sym_key] = sym_merged
-            merged[k] = merged_symbols  # config 已刪的 symbol 不進 merged
-        elif isinstance(v, dict) and isinstance(raw.get(k), dict):
-            sub = dict(raw[k])
-            sub.update(v)
-            merged[k] = sub
-        else:
-            merged[k] = v
-
-    for sym_key, extras in (symbol_extras or {}).items():
-        if sym_key in merged.get("symbols", {}):
-            merged["symbols"][sym_key].update(extras)
-
-    _ensure_backup(p)
-    # 原子寫：tmp + os.replace 防止 crash/disk-full 導致檔案截斷
-    tmp = p.with_suffix(p.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(merged, f, indent=2, ensure_ascii=False)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, p)
+    config_io.merge_preserve_save(
+        _resolve(path), config.to_dict(),
+        symbol_extras=symbol_extras, ensure_backup=True)
