@@ -11,6 +11,7 @@ from .utils import CONFIG_FILE, console
 from .enhancements import (
     MaxEnhancement, BanditConfig, DGTConfig, LeadingIndicatorConfig
 )
+from .config_io import merge_preserve_save
 
 
 @dataclass
@@ -235,8 +236,7 @@ class GlobalConfig:
         return config
 
     def save(self):
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.to_dict(), f, indent=2)
+        merge_preserve_save(CONFIG_FILE, self.to_dict())
         console.print("[green]配置已保存[/]")
 
     @classmethod
