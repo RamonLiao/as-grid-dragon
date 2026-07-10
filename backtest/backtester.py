@@ -61,7 +61,12 @@ FIDELITY_NOTES = (
     "尾部風險會被系統性低估；equity_curve 本身恆用收盤價(供繪圖用，不是風險指標)，"
     "故 min(equity_curve) 可能高於 max_drawdown 隱含的谷底，兩者不保證一致; "
     "(10) margin_usage 為單 symbol，實盤 state.margin_usage 是帳戶層(跨 symbol)，結論不得外推; "
-    "(11) legacy 路徑(initial_quantity<=0)不含成本模型、不含強平、不含 high/low 撮合。"
+    "(11) legacy 路徑(initial_quantity<=0)不含成本模型、不含強平、不含 high/low 撮合; "
+    "(12) 初始持倉注入(seed position)——注入的 lot 進 index 0，後續 partial TP 走 "
+    "per-lot FIFO 會【先平這張 seed lot】並對其認列 realized(例如多頭高價 690 的 lot)，"
+    "而生產 Binance hedge mode 是對【混合均價】結算；故涉及 seed 部分平倉的實驗"
+    "(threshold 掃描)其 realized_pnl 與 final_equity 會系統性偏離生產，只可看方向、"
+    "不可當精確預測。seed 全 0(預設)時本條不適用(與空倉起跑 bit-identical)。"
 )
 
 
@@ -632,14 +637,22 @@ class GridBacktester:
         # 初始持倉注入（seed）：pre-populate lot @ seed price，margin 從 balance 扣、
         # 不扣 fee（既存倉位非本回測新成交）。全 0 → 不 append → 與空倉起跑等價。
         # 用途：重現生產裝死狀態（空倉起跑碰不到 threshold，見 tests/test_backtest_seed_position.py）。
+        # 注入點自身也 raise（不只靜默跳過），防直接調 _run_terminal_ui_mode 繞過
+        # run() 的 _validate_seed（內部 review M4，defense-in-depth）。qty==0 = 跳過。
         for _side, _qty, _px, _bucket in (
             ("long", cfg.seed_long_qty, cfg.seed_long_price, long_positions),
             ("short", cfg.seed_short_qty, cfg.seed_short_price, short_positions),
         ):
-            if _qty > 0 and _px > 0 and cfg.direction in (_side, "both"):
-                _margin = (_qty * _px) / leverage
-                balance -= _margin
-                _bucket.append({"price": _px, "qty": _qty, "margin": _margin})
+            if _qty == 0:
+                continue
+            if (_qty < 0 or not math.isfinite(_qty) or _px <= 0
+                    or not math.isfinite(_px) or cfg.direction not in (_side, "both")):
+                raise ValueError(
+                    f"seed_{_side} 非法或方向矛盾（qty={_qty} px={_px} "
+                    f"direction={cfg.direction}）——不得靜默丟棄")
+            _margin = (_qty * _px) / leverage
+            balance -= _margin
+            _bucket.append({"price": _px, "qty": _qty, "margin": _margin})
 
         # pending 掛單狀態：每側 entry/tp 各為 {"price","qty"} 或 None，驅動 should_adjust
         pend = {"long": {"entry": None, "tp": None},

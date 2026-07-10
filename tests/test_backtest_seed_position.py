@@ -82,6 +82,25 @@ def test_seed_at_current_price_no_fee_preserves_balance():
     )
 
 
+def test_seed_charges_no_fee_even_when_fee_pct_positive():
+    """核心（外部 review I1）：seed 是既存倉位，即使 fee_pct>0 也不得扣 fee。
+
+    前一條用 fee_pct=0 → 把待測的 fee 維度壓成常數，誤扣 fee 的真實 bug
+    （抄 _open 的 fee=qty×price×fee_pct）在 fee_pct=0 時算出 0、仍綠（假綠）。
+    本條 fee_pct=0.0002、seed@現價 → 若 seed 扣了 fee，final_equity =
+    1000 - 0.58×573×0.0002 = 999.9335 ≠ 1000 → 紅。大間距確保無其他成交產生 fee。
+    """
+    res = GridBacktester(
+        _flat_df([573.0] * 5),
+        _seed_cfg(seed_long_qty=0.58, seed_long_price=573.0, direction="long",
+                  fee_pct=0.0002),
+    ).run()
+    assert res.final_equity == pytest.approx(1000.0, abs=1e-6), (
+        f"seed 不得扣 fee（即使 fee_pct>0）；final_equity 應 == 1000，實得 {res.final_equity}"
+        f"（≈999.93 = 誤把既存倉位當新成交收了 fee）"
+    )
+
+
 def test_seed_zero_is_bit_identical_to_no_seed():
     """守門：顯式設 seed_*=0 與完全不設（用 dataclass 預設），結果逐位元相同。
 
@@ -108,20 +127,24 @@ def test_seed_zero_is_bit_identical_to_no_seed():
     assert res_default.unrealized_pnl == res_zero.unrealized_pnl
 
 
-def test_seed_margin_deducted_from_balance():
-    """seed 佔用的 margin 必須從 balance 扣（否則等於憑空多了保證金）。
+def test_seed_lot_occupies_margin_and_deducts_balance():
+    """seed lot 必須同時：(a) 佔保證金額度、(b) margin 從 balance 扣（外部 review M3）。
 
-    注入 0.58@573（20x）→ margin = 0.58×573/20 = 16.617。此時 balance 應 = 1000-16.617。
-    間接驗證：再注入一個對手單無法開倉時的可用資金一致性——這裡直接用
-    peak_margin_usage > 0 確認倉位真的佔了保證金額度（空倉時為 0）。
+    (a) peak_margin_usage > 0：空倉為 0，注入後 lot 佔額度。
+    (b) seed@現價 → unrealized=0 → final_equity 應 == 本金。若漏扣 balance，
+        open_margin 仍含 seed margin（lot 帶 margin 欄位）→ equity 多算一個 margin
+        → final_equity = 1016.617 ≠ 1000 → 紅。這才真的守住「balance -= margin」，
+        單獨 peak_margin_usage>0 刪掉扣減也仍綠（margin_usage 只看 lot 存在）。
     """
     res = GridBacktester(
         _flat_df([573.0] * 5),
         _seed_cfg(seed_long_qty=0.58, seed_long_price=573.0, direction="long"),
     ).run()
-    assert res.peak_margin_usage > 0.0, (
-        "注入的倉位必須反映在 margin_usage 上（空倉為 0）；"
-        f"實得 {res.peak_margin_usage} → seed 倉位沒佔保證金"
+    assert res.peak_margin_usage > 0.0, (  # (a)
+        f"注入的倉位必須反映在 margin_usage 上（空倉為 0）；實得 {res.peak_margin_usage}"
+    )
+    assert res.final_equity == pytest.approx(1000.0, abs=1e-6), (  # (b)
+        f"seed margin 必須從 balance 扣；漏扣則 final_equity≈1016.6，實得 {res.final_equity}"
     )
 
 
@@ -154,6 +177,23 @@ def test_seed_infinite_price_raises():
         GridBacktester(
             _flat_df([573.0] * 5),
             _seed_cfg(seed_long_qty=0.58, seed_long_price=float("inf"), direction="long"),
+        ).run()
+
+
+def test_seed_nan_raises():
+    """seed_qty 或 seed_price = NaN → raise（外部 review M5：inf 有 red-once，NaN 也要）。
+
+    NaN==0 為 False（不會被當成「不注入」），落到 not isfinite → raise。
+    """
+    with pytest.raises(ValueError, match="seed_long_qty"):
+        GridBacktester(
+            _flat_df([573.0] * 5),
+            _seed_cfg(seed_long_qty=float("nan"), seed_long_price=690.0, direction="long"),
+        ).run()
+    with pytest.raises(ValueError, match="seed_long_price"):
+        GridBacktester(
+            _flat_df([573.0] * 5),
+            _seed_cfg(seed_long_qty=0.58, seed_long_price=float("nan"), direction="long"),
         ).run()
 
 
