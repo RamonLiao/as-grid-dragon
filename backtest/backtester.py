@@ -25,6 +25,7 @@ from grid_engine.enhancements import (
     DynamicGridManager, LeadingIndicatorManager, GLFTController, MaxEnhancement,
 )
 from backtest.costs import apply_slippage, funding_charge
+from backtest.matching import entry_crossed, tp_crossed
 
 # 回測保真限制（樂觀成交模型，與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
@@ -621,20 +622,23 @@ class GridBacktester:
                     pos["margin"] -= close_margin
                     remaining = 0
 
-        def _settle(side: str, price: float, ts) -> None:
-            """結算既有 pending（上一根掛的單）對本根價格的成交，樂觀以收盤價成交。"""
+        def _settle(side: str, bar_low: float, bar_high: float, ts) -> None:
+            """結算既有 pending（上一根掛的單）對本根 K 線的成交。
+
+            穿越用 high/low 判定（限價單盤中觸及即成交）；成交價一律是掛單價。
+            close 不再參與撮合——它既不決定有沒有成交，也不決定成交在哪。
+            同根雙觸發時 entry 先於 tp（保守：先增加曝險）；_close 走 FIFO，
+            故本根新開的倉不會被本根止盈平掉。
+            """
             positions = long_positions if side == "long" else short_positions
             e = pend[side]["entry"]
-            if e is not None:
-                crossed = price <= e["price"] if side == "long" else price >= e["price"]
-                if crossed and _open(side, price, e["qty"]):
+            if e is not None and entry_crossed(side, bar_low, bar_high, e["price"]):
+                if _open(side, e["price"], e["qty"]):
                     pend[side]["entry"] = None
             t = pend[side]["tp"]
-            if t is not None and positions:
-                crossed = price >= t["price"] if side == "long" else price <= t["price"]
-                if crossed:
-                    _close(side, price, t["qty"], ts)
-                    pend[side]["tp"] = None
+            if t is not None and positions and tp_crossed(side, bar_low, bar_high, t["price"]):
+                _close(side, t["price"], t["qty"], ts)
+                pend[side]["tp"] = None
 
         try:
             for _, row in self.df.iterrows():
@@ -650,10 +654,15 @@ class GridBacktester:
                 clock.set_clock(lambda t=epoch: t)
                 self._dgm.update_price(sym, price)
 
-                # 先結算成交（用上一根掛出的 pending）
+                # 先結算成交（用上一根掛出的 pending）；穿越判定吃本根 high/low
+                bar_high = row['high']
+                bar_low = row['low']
+                if not (math.isfinite(bar_high) and math.isfinite(bar_low)
+                        and bar_low > 0 and bar_high >= bar_low):
+                    bar_high = bar_low = price   # 髒 OHLC 退化為 close（保守）
                 for side in ("long", "short"):
                     if cfg.direction in (side, "both"):
-                        _settle(side, price, timestamp)
+                        _settle(side, bar_low, bar_high, timestamp)
 
                 # funding 現金流結算：掃過所有 <= 本根 epoch 的 settlement（data-driven，非 8h 網格）
                 if settlements and epoch > 0:

@@ -66,3 +66,77 @@ def test_short_tp_does_not_fill_when_low_falls_short():
 def test_zero_and_equal_bounds_do_not_raise(side):
     assert isinstance(entry_crossed(side, 0.0, 0.0, 0.0), bool)
     assert isinstance(tp_crossed(side, 100.0, 100.0, 100.0), bool)
+
+
+# ── 整合：backtester 真的用 high/low 且成交於掛單價 ──────────────────
+
+import pandas as pd
+
+from backtest.backtester import GridBacktester
+from backtest.config import Config
+
+
+def _ohlc_df(bars):
+    """bars: list of (open, high, low, close)"""
+    return pd.DataFrame({
+        "open_time": pd.date_range("2024-01-01", periods=len(bars), freq="1min"),
+        "open": [b[0] for b in bars],
+        "high": [b[1] for b in bars],
+        "low": [b[2] for b in bars],
+        "close": [b[3] for b in bars],
+        "volume": [100.0] * len(bars),
+    })
+
+
+def _zero_cost_cfg(**kw):
+    base = dict(symbol="BNBUSDC", initial_balance=100000.0, initial_quantity=1.0,
+                leverage=10, take_profit_spacing=0.004, grid_spacing=0.006,
+                direction="long", terminal_ui_mode=True,
+                fee_pct=0.0, slippage_bps=0.0, funding_enabled=False)
+    base.update(kw)
+    return Config(**base)
+
+
+def test_long_entry_fills_at_limit_price_not_at_close():
+    """G-0a2：零成本下，成交價必須嚴格等於掛單價。
+
+    第 1 根 close=100 → 掛進場限價 100*(1-0.006) = 99.4。
+    第 2 根 low=98（刺穿 99.4）但 close=100（未穿越）→ 正確實作應成交於 99.4。
+    第 3 根收在 99.5（**高於掛單價**）→ 舊實作在這根也不會成交。
+
+    三種實作產生三個互相可區分的 unrealized_pnl（qty=1）：
+      舊（close 判穿越、成交於 close）     → 兩根都不成交 → 0.0，final_equity == 100000
+      半修（low 判穿越、仍成交於 close）    → 成交於 98    → 99.5 - 98.0  = 1.5
+      正確（low 判穿越、成交於 limit）      → 成交於 99.4  → 99.5 - 99.4 = 0.1
+
+    第一條斷言擋掉「沒開倉」（舊實作），第二條擋掉「成交於 close」（半修）。
+
+    註：末根 close 不可設成 99.4 —— 那會讓舊實作在第 3 根以 close=99.4 成交，
+    結果與正確實作在第 2 根成交於 99.4 數值完全相同，fixture 就失去鑑別力。
+    （此陷阱在計畫初稿中真實發生過。）
+    """
+    df = _ohlc_df([
+        (100.0, 100.0, 100.0, 100.0),   # 掛單：entry @ 99.4
+        (100.0, 100.5,  98.0, 100.0),   # low 刺穿 99.4 → 應成交於 99.4
+        (99.5,   99.5,  99.5,  99.5),   # 末根收在 99.5（> 99.4）→ 舊實作仍不成交
+    ])
+    res = GridBacktester(df, _zero_cost_cfg()).run()
+    assert res.final_equity != pytest.approx(100000.0, abs=1e-9), (
+        "沒有開倉：low 未被用來判穿越（舊實作行為）"
+    )
+    assert res.unrealized_pnl == pytest.approx(0.1, abs=1e-6), (
+        f"成交價不等於掛單價 99.4（unrealized={res.unrealized_pnl}；"
+        f"若為 1.5 表示成交於該根 close=98）"
+    )
+
+
+def test_long_entry_does_not_fill_when_low_never_reaches_limit():
+    """負向對照：low 沒到掛單價就不該成交。"""
+    df = _ohlc_df([
+        (100.0, 100.0, 100.0, 100.0),   # entry @ 99.4
+        (100.0, 100.5,  99.5, 100.0),   # low=99.5 > 99.4 → 不成交
+        (100.0, 100.0, 100.0, 100.0),
+    ])
+    res = GridBacktester(df, _zero_cost_cfg()).run()
+    assert res.unrealized_pnl == pytest.approx(0.0, abs=1e-9)
+    assert res.trades_count == 0
