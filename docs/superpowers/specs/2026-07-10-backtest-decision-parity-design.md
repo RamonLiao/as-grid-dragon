@@ -188,9 +188,33 @@ sym_config.take_profit_spacing = bandit_params.take_profit_spacing
 
 FIDELITY_NOTES 第 (4) 條「Bandit 參數優化不在回測 loop 內重現」**低估了嚴重性** —— 不是「優化不重現」，是**間距參數整個對不上**。此缺口影響**全部三個選項**，非僅 GLFT。
 
-**修法**：回測參數釘在實盤有效值 `0.003/0.003`，並明文揭露「bandit 被 pin 住」。
+#### G5-bis：實盤間距之所以恆定，是因為 bandit 有 bug（已查證）
 
-> **獨立可疑點（另案追查，不在本次範圍）**：60001 筆全部同值，而 `thompson_enabled: true`、`update_interval: 10` 的 bandit 理應探索。要嘛 bandit 卡住（潛在 bug），要嘛已收斂。無論何者，回測都必須用實測有效值而非 config 值。
+`current_arm_idx = 0` ⇒ `DEFAULT_ARMS[0] = (grid 0.003, tp 0.003)`，與 60001 筆觀測吻合。bandit 停在此處的原因是**三個獨立缺陷**構成的固定點：
+
+- **BD1（根因）**：`to_dict()` 未持久化 `trade_count_since_update` 與 `pending_trades`。評估需 `update_interval=10` 筆止盈成交（`record_trade` 僅在 `realized_pnl != 0` 時累積，`bot.py:630-638`），**每次重啟計數器歸零**。
+  實測 `log/as_terminal_max.log`：**126 次啟動 / 607 筆止盈成交 / 只有 6 個 run 累積到 10 筆**，絕大多數 run 為 0。
+- **BD2**：`_cold_start_init`（`enhancements.py:237-248`）把**捏造的 reward `0.5`** 寫進 `rewards[4]`、`rewards[5]`、`pull_counts=1`、`total_pulls += 1`，與真實 earned reward 混在同一張表、無法區分。
+- **BD3（推測，未證實）**：`load_state:521` 為 `state.get('current_arm_idx', 0)`，預設 `0`。若曾存在缺該鍵的舊 schema 檔，載入會把 arm 悄悄重置為 0。這能解釋為何是 `0` 而非 `cold_start_arm_idx=4`。
+
+**固定點機制**：重啟 → `_cold_start_init` 播種（`total_pulls: 0→2`）→ `load_state` 讀回 `total_pulls=2` → 無評估 → `stop()` 存回 `total_pulls=2`。**自我複製，永不改變。**
+
+狀態檔實證（`logs/bandit_state.json`）：`total_pulls: 2`（= 兩個種子）、`rewards` 僅 `{4:[0.5], 5:[0.5]}`、`thompson_alpha` 全 `1.0`（`_update_thompson` 從未執行）、`cumulative_reward: 0`（`_update_and_select` 從未執行）。
+
+> **這意味著 #6 的 bandit 持久化在實務上只持久化了一個永不改變的種子。**
+>
+> 而且 #11 的裝死死鎖（多頭側 104h 零成交）**正是 bandit 餓死的直接原因之一** —— 兩個 bug 互相掩護：網格不成交所以 bandit 不學習，bandit 不學習所以間距停在最窄的 arm 0（0.003），最窄的間距讓倉位累積更快、更早撞裝死門檻。
+
+**修法（本 spec 採用）**：**不修 bandit。實驗期間 `bandit.enabled: false`，並把 config 的 `grid_spacing`/`take_profit_spacing` 顯式設為受測值。**
+
+理由：
+1. 修好 bandit 會讓實盤間距變成**非平穩過程**（round-robin 走完 10 arm 各 3 pull = 300 筆止盈成交才進入真正 UCB，期間 `grid_spacing` 在 0.003~0.012 漂移），回測**更難**對標，不是更容易。
+2. 關掉 bandit 後 live 與 backtest 的間距**真的相等**，pin 是事實而非假設。
+3. 一併解掉 §6 風險 1 的 `gamma` 耦合（`bot.py:359-360` 在 `bandit.enabled=false` 時不執行）。
+
+⇒ **原本「回測釘 0.003/0.003」的設計是錯的** —— 它把一個 bug 的產物當成穩定事實。#11 修好後多頭恢復成交，止盈速率上升，遲早有 run 累積到 10 筆，bandit 開始漂移，屆時 pin 靜默失效且無人察覺。
+
+BD1/BD2/BD3 移至獨立任務 **#13**（見 §10），不阻擋本 spec。
 
 ### G6. 沒有爆倉建模 ⇒ 選項 (b) 根本不可評估
 
@@ -351,14 +375,13 @@ peak_margin_usage: float = 0.0      # 全程 margin_usage 最大值（強平距�
 
 ## 6. 已知風險與必須揭露的事項
 
-1. **bandit 覆寫策略參數**（Phase 0 部分處理，其餘揭露）
-   `bot.py:355-360`，`bandit.enabled: true` 時每 tick 覆寫：
-   - `grid_spacing` / `take_profit_spacing`：**無條件覆寫**，實測恆為 `0.003/0.003`（見 G5）。Phase 0 以 pin 住實測值處理。
-   - `gamma`：額外需 `all_enhancements_enabled`。回測沒有 bandit，`gamma` 固定。
+1. **bandit 覆寫策略參數 → 實驗期間必須關閉 bandit**（Phase 0-c 處理）
+   `bot.py:355-360`，`bandit.enabled: true` 時每 tick 覆寫 `grid_spacing` / `take_profit_spacing`（**無條件**）與 `gamma`（額外需 `all_enhancements_enabled`）。
 
-   ⇒ **開 GLFT 的回測結果不能直接對標實盤**，除非實盤同時關掉 `bandit.enabled`。
-   ⇒ 回測全程是「bandit 被凍結在某一 arm」的假設。若 bandit 在實盤重新探索，回測結論即失效。
-   若日後決定採用 GLFT，須先處理此耦合（讓 bandit 不覆寫 `gamma`，或讓回測重現 bandit）。
+   **實驗前置條件（必須，非建議）**：`bandit.enabled: false` + config 顯式設定受測間距。
+   - 此為唯一能讓 live 與 backtest 間距真正相等的手段（詳見 G5-bis）
+   - 一併消除 `gamma` 耦合，因為 `bot.py:359-360` 在 `bandit.enabled=false` 時不執行
+   - **殘留風險**：實驗結論只在「bandit 關閉」的前提下成立。若日後重新啟用 bandit（含修好 #13 之後），間距成為非平穩過程，本輪所有參數結論**必須重新驗證**。此限制須寫入結論文件，不得僅存於本 spec。
 
 2. **GLFT 的天花板**（預期結論，回測應證實）
    `clamp(0.5, 1.5)` + `max(initial_quantity × 0.5, q)` 地板 ⇒ 多頭開倉量最多砍半，永不停止買入。
@@ -434,7 +457,7 @@ G4/G5/G6/G7 是後續所有數字的前提。**在 Phase 0 完成前，回測輸
 |---|---|---|
 | **0-a** | 撮合改為 `high`/`low` 判穿越、成交於**掛單價**；同根雙觸發時不利者（進場）先成交 | **G-0a1**：以 `data/futures/.../BNBUSDC/1m/` 真實 K 線實測，多頭進場成交次數由 86 → 167（±rounding）<br>**G-0a2**：零成本（`slippage_bps=0, fee_pct=0`）下，每筆成交價**嚴格等於**掛單價（斷言無價格改善） |
 | **0-b** | 建模強平：`equity <= maintenance_margin` → 當根全平、`liquidated=True`、終止回測 | **G-0b1**：構造必爆參數組（極高 `threshold_multiplier` + `dead_mode_enabled=False` + 單邊趨勢資料），斷言 `liquidated is True` 且回測提前終止<br>**G-0b2**：正常參數組 `liquidated is False`，且結果與未加此邏輯前一致 |
-| **0-c** | `fee_pct` 改 maker 費率；回測策略參數釘在實盤有效值 `0.003/0.003`；FIDELITY_NOTES 第 (4)(8) 條改寫 | **G-0c1**：cost sensitivity 網格（fee ∈ {2,4} bps × slippage ∈ {0,1,2} bps）可跑出 6 組結果<br>**G-0c2**：FIDELITY_NOTES 不再宣稱「保守下界」 |
+| **0-c** | `fee_pct` 改 maker 費率；**實驗前置：`bandit.enabled: false` + config 顯式設定受測間距**（見 G5-bis，取代原「釘 0.003/0.003」）；FIDELITY_NOTES 第 (4)(8) 條改寫 | **G-0c1**：cost sensitivity 網格（fee ∈ {2,4} bps × slippage ∈ {0,1,2} bps）可跑出 6 組結果<br>**G-0c2**：FIDELITY_NOTES 不再宣稱「保守下界」<br>**G-0c3**：斷言 `bandit.enabled=True` 時 `_grid_step` 後的 `sym_config.grid_spacing` **不等於** config 原值 —— 釘死「bandit 會覆寫」這個事實，防止未來再有人假設 config 值即實際值 |
 
 > **G-0a2 是本階段的核心守門**：它把「幻覺價格改善」變成一個可自動偵測的斷言。零成本下若成交價 ≠ 掛單價，測試必紅。
 
@@ -510,8 +533,12 @@ G4/G5/G6/G7 是後續所有數字的前提。**在 Phase 0 完成前，回測輸
 ## 10. 後續（不在本次範圍）
 
 1. 用本次交付的工具跑 optimizer，定奪 (a)(b)(c) —— progress.md 未決事項第 1 項的本體。**必須走 Phase D 的樣本外流程**
-2. 若採用 GLFT → 先解 §6 風險 1 的 bandit/gamma 耦合
-2bis. **追查 bandit 是否卡住**：`decisions.jsonl` 60001 筆 `grid_spacing`/`take_profit_spacing` 全同值，而 `thompson_enabled: true`、`update_interval: 10`。若 bandit 從未探索，`bandit_state.json` 的持久化與 `select_arm` 路徑有 bug 的可能。**這同時意味著 #6 的 bandit 持久化功能可能從未真正生效過。**
+2. 若採用 GLFT → 先解 §6 風險 1 的 bandit/gamma 耦合（關 bandit 後暫時無此問題）
+2bis. **#13 — bandit 三個缺陷**（已查證，不阻擋 #12，見 G5-bis）：
+   - **BD1**：`to_dict()` 未持久化 `trade_count_since_update` / `pending_trades` ⇒ 重啟即歸零 ⇒ 126 次啟動中僅 6 個 run 累積到 `update_interval=10`。**#6 的持久化實務上只持久化了一個永不改變的種子。**
+   - **BD2**：`_cold_start_init` 注入捏造的 reward `0.5` 進 `rewards[4]`/`rewards[5]`，與真實 earned reward 不可區分。且因 `select_arm()` 冷啟動迴圈從 `i=0` 掃起，此播種對選擇**毫無影響**，只污染統計。
+   - **BD3（推測）**：`load_state:521` 的 `state.get('current_arm_idx', 0)` 預設值會靜默把 arm 重置為 0。
+   - 修好後實盤間距成為非平穩過程（round-robin 需 300 筆止盈成交才進入真正 UCB），**任何在 bandit 關閉前提下得出的參數結論都須重新驗證**。
 3. `glft_controller` 重複實作收斂（`enhancements.py:767` vs `decision.py:107`）
 4. `_sync_positions()` 多空 `unrealizedPnl` 加總（`sync_service.py:73`）
 5. anchor 語意污染（`bot.py:406`）
