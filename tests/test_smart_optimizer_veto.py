@@ -88,6 +88,20 @@ class TestLiquidatedTrialIsPruned:
     """
 
     def test_liquidated_trial_is_pruned_not_scored(self, monkeypatch):
+        """守 spec §7 一票否決在 _optuna_objective 層：呼叫端收到 TrialPruned，
+        不是虛偽的「超低分」。
+
+        若本測試失紅，代表 liquidated=True 的 trial 沒有被正確剪除，
+        而是被某個捕捉所有 Exception 的 handler 吞掉後回傳虛偽的最差分數。
+        這樣優化器會把爆倉組合當成「完成但失敗」的試驗，仍能進入統計計算。
+
+        用 TrialPruned 而非「回傳 -1e6」：TrialPruned 讓 trial 狀態變成
+        PRUNED，完全不進 best_trial / best_params 候選集；回傳 -1e6 只是讓
+        分數難看，trial 仍是 COMPLETE，污染後續統計。TrialPruned 繼承自
+        Exception，若不特別在既有 `except Exception` 之前攔截，會被吞掉，
+        一票否決又一次退化成虛偽的扣分（且難以被發現，因為 log 訊息看起來
+        像普通 trial 失敗）。
+        """
         opt = _optimizer()
 
         # 刻意讓 liquidated=True 的假結果帶著「看起來很棒」的高分，模擬
@@ -108,6 +122,19 @@ class TestPrunedTrialNeverBecomesBest:
     """
 
     def test_pruned_trial_never_becomes_best_params(self, monkeypatch):
+        """整合驗證：跑一個完整的 Optuna study，被剪除的 trial 絕不能贏得
+        best_params，且 study 中必須有 PRUNED 狀態的試驗（證明剪除發生過，
+        而不是被悄悄吞掉了）。
+
+        若本測試失紅，代表優化器選出了「回測期間爆倉但帳面分數很高」的
+        參數組合當最佳解，等於白加了強平建模。沒有強平時，無限加倉 + 不
+        止損在算術上是必勝策略（martingale 恆等式），加了建模後優化器仍
+        選爆倉組，代表 spec §7 的一票否決機制失效。
+
+        測試特意給強平的參數組超高分數，逼優化器「如果沒實施剪除就一定
+        會選中它」。同時檢查 study.trials 中確實有 PRUNED 狀態的紀錄，
+        確保剪除不只是「程式碼裡寫了」而是「真的發生過」。
+        """
         opt = _optimizer()
 
         call_count = {"n": 0}
@@ -156,6 +183,22 @@ class TestTrialPrunedNotSwallowedByExceptExcept:
     """
 
     def test_trial_pruned_propagates_through_optuna_objective(self, monkeypatch):
+        """機制驗證：TrialPruned 不能被既有的 `except Exception` 吞掉。
+
+        背景：TrialPruned 繼承自 Exception。若 _optuna_objective 內包住
+        _run_backtest 的異常捕捉沒有特別排除 TrialPruned，會把它當成
+        「trial 失敗」處理（log 警告 + 回傳 -1e6），trial 狀態改為 COMPLETE
+        而非 PRUNED。這樣一票否決形同虛設，且由於 log 訊息看起來像普通
+        失敗，難以被發現。
+
+        若本測試失紅，代表 TrialPruned 被吞掉了。結果雖然仍是「最終 best
+        沒選爆倉組」（因為 -1e6 分數太低），但機制完全破裂 ——
+        study.trials_dataframe() 會記錄虛偽的失敗，多目標優化的 best_trials
+        會被污染，後續統計無法區分「正確的剪除」和「掩蓋的故障」。
+
+        此測試直接證明 _optuna_objective 的呼叫端收到的是真的 TrialPruned
+        異常，而非被吞掉後的虛偽返回值。
+        """
         opt = _optimizer()
         fake = _fake_result(liquidated=True, return_pct=9.99, sharpe=99.0)
         monkeypatch.setattr(SmartOptimizer, "_run_backtest", lambda self, params: fake)
@@ -187,6 +230,16 @@ class TestNonLiquidatedTrialStillScoredNormally:
     """
 
     def test_non_liquidated_trial_still_scored_normally(self, monkeypatch):
+        """負向對照：liquidated=False 的正常 trial 不能被誤傷。
+
+        spec §7 的一票否決只針對 liquidated=True 的情況。若實作不當把範圍
+        改得太寬（例如對所有 trial 丟 TrialPruned），會誤傷正常的回測結果，
+        導致優化器無法訓練。本測試驗證修復沒有超度打擊 —— 合格組合仍要
+        照常計分並回傳有限的數值。
+
+        若本測試失紅，代表一票否決的實作邏輯有誤，正常 trial 被錯誤地
+        剪除或給了虛偽的分數，優化器會失去合格候選，無法進行優化。
+        """
         opt = _optimizer()
         fake = _fake_result(liquidated=False, return_pct=0.02, sharpe=0.75)
         monkeypatch.setattr(SmartOptimizer, "_run_backtest", lambda self, params: fake)
