@@ -439,6 +439,20 @@ class SmartOptimizer:
         # 執行回測
         try:
             result = self._run_backtest(params)
+
+            # spec §7 一票否決：liquidated=True 的參數組不得進入目標函數評分。
+            # 用 TrialPruned（而非回傳最差分數）是刻意選擇：
+            # PRUNED 狀態的 trial 完全不進 best_trial 候選集，也不污染
+            # study.trials_dataframe()；回傳 -1e6 只是「分數很低」，trial
+            # 仍是 COMPLETE，會出現在統計與 dataframe 裡 —— 這正是本任務要
+            # 修的磨損形式（弱動詞取代規格裡的強動詞「否決」）。
+            if result.liquidated:
+                self.logger.warning(
+                    f"Trial {trial.number} 觸發強平（spec §7 一票否決），"
+                    f"剪除此 trial：params={params!r}"
+                )
+                raise optuna.TrialPruned()
+
             objective_value = self._calculate_objective(result, objective_type)
 
             # 處理無效值
@@ -471,6 +485,12 @@ class SmartOptimizer:
             self._convergence.append(self._best_value)
 
             return objective_value
+
+        except optuna.TrialPruned:
+            # TrialPruned 繼承自 Exception，若不在此攔截，下面的
+            # `except Exception` 會把它吞掉並回傳 -1e6，等同於一票否決
+            # 完全失效。必須重新拋出讓 Optuna study 收到 PRUNED 狀態。
+            raise
 
         except Exception as e:
             self.logger.warning(f"Trial {trial.number} 失敗: {e}")
@@ -515,6 +535,14 @@ class SmartOptimizer:
         try:
             result = self._run_backtest(params)
 
+            # spec §7 一票否決（理由同 _optuna_objective，見上）
+            if result.liquidated:
+                self.logger.warning(
+                    f"Trial {trial.number} 觸發強平（spec §7 一票否決），"
+                    f"剪除此 trial：params={params!r}"
+                )
+                raise optuna.TrialPruned()
+
             duration = time.time() - start_time
             metrics = {
                 'return_pct': result.return_pct,
@@ -540,6 +568,12 @@ class SmartOptimizer:
                 result.max_drawdown,       # 最小化回撤
                 -result.return_pct         # 最大化收益
             )
+
+        except optuna.TrialPruned:
+            # 同 _optuna_objective：TrialPruned 是 Exception 子類，必須在
+            # `except Exception` 之前重新拋出，否則會被吞掉並回傳最差分數
+            # (1e6, 1e6, 1e6)，一票否決失效。
+            raise
 
         except Exception as e:
             self.logger.warning(f"Trial {trial.number} 失敗: {e}")
