@@ -532,11 +532,39 @@ class GridBacktester:
         Returns:
             BacktestResult: 回測結果
         """
+        self._validate_seed()
         # 使用終端 UI 兼容模式
         if self.config.terminal_ui_mode and self.config.initial_quantity > 0:
             return self._run_terminal_ui_mode()
         else:
             return self._run_legacy_mode()
+
+    def _validate_seed(self) -> None:
+        """初始持倉注入的前置驗證：qty>0 但無法如實注入 → 大聲 raise。
+
+        seed 數字會定實盤 threshold_multiplier 並影響入金決策，靜默空倉起跑
+        （值非法被跳過、或路由走沒有 seed 邏輯的 legacy 路徑）是最危險的
+        失效模式（內部 review I1/M1）。qty==0 = 合法不注入，直接跳過。
+        """
+        cfg = self.config
+        for side, qty, px in (("long", cfg.seed_long_qty, cfg.seed_long_price),
+                              ("short", cfg.seed_short_qty, cfg.seed_short_price)):
+            if qty == 0:
+                continue  # 合法：該側不注入
+            if qty < 0 or not math.isfinite(qty):
+                raise ValueError(f"seed_{side}_qty={qty} 非法（qty!=0 時須 >0 且有限）")
+            if px <= 0 or not math.isfinite(px):
+                raise ValueError(f"seed_{side}_price={px} 非法（qty>0 時須 >0 且有限）")
+            if not (cfg.terminal_ui_mode and cfg.initial_quantity > 0):
+                raise ValueError(
+                    f"seed_{side} 已設定但回測會走 legacy 路徑"
+                    f"（terminal_ui_mode={cfg.terminal_ui_mode}, "
+                    f"initial_quantity={cfg.initial_quantity}）——legacy 無 seed 注入，"
+                    "會靜默空倉起跑；seed 僅支援 terminal_ui_mode 主路徑")
+            if cfg.direction not in (side, "both"):
+                raise ValueError(
+                    f"seed_{side} 已設定但 direction={cfg.direction} 不含該側——"
+                    "回測方向與注入方向矛盾")
 
     def _build_bundle(self) -> ManagerBundle:
         """回測用真 manager 實例，全增強關閉 → build_snapshot 回傳中性間距/bias。

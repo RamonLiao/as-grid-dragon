@@ -63,9 +63,15 @@ class Config:
     terminal_ui_mode: bool = True
 
     # 初始持倉注入（seed position）：讓回測從既有倉位起跑，重現生產裝死狀態。
-    # qty>0 時 pre-populate 一張 lot @ seed price（單 lot 均價，pnl 只看價差故等價於
-    # 多 lot 加權平均）；margin 從 balance 扣、不扣 fee（既存倉位非本回測新成交）。
-    # 全 0（預設）→ 與空倉起跑 bit-identical。
+    # qty>0 時 pre-populate 一張 lot @ seed price；margin 從 balance 扣、不扣 fee
+    # （既存倉位非本回測新成交）。全 0（預設）→ 與空倉起跑 bit-identical。
+    # ⚠️ 單 lot ≡ 多 lot 加權均價只對 mark-to-market（unrealized）與一次性全平
+    #    精確——即「凍結後強平」的重現情境。一旦後續 partial TP 逐格成交，
+    #    backtester 的 per-lot FIFO 會先平這張 index-0 的 seed lot（例如多頭 690
+    #    的高價 lot），認列大額 realized 虧損，而生產 Binance hedge mode 是對
+    #    【混合均價】結算。故涉及 seed 部分平倉的實驗（threshold 掃描），
+    #    realized_pnl 與 final_equity 會系統性偏離生產，只可看方向不可當精確預測
+    #    （內部 review I2）。
     seed_long_qty: float = 0.0
     seed_long_price: float = 0.0
     seed_short_qty: float = 0.0

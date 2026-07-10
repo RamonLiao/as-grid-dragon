@@ -83,10 +83,13 @@ def test_seed_at_current_price_no_fee_preserves_balance():
 
 
 def test_seed_zero_is_bit_identical_to_no_seed():
-    """等價守門：seed 全 0 與不設 seed，結果逐位元相同。
+    """守門：顯式設 seed_*=0 與完全不設（用 dataclass 預設），結果逐位元相同。
 
-    單調下跌讓多頭一路開倉，放大任何差異。seed 注入若污染了 seed=0 路徑
-    （例如無條件 append 空 lot、或改了 balance），這條會紅。
+    誠實範圍（內部 review M2）：因 Config 預設本就是 0.0，兩個 arm 走的是
+    同一條 `_qty==0 → continue` 分支，這條測試無法區分「注入邏輯對非零輸入
+    是否污染共享狀態」——那由 `test_seed_*` 系列 + guard `_qty>0` 短路保證。
+    本測試真正守的是：若日後有人把某個 seed 欄位的預設值從 0.0 改掉，
+    explicit-zero 與 default 會分歧 → 這條會紅。屬預設值回歸守門，非污染守門。
     """
     prices = [100.0] * 3 + [99.0, 98.0, 97.0, 96.0, 95.0] + [100.0]
     common = dict(symbol="BNBUSDC", initial_balance=1000.0, initial_quantity=0.5,
@@ -122,42 +125,63 @@ def test_seed_margin_deducted_from_balance():
     )
 
 
-# ── Monkey：極端輸入不得注入垃圾倉位 ──────────────────────────────────
+# ── Monkey：qty>0 但無法如實注入 → 大聲 raise（不得靜默丟棄）──────────
+# 統一原則（內部 review I1/M1）：seed 數字會定實盤 threshold_multiplier 並影響
+# 入金決策。qty==0 = 合法不注入；qty>0 但任何原因無法如實注入（負/inf/price<=0/
+# 方向矛盾/路由走 legacy）→ 靜默空倉起跑是最危險的失效模式，一律 raise ValueError。
 
-def test_seed_negative_price_not_injected():
-    """seed_price <= 0 → 不注入（垃圾價會污染 unrealized/margin）。guard: _px > 0。"""
-    res = GridBacktester(
-        _flat_df([573.0] * 5),
-        _seed_cfg(seed_long_qty=0.58, seed_long_price=-100.0, direction="long"),
-    ).run()
-    assert res.unrealized_pnl == pytest.approx(0.0, abs=1e-9), (
-        f"負 seed_price 應被拒絕注入，unrealized 應為 0，實得 {res.unrealized_pnl}"
-    )
-    assert res.peak_margin_usage == 0.0
-
-
-def test_seed_negative_qty_not_injected():
-    """seed_qty <= 0 → 不注入（負量 = 反向倉位，語義未定義）。guard: _qty > 0。"""
-    res = GridBacktester(
-        _flat_df([573.0] * 5),
-        _seed_cfg(seed_long_qty=-0.5, seed_long_price=690.0, direction="long"),
-    ).run()
-    assert res.unrealized_pnl == pytest.approx(0.0, abs=1e-9)
-    assert res.peak_margin_usage == 0.0
+def test_seed_negative_price_raises():
+    """seed_qty>0 但 price<=0 → raise（不得靜默丟棄成空倉）。"""
+    with pytest.raises(ValueError, match="seed_long_price"):
+        GridBacktester(
+            _flat_df([573.0] * 5),
+            _seed_cfg(seed_long_qty=0.58, seed_long_price=-100.0, direction="long"),
+        ).run()
 
 
-def test_seed_respects_direction_filter():
-    """direction=long 時，seed_short 不得注入（回測方向與注入方向必須一致）。
+def test_seed_negative_qty_raises():
+    """seed_qty < 0（負量 = 反向倉位，語義未定義）→ raise。"""
+    with pytest.raises(ValueError, match="seed_long_qty"):
+        GridBacktester(
+            _flat_df([573.0] * 5),
+            _seed_cfg(seed_long_qty=-0.5, seed_long_price=690.0, direction="long"),
+        ).run()
 
-    guard: cfg.direction in (_side, "both")。否則會憑空造出方向外的倉位。
-    """
-    res = GridBacktester(
-        _flat_df([573.0] * 5),
-        _seed_cfg(seed_short_qty=0.58, seed_short_price=690.0, direction="long"),
-    ).run()
-    assert res.unrealized_pnl == pytest.approx(0.0, abs=1e-9), (
-        f"direction=long 應忽略 seed_short，unrealized 應為 0，實得 {res.unrealized_pnl}"
-    )
+
+def test_seed_infinite_price_raises():
+    """seed_price = inf → raise（inf 通過 `>0` 但會污染 balance/equity 成 nan）。"""
+    with pytest.raises(ValueError, match="seed_long_price"):
+        GridBacktester(
+            _flat_df([573.0] * 5),
+            _seed_cfg(seed_long_qty=0.58, seed_long_price=float("inf"), direction="long"),
+        ).run()
+
+
+def test_seed_direction_mismatch_raises():
+    """direction=long 但設了 seed_short>0 → 矛盾配置，raise（不得靜默忽略）。"""
+    with pytest.raises(ValueError, match="direction"):
+        GridBacktester(
+            _flat_df([573.0] * 5),
+            _seed_cfg(seed_short_qty=0.58, seed_short_price=690.0, direction="long"),
+        ).run()
+
+
+def test_seed_with_legacy_routing_raises():
+    """I1：seed 設了但路由走 _run_legacy_mode（terminal_ui_mode=False 或
+    initial_quantity<=0）→ seed 會被靜默丟棄、回傳空倉結果。這是定實盤參數時
+    最危險的失效，必須 raise 而非靜默空倉。"""
+    with pytest.raises(ValueError, match="terminal_ui_mode|legacy"):
+        GridBacktester(
+            _flat_df([573.0] * 5),
+            _seed_cfg(seed_long_qty=0.58, seed_long_price=690.0, direction="long",
+                      terminal_ui_mode=False),
+        ).run()
+    with pytest.raises(ValueError, match="terminal_ui_mode|legacy"):
+        GridBacktester(
+            _flat_df([573.0] * 5),
+            _seed_cfg(seed_long_qty=0.58, seed_long_price=690.0, direction="long",
+                      initial_quantity=0.0),
+        ).run()
 
 
 def test_seed_margin_exceeding_balance_does_not_crash():
