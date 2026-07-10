@@ -232,6 +232,32 @@ BD1/BD2/BD3 移至獨立任務 **#13**（見 §10），不阻擋本 spec。
 
 **修法**：`fee_pct` 改 maker 費率；三選項一律做 **cost sensitivity 網格**（fee ∈ {2, 4} bps × slippage ∈ {0, 1, 2} bps）。**若排序在此範圍內翻轉，則不得下結論。**
 
+### G8. 權益核算漏掉未平倉位鎖住的 margin —— 主指標本身是錯的
+
+`_open()` 執行 `balance -= (margin + fee)` 並把 `margin` 存進倉位；`_close()` 才 `balance += pos["margin"] + net`。但權益計算是：
+
+```python
+equity = balance + unrealized              # backtester.py:720（equity_curve）
+final_equity = balance + unrealized_pnl    # backtester.py:732
+```
+
+**兩處都漏了 `+ sum(p["margin"] for p in open_positions)`。**
+
+實證（零成本、`initial_balance=1000`、`qty=0.5`、`leverage=10`、單調下跌後收盤價回到起點）：
+
+| | |
+|---|---|
+| 回測 `final_equity` | **988.2** |
+| 正確權益（本金 + 已實現 + 未實現） | **1007.5** |
+| 缺口 | **19.3** = 4 張未平倉位的 margin（每張 ≈ `price × 0.5 / 10`） |
+| `max_drawdown` | 被虛增 |
+
+⇒ **只要有未平倉位，`final_equity` 被系統性低估、`max_drawdown` 被系統性虛增**，偏誤幅度與持倉規模成正比。這**直接命中 §7 欽定的兩個主指標**，且再次不是方向中性 —— 持倉越大的選項被罰越重。
+
+**修法**：`equity = balance + open_margin + unrealized`，兩處一併修。`open_margin` 由 `long_positions` / `short_positions` 的 `margin` 欄位加總。
+
+> 此欄位是 G6（強平建模）的前置：沒有正確的權益，就無法判斷何時觸及維持保證金。
+
 ---
 
 ## 4. 目標與非目標
@@ -353,7 +379,7 @@ def decide_reduce(inputs: ReduceInputs) -> Optional[ReduceIntent]: ...
 - `_max_enh` 改由 `Config` 建構：`MaxEnhancement(all_enhancements_enabled=cfg.all_enhancements_enabled, glft_enabled=cfg.glft_enabled, gamma=cfg.gamma)`
 - `DecisionInputs` 補新欄位：`dead_mode_enabled=cfg.dead_mode_enabled`、`now=epoch`、`best_bid=best_ask=price`（1m K 線無盤口，用 close 代理，揭露）、`last_order_time_*` 由回測自行維護
   > 1m K 線的間隔（60s）恆大於節流窗（10s），故 `pos==0` 節流在回測中**永不 binding**，每根 K 線都會重掛。這是與 live 的已知節奏差異，方向中性。
-- **（Phase A）** `margin_usage` 建模：`(long_pos + short_pos) × price / leverage / equity`，`equity <= 0` 時定義為 `inf`，避免除零。Phase A 僅**觀測**（餵 `peak_margin_usage`），不參與任何決策。
+- **（Phase 0-b）** `margin_usage` 建模：`(long_pos + short_pos) × price / leverage / equity`，`equity <= 0` 時定義為 `inf`，避免除零。**`equity` 須為修正後的 `balance + open_margin + unrealized`（G8）**。Phase 0-b 供強平判斷與 `peak_margin_usage` 觀測。
 - **（Phase B）** 每根 K 線接 `risk.decide_trailing()` 與 `risk.decide_reduce()`，開始**消費** `margin_usage`（節奏差異見 §6 風險 3）
 - `_legacy_grid_decision` / `_run_legacy_mode` 加 deprecated docstring
 
@@ -456,7 +482,7 @@ G4/G5/G6/G7 是後續所有數字的前提。**在 Phase 0 完成前，回測輸
 | 子階段 | 內容 | 守門 |
 |---|---|---|
 | **0-a** | 撮合改為 `high`/`low` 判穿越、成交於**掛單價**；同根雙觸發時不利者（進場）先成交 | **G-0a1**：以 `data/futures/.../BNBUSDC/1m/` 真實 K 線實測，多頭進場成交次數由 86 → 167（±rounding）<br>**G-0a2**：零成本（`slippage_bps=0, fee_pct=0`）下，每筆成交價**嚴格等於**掛單價（斷言無價格改善） |
-| **0-b** | 建模強平：`equity <= maintenance_margin` → 當根全平、`liquidated=True`、終止回測 | **G-0b1**：構造必爆參數組（極高 `threshold_multiplier` + `dead_mode_enabled=False` + 單邊趨勢資料），斷言 `liquidated is True` 且回測提前終止<br>**G-0b2**：正常參數組 `liquidated is False`，且結果與未加此邏輯前一致 |
+| **0-b** | **先修權益核算**（G8：`equity = balance + open_margin + unrealized`，兩處），**再**建模強平：`equity <= maintenance_margin` → 當根全平、`liquidated=True`、終止回測 | **G-0b0**：零成本、收盤價回到起點 → `final_equity == initial_balance + realized + unrealized`（釘死 G8，改前必紅：實測 988.2 vs 1007.5）<br>**G-0b1**：構造必爆參數組（極高 `threshold_multiplier` + `dead_mode_enabled=False` + 單邊趨勢資料），斷言 `liquidated is True` 且回測提前終止<br>**G-0b2**：正常參數組 `liquidated is False` |
 | **0-c** | `fee_pct` 改 maker 費率；**實驗前置：`bandit.enabled: false` + config 顯式設定受測間距**（見 G5-bis，取代原「釘 0.003/0.003」）；FIDELITY_NOTES 第 (4)(8) 條改寫 | **G-0c1**：cost sensitivity 網格（fee ∈ {2,4} bps × slippage ∈ {0,1,2} bps）可跑出 6 組結果<br>**G-0c2**：FIDELITY_NOTES 不再宣稱「保守下界」<br>**G-0c3**：斷言 `bandit.enabled=True` 時 `_grid_step` 後的 `sym_config.grid_spacing` **不等於** config 原值 —— 釘死「bandit 會覆寫」這個事實，防止未來再有人假設 config 值即實際值 |
 
 > **G-0a2 是本階段的核心守門**：它把「幻覺價格改善」變成一個可自動偵測的斷言。零成本下若成交價 ≠ 掛單價，測試必紅。
