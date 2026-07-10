@@ -702,7 +702,26 @@ class SmartOptimizer:
 
             pareto_front = None
             best_params = study.best_params
-            best_trial_obj = self._trials[study.best_trial.number] if self._trials else None
+            # 不可用位置索引 self._trials[study.best_trial.number]：
+            # self._trials 只在 COMPLETE 路徑 append（見 _optuna_objective），
+            # 一旦有任何 trial 被 TrialPruned（spec §7 一票否決的常態路徑），
+            # self._trials 的位置索引就不再等於 optuna 的全域 trial.number，
+            # 輕則 IndexError 讓 optimize() 整個炸掉，重則悄悄配對到別的
+            # trial 的 metrics（使用者看到的 Sharpe/return/drawdown 屬於
+            # 另一組參數 —— 這個 optimizer 輸出會被用來選實盤參數）。
+            # 改用 trial_number 精確查找，不依賴 append 順序與 trial.number
+            # 對齊這個已被打破的假設。
+            best_num = study.best_trial.number
+            best_trial_obj = next(
+                (t for t in self._trials if t.trial_number == best_num), None
+            )
+            if best_trial_obj is None:
+                self.logger.warning(
+                    f"best_trial.number={best_num} 在 self._trials 裡找不到"
+                    f"（len={len(self._trials)}）。這代表 trial 收集邏輯有 bug："
+                    f"best trial 理論上必然是 COMPLETE 狀態，應該存在於 "
+                    f"self._trials 中。best_metrics 將回退為空字典。"
+                )
             best_metrics = best_trial_obj.metrics if best_trial_obj else {}
 
         self._study = study

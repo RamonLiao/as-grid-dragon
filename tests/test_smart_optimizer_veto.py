@@ -248,3 +248,159 @@ class TestNonLiquidatedTrialStillScoredNormally:
         value = opt._optuna_objective(trial, OptimizationObjective.SHARPE)
 
         assert value == pytest.approx(0.75)
+
+
+class TestOptimizeSurvivesPositionIndexVsTrialNumberMismatch:
+    """dual-review R3 Critical：self._trials 的位置索引 != optuna 的
+    trial.number，一旦有 trial 被剪除就會炸掉或悄悄配錯資料。
+
+    背景：本 branch 把強平從「return -1e6（COMPLETE，會 append 進
+    self._trials，位置索引與 trial.number 對齊）」改成「raise
+    TrialPruned（PRUNED，完全不 append 進 self._trials）」。這修好了
+    spec §7 一票否決，但同時打破了一個從沒人寫下來的不變式：
+    `self._trials[i].trial_number == i`。這個不變式在 prune 幾乎不會
+    發生時剛好成立；現在 prune 是常態路徑（任何強平的 trial 都會被
+    剪除），於是 `optimize()` 裡 `self._trials[study.best_trial.number]`
+    這行位置索引直接錯位。
+
+    optuna 的 trial.number 是「含 PRUNED trial」的全域序號；
+    self._trials 只含 COMPLETE trial 且照 append 順序排列。只要曾經有
+    任何 trial 被剪除，這兩者就不再相等。
+    """
+
+    def test_optimize_survives_pruned_trials_and_reports_the_winners_own_metrics(
+        self, monkeypatch
+    ):
+        """整合驗證：跑真正的 optimize()（不是手工建 study），前幾個 trial
+        強平被剪除，最佳解落在最後一個 trial —— 修復前這裡應該直接
+        IndexError，因為 study.best_trial.number（全域序號，含 PRUNED）
+        會超出 self._trials（只含 COMPLETE）的長度。
+
+        若本測試失紅（IndexError），代表 optimize() 的 best_metrics 抓取
+        邏輯又走回了「用位置索引 self._trials[trial.number]」這個在
+        prune 常態化後不成立的假設，會直接把 run_smart_optimization 這個
+        對外服務層 API 整個炸掉。
+        """
+        opt = _optimizer()
+
+        call_count = {"n": 0}
+
+        def fake_run_backtest(self, params):
+            call_count["n"] += 1
+            n = call_count["n"]
+            if n <= 3:
+                # 前 3 個 trial（trial_number 0,1,2）強平，全部被剪除，
+                # 不會進 self._trials。
+                return _fake_result(liquidated=True, return_pct=9.99, sharpe=99.0)
+            # 之後遞增的 sharpe，最佳解落在最後一個 trial
+            # （trial_number = n - 1 = 9，是全域序號裡的最大值）。
+            return _fake_result(
+                liquidated=False, return_pct=0.01 * n, sharpe=0.1 * n
+            )
+
+        monkeypatch.setattr(SmartOptimizer, "_run_backtest", fake_run_backtest)
+
+        result = opt.optimize(
+            n_trials=10,
+            objective=OptimizationObjective.SHARPE,
+            n_startup_trials=10,
+            show_progress=False,
+        )
+
+        # 修復前：study.best_trial.number=9（全域序號），
+        # len(self._trials)=7（只有 trial 3..9 這 7 個 COMPLETE），
+        # self._trials[9] -> IndexError，整個 optimize() 炸掉。
+        assert result.best_metrics != {}
+        # best_metrics 必須真的屬於贏家那個 trial（sharpe=0.1*10=1.0），
+        # 不是位置索引錯位後配到的別的 trial。
+        assert result.best_metrics["sharpe_ratio"] == pytest.approx(1.0)
+
+    def test_optimize_reports_correct_metrics_when_prune_precedes_winner(
+        self, monkeypatch
+    ):
+        """Failure B（靜默錯配）：prune 發生在最佳 trial 之前，且
+        best_trial.number 仍小於 len(self._trials)，所以位置索引不會
+        IndexError —— 但會悄悄配到另一個 trial 的 metrics。
+
+        這個失敗模式不會讓程式崩潰，使用者會看到「看起來正常」的優化
+        結果，但 best_metrics（Sharpe / return / drawdown）其實屬於
+        另一組參數。而這個 optimizer 的輸出會被用來選實盤參數 —— 錯配
+        的後果是使用者依據錯的績效數字上線一組參數。
+
+        若本測試失紅，代表 best_metrics 的內容跟 best_params 對不上：
+        贏家的 sharpe 應該是全場最高（99.0），若拿到的是別的數字，代表
+        位置索引又配錯了 trial。
+        """
+        opt = _optimizer()
+
+        call_count = {"n": 0}
+
+        def fake_run_backtest(self, params):
+            call_count["n"] += 1
+            n = call_count["n"]
+            if n <= 2:
+                # trial_number 0,1 強平被剪除。
+                return _fake_result(liquidated=True, return_pct=9.99, sharpe=99.0)
+            if n == 3:
+                # trial_number=2：全場最佳解，sharpe 遠高於其餘所有 trial。
+                return _fake_result(liquidated=False, return_pct=0.5, sharpe=99.0)
+            # trial_number 3..9：sharpe 遞增但遠低於贏家，避免蓋過它。
+            return _fake_result(
+                liquidated=False, return_pct=0.01 * n, sharpe=0.1 * (n - 3)
+            )
+
+        monkeypatch.setattr(SmartOptimizer, "_run_backtest", fake_run_backtest)
+
+        result = opt.optimize(
+            n_trials=10,
+            objective=OptimizationObjective.SHARPE,
+            n_startup_trials=10,
+            show_progress=False,
+        )
+
+        # self._trials 的 append 順序：[trial2(sharpe=99), trial3(0.1),
+        # trial4(0.2), ..., trial9(0.7)]，共 8 筆。best_trial.number=2，
+        # 2 < len(self._trials)=8，位置索引 self._trials[2] 不會
+        # IndexError，但拿到的其實是 trial_number=4（sharpe=0.2），
+        # 不是贏家 trial_number=2（sharpe=99.0）—— 這就是靜默錯配。
+        assert result.best_metrics["sharpe_ratio"] == pytest.approx(99.0)
+
+
+class TestMultiObjectivePathDoesNotUsePositionalTrialIndex:
+    """驗證多目標路徑（_multi_objective / pareto_front）沒有同樣的位置
+    索引假設。
+
+    `grep -n "_trials\\[" backtest/smart_optimizer.py` 確認全檔唯一一處
+    對 self._trials 做位置索引的地方就是本次修掉的那一行（單目標路徑）。
+    _multi_objective 收集 best_trials 的方式完全不同：它直接從
+    `study.best_trials` 拿 `trial.params` / `trial.values`（見
+    `optimize()` 裡 objective == MULTI_OBJECTIVE 分支，約 line 656-672），
+    從未用 `self._trials[trial.number]` 這種位置索引去查 metrics，所以
+    不受本次修的 bug 影響 —— 不需要額外的整合測試來證明「沒有這個 bug」。
+
+    注意（範圍外發現，未在本次修復）：多目標路徑本身有一個*不同*且更早
+    存在的 bug，與本次 Critical 無關：`optimize()` line 743
+    `study.best_value if hasattr(study, 'best_value') else self._best_value`
+    —— Optuna 的 `Study.best_value` 是一個 property，`hasattr()` 恆真，
+    但在多目標 study 上存取它會拋 `RuntimeError`（不是 `AttributeError`），
+    所以這個 hasattr 防呆完全沒用。這會讓任何呼叫
+    `optimize(objective=MULTI_OBJECTIVE)` 的路徑，只要曾經有一個 trial
+    被剪除（讓 study 裡同時存在 PRUNED 與 COMPLETE），就在建構
+    SmartOptimizationResult 時整個炸掉。這個 bug 不在本次白名單
+    （backtest/smart_optimizer.py 的其餘正確性）授權範圍內的「同一個
+    position-index 假設」，是獨立問題，留給後續任務處理，此處僅記錄。
+    """
+
+    def test_no_positional_trial_index_outside_the_fixed_line(self):
+        """結構驗證：全檔只有一處位置索引寫法，且已修復。"""
+        import re
+        from pathlib import Path
+
+        src = Path("backtest/smart_optimizer.py").read_text(encoding="utf-8")
+        matches = [
+            line for line in src.splitlines() if re.search(r"_trials\[", line)
+        ]
+        # 唯一應該存在的是說明性註解裡提到 self._trials[study.best_trial.number]
+        # 的那一行文字，不是真正的可執行索引語句。
+        assert len(matches) == 1
+        assert "不可用位置索引" in matches[0]
