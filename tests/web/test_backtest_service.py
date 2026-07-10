@@ -28,8 +28,8 @@ def test_to_backtest_config_golden():
     assert cfg.leverage == 20
     assert cfg.take_profit_spacing == 0.004     # 兩邊皆小數比例，1:1
     assert cfg.grid_spacing == 0.006
-    assert cfg.limit_multiplier == 5.0          # 不帶 → backtester 用預設 5/14
-    assert cfg.threshold_multiplier == 20.0
+    assert cfg.limit_multiplier == 5.0          # 不帶 → backtester 用預設 5.0（grid_engine/config.py:48）
+    assert cfg.threshold_multiplier == 20.0     # 預設 20.0（grid_engine/config.py:49）
     assert cfg.initial_balance == 1000.0
     # 成本模型：單次回測用引擎預設（保真）
     assert cfg.fee_pct == 0.0002   # maker（網格全是限價單），見 spec G7

@@ -103,6 +103,7 @@ class Config:
             "slippage_bps": self.slippage_bps,
             "funding_enabled": self.funding_enabled,
             "maintenance_margin_rate": self.maintenance_margin_rate,
+            "dead_mode_enabled": self.dead_mode_enabled,
         }
 
     @classmethod
@@ -130,6 +131,7 @@ class Config:
             funding_enabled=data.get("funding_enabled", True)
                 if isinstance(data.get("funding_enabled", True), bool) else True,
             maintenance_margin_rate=data.get("maintenance_margin_rate", 0.005),
+            dead_mode_enabled=data.get("dead_mode_enabled", True),
         )
 
     def save(self, filepath: str):

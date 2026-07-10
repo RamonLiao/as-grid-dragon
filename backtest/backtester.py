@@ -31,12 +31,12 @@ from backtest.liquidation import margin_usage, should_liquidate
 # 回測保真限制（與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
     "回測保真限制: "
-    "(1) 限價單撮合——用該根 high/low 判穿越、成交於掛單價；"
+    "(1) 限價單撮合——用該根 high/low 判穿越、成交於掛單價（撮合價=掛單價；執行成本 haircut 另行疊加，見 (7)）；"
     "無 queue position、無部分成交、無排隊落空(maker 單的真實風險); "
     "(2) flat-entry 近似——零倉位 bootstrap 沿用收盤價觸發即進場; "
     "(3) leading/ATR/GLFT 增強於回測退化為中性(全關); "
     "(4) Bandit 不在回測 loop 內重現。實盤 bandit.enabled=true 時會【無條件覆寫】"
-    "grid_spacing/take_profit_spacing(bot.py:355-358)，config 值不生效——"
+    "grid_spacing/take_profit_spacing(grid_engine/bot.py:355-358)，config 值不生效——"
     "故實驗期間必須 bandit.enabled=false 並顯式設定受測間距，否則回測與實盤跑的不是同一個策略; "
     "(5) 決策同源實盤 decide()，實盤每 10s 追價重掛(pos==0)於回測以 should_adjust 偏離門檻近似; "
     "(6) 進場量語意=固定幣量(=initial_quantity，同實盤下單)，舊/新 equity 曲線不可直接比較; "
@@ -640,7 +640,7 @@ class GridBacktester:
         def _settle(side: str, bar_low: float, bar_high: float, ts) -> None:
             """結算既有 pending（上一根掛的單）對本根 K 線的成交。
 
-            穿越用 high/low 判定（限價單盤中觸及即成交）；成交價一律是掛單價。
+            穿越用 high/low 判定（限價單盤中觸及即成交）；成交價一律是掛單價（執行成本 haircut 已於 _open/_close 內另行疊加）。
             close 不再參與撮合——它既不決定有沒有成交，也不決定成交在哪。
             同根雙觸發時 entry 先於 tp（保守：先增加曝險）。止盈單是 reduce_only，
             交易所只允許平「成交當下已存在」的倉位；entry 先成交會讓 _close 的
