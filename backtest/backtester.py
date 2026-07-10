@@ -28,22 +28,30 @@ from backtest.costs import apply_slippage, funding_charge
 from backtest.matching import entry_crossed, tp_crossed
 from backtest.liquidation import margin_usage, should_liquidate
 
-# 回測保真限制（樂觀成交模型，與實盤的已知差異）。寫入 BacktestResult.notes。
+# 回測保真限制（與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
     "回測保真限制: "
-    "(1) 樂觀成交——限價單以當根收盤價成交、無 queue/部分成交佇列; "
+    "(1) 限價單撮合——用該根 high/low 判穿越、成交於掛單價；"
+    "無 queue position、無部分成交、無排隊落空(maker 單的真實風險); "
     "(2) flat-entry 近似——零倉位 bootstrap 沿用收盤價觸發即進場; "
     "(3) leading/ATR/GLFT 增強於回測退化為中性(全關); "
-    "(4) Bandit 參數優化不在回測 loop 內重現; "
+    "(4) Bandit 不在回測 loop 內重現。實盤 bandit.enabled=true 時會【無條件覆寫】"
+    "grid_spacing/take_profit_spacing(bot.py:355-358)，config 值不生效——"
+    "故實驗期間必須 bandit.enabled=false 並顯式設定受測間距，否則回測與實盤跑的不是同一個策略; "
     "(5) 決策同源實盤 decide()，實盤每 10s 追價重掛(pos==0)於回測以 should_adjust 偏離門檻近似; "
     "(6) 進場量語意=固定幣量(=initial_quantity，同實盤下單)，舊/新 equity 曲線不可直接比較; "
-    "(7) 成本模型(主路徑)——slippage_bps 執行成本 haircut(逆選擇代理，非訂單簿滑價；"
-    "網格 maker 單實際成交價≤掛單價，此 bps 當保守緩衝) + funding 現金流結算"
+    "(7) 成本模型(主路徑)——fee_pct 預設 maker 0.02%(網格全是限價單) + "
+    "slippage_bps 執行成本 haircut(逆選擇代理，非訂單簿滑價；maker 的風險是逆選擇與排隊落空，"
+    "用滑價代理量級可能差一個數量級) + funding 現金流結算"
     "(真實歷史 settlement 時點，缺漏時點 rate=0；notional 用 bar close 當 mark price 代理"
-    "；funding 快取按 symbol 不按區間，同 symbol 更寬回測區間需先刪 data/funding/<symbol>.csv 重抓，否則尾段缺漏 rate=0); "
-    "(8) 保守堆疊——fee_pct 預設 0.04%(taker)已對 maker 網格偏保守，疊 slippage haircut → "
-    "回測績效偏低估、屬刻意保守下界; "
-    "(9) legacy 路徑(initial_quantity<=0)不含成本模型。"
+    "；funding 快取按 symbol 不按區間，同 symbol 更寬回測區間需先刪 data/funding/<symbol>.csv 重抓); "
+    "(8) 【不宣稱保守下界】——成本按成交次數收，會系統性偏袒低換手方案；"
+    "比較換手率差異大的方案時必須做 cost sensitivity(scripts/cost_sensitivity.py)，"
+    "排序若在合理成本範圍內翻轉則不得下結論; "
+    "(9) 強平模型——維持保證金=倉位名目×maintenance_margin_rate(單一費率代理幣安分層階梯)；"
+    "觸發即全平並終止回測，liquidated=True 的參數組應一票否決; "
+    "(10) margin_usage 為單 symbol，實盤 state.margin_usage 是帳戶層(跨 symbol)，結論不得外推; "
+    "(11) legacy 路徑(initial_quantity<=0)不含成本模型、不含強平、不含 high/low 撮合。"
 )
 
 

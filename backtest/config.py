@@ -34,7 +34,7 @@ class Config:
     # 風控參數
     max_drawdown: float = 0.5           # 最大回撤 50%
     max_positions: int = 50             # 最大持倉數
-    fee_pct: float = 0.0004             # 手續費 0.04%
+    fee_pct: float = 0.0002             # maker 手續費 0.02%（網格全是限價單；taker 為 0.05%）
 
     # 成本模型（fidelity-first：預設全開）
     slippage_bps: float = 0.0001       # 每次成交向不利方向偏移比例（執行成本 haircut）
@@ -118,7 +118,7 @@ class Config:
             grid_spacing=data.get("grid_spacing", 0.006),
             max_drawdown=data.get("max_drawdown", 0.5),
             max_positions=data.get("max_positions", 50),
-            fee_pct=data.get("fee_pct", 0.0004),
+            fee_pct=data.get("fee_pct", 0.0002),
             direction=data.get("direction", "both"),
             grid_refresh_interval=data.get("grid_refresh_interval", 5),
             position_threshold=data.get("position_threshold", 500.0),

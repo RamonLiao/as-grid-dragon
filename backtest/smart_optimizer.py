@@ -228,7 +228,7 @@ class SmartOptimizer:
         "leverage": 20,           # 槓桿固定
         "max_positions": 50,
         "max_drawdown": 0.5,
-        "fee_pct": 0.0004,
+        "fee_pct": 0.0002,
     }
 
     def __init__(
@@ -300,7 +300,7 @@ class SmartOptimizer:
             direction=self.base_config.direction,
             max_drawdown=self.fixed_params.get('max_drawdown', 0.5),
             max_positions=self.fixed_params.get('max_positions', 50),
-            fee_pct=self.fixed_params.get('fee_pct', 0.0004),
+            fee_pct=self.fixed_params.get('fee_pct', 0.0002),
             position_threshold=position_threshold,
             position_limit=position_limit,
             limit_multiplier=limit_mult,

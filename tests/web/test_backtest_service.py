@@ -32,7 +32,7 @@ def test_to_backtest_config_golden():
     assert cfg.threshold_multiplier == 20.0
     assert cfg.initial_balance == 1000.0
     # 成本模型：單次回測用引擎預設（保真）
-    assert cfg.fee_pct == 0.0004
+    assert cfg.fee_pct == 0.0002   # maker（網格全是限價單），見 spec G7
     assert cfg.funding_enabled is True
     assert cfg.position_threshold == 0.0
     assert cfg.position_limit == 0.0
