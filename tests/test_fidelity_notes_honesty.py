@@ -139,6 +139,27 @@ class TestFidelityNotesHonesty:
             "若刪除此提及，使用者會誤以為強平只看收盤價（與撮合的 high/low 邏輯矛盾）。"
         )
 
+    def test_notes_disclose_max_drawdown_uses_intrabar_trough(self):
+        """max_drawdown 的谷底改用盤中最不利權益（dual-review R1 第二輪 Important #2）必須揭露。
+
+        「盤中觸及才是真相」原則此前只套用了一半：撮合、強平都已修正，
+        max_drawdown（spec §7 兩個主指標之一）仍從收盤價的 equity_curve 算出，
+        對盤中反覆逼近爆倉、收盤回升的策略系統性低估尾部風險。notes 必須說明
+        修正後的行為，否則使用者無法知道 max_drawdown 谷底用的是哪個價格、
+        也無法知道它可能比 equity_curve 上看到的最低點更低。
+
+        若有人把 max_drawdown 改回純收盤價、或刪掉這段揭露卻沒同步改實作，
+        本測試轉紅。
+        """
+        assert "max_drawdown" in FIDELITY_NOTES, (
+            "FIDELITY_NOTES 應明確提及 max_drawdown 的谷底計算基準。"
+        )
+        assert "盤中最不利權益" in FIDELITY_NOTES, (
+            "FIDELITY_NOTES 應說明 max_drawdown 的谷底用『盤中最不利權益』，"
+            "而非收盤價的 equity_curve。若刪除此提及，使用者無法知道 max_drawdown "
+            "可能比 equity_curve 上看到的最低點更低。"
+        )
+
     def test_notes_fee_claim_matches_actual_default(self):
         """成本模型的文件與實作必須同步
 

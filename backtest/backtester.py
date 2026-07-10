@@ -55,6 +55,11 @@ FIDELITY_NOTES = (
     "實際市場中三者(entry/tp/liquidation)的真實時序未知；"
     "peak_margin_usage 亦以盤中最不利價計算；觸發即以該最不利價全平並終止回測，"
     "liquidated=True 的參數組應一票否決; "
+    "(9b) max_drawdown 的谷底同樣改用本根盤中最不利權益(不是收盤價的 equity_curve)，"
+    "峰頂仍用收盤權益的 running max(high-water mark 用收盤價是標準做法)——"
+    "同一個「盤中觸及才是真相」的論證：盤中反覆逼近爆倉、收盤回升的策略若谷底吃收盤價，"
+    "尾部風險會被系統性低估；equity_curve 本身恆用收盤價(供繪圖用，不是風險指標)，"
+    "故 min(equity_curve) 可能高於 max_drawdown 隱含的谷底，兩者不保證一致; "
     "(10) margin_usage 為單 symbol，實盤 state.margin_usage 是帳戶層(跨 symbol)，結論不得外推; "
     "(11) legacy 路徑(initial_quantity<=0)不含成本模型、不含強平、不含 high/low 撮合。"
 )
@@ -588,6 +593,7 @@ class GridBacktester:
             fund_i += 1
 
         max_equity = balance
+        min_worst_equity = balance  # max_drawdown 谷底：盤中最不利權益的全程最小值
         peak_margin_usage = 0.0
         liquidated = False
         long_positions: list = []
@@ -782,6 +788,13 @@ class GridBacktester:
                     ((p, _equity_at(p)) for p in (bar_low, bar_high)),
                     key=lambda t: t[1],
                 )
+                # max_drawdown 的谷底同樣吃「盤中最不利價」——同一個「盤中觸及才是
+                # 真相」的論證：撮合(1)與強平(9)都已套用，若谷底仍用收盤價的
+                # equity_curve 算，盤中反覆逼近爆倉、收盤回升的策略會被系統性低估
+                # 尾部風險（dual-review R1 第二輪 Important #2）。峰頂仍用收盤價
+                # 的 max_equity（high-water mark 用收盤價是標準做法）。
+                if worst_equity < min_worst_equity:
+                    min_worst_equity = worst_equity
 
                 mu = margin_usage(long_pos_qty, short_pos_qty, worst_price, leverage, worst_equity)
                 if mu > peak_margin_usage:
@@ -846,7 +859,11 @@ class GridBacktester:
         return BacktestResult(
             final_equity=final_equity,
             return_pct=(final_equity - self.config.initial_balance) / self.config.initial_balance,
-            max_drawdown=1 - (min(e[2] for e in equity_curve) / max_equity) if equity_curve else 0,
+            # 谷底用盤中最不利權益(min_worst_equity)、峰頂用收盤權益(max_equity)——
+            # 不對稱是刻意的，見上方迴圈內註解與 FIDELITY_NOTES (9)。
+            # equity_curve 恆用收盤價，故 min(e[2] for e in equity_curve) 可能高於
+            # 此處隱含的谷底，兩者不保證一致。
+            max_drawdown=1 - (min_worst_equity / max_equity) if equity_curve else 0,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl,
             total_pnl=realized_pnl + unrealized_pnl,

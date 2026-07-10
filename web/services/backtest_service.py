@@ -67,7 +67,24 @@ def _ensure_open_time(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+LIQUIDATION_WARNING = (
+    "⚠️ 此參數組在回測期間觸發強平（spec §7 一票否決）：結果不可用作最佳解，"
+    "final_equity 與 max_drawdown 皆不具參考價值。\n"
+)
+
+
 def backtest_result_to_view(result: BacktestResult) -> dict:
+    """BacktestResult → 頁面渲染用 dict。
+
+    liquidated=True 時在 notes 最前面插入一票否決警告（LIQUIDATION_WARNING）。
+    notes 是前端已經在渲染的欄位，這個警告不需要改任何 UI 程式碼就會出現在畫面上：
+    不變式由持有它的模組（本函式）保證，不外包給消費端（Streamlit 頁面）自行判讀
+    liquidated flag。liquidated 本身也一併暴露在 view dict 裡供未來 UI 使用，但
+    即使沒有任何 UI 改動，警告文字已經生效。
+    """
+    notes = result.notes
+    if result.liquidated:
+        notes = LIQUIDATION_WARNING + notes
     return {
         "return_pct": result.return_pct,
         "max_drawdown": result.max_drawdown,
@@ -81,7 +98,9 @@ def backtest_result_to_view(result: BacktestResult) -> dict:
         "final_equity": result.final_equity,
         "trade_history": result.trade_history,
         "equity_curve": result.equity_curve,
-        "notes": result.notes,
+        "notes": notes,
+        "liquidated": result.liquidated,
+        "peak_margin_usage": result.peak_margin_usage,
     }
 
 
