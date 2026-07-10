@@ -2,6 +2,7 @@
 參數優化器模組
 網格搜尋與參數優化
 """
+import logging
 import pandas as pd
 from typing import List, Dict, Optional, Callable, Tuple
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing
 from .config import Config
 from .backtester import GridBacktester, BacktestResult
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -85,10 +88,38 @@ class GridOptimizer:
         })
 
     def _run_single_backtest(self, params: Dict) -> Dict:
-        """執行單次回測"""
+        """執行單次回測
+
+        批次路徑（網格搜尋 / grid search）：should_liquidate() 對無效輸入
+        （非有限 price/equity、負倉位等）會 raise ValueError（見
+        backtest/liquidation.py 的 defense-in-depth 設計）。正常路徑不會
+        觸發它（backtester.py 主迴圈已擋掉髒 K 線），但若上游防禦有洞，
+        炸掉的不能是整個批次優化 —— 淘汰這一組參數、大聲記錄，讓其餘
+        組合繼續跑。只 catch ValueError：其他例外類型（含 KeyboardInterrupt）
+        一律照常往上炸，不吞。
+        """
         config = self._create_config(params)
-        bt = GridBacktester(self.df.copy(), config)
-        result = bt.run()
+        try:
+            bt = GridBacktester(self.df.copy(), config)
+            result = bt.run()
+        except ValueError as e:
+            logger.warning(
+                "參數組合觸發 should_liquidate() 的無效輸入防線，淘汰此組並繼續: "
+                "params=%r, error=%s", params, e
+            )
+            return {
+                **params,
+                "return_pct": -1.0,
+                "max_drawdown": 1.0,
+                "trades": 0,
+                "win_rate": 0.0,
+                "profit_factor": 0.0,
+                "sharpe_ratio": -1e6,
+                "final_equity": 0.0,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "liquidated": True,
+            }
 
         return {
             **params,
@@ -100,7 +131,8 @@ class GridOptimizer:
             "sharpe_ratio": result.sharpe_ratio,
             "final_equity": result.final_equity,
             "realized_pnl": result.realized_pnl,
-            "unrealized_pnl": result.unrealized_pnl
+            "unrealized_pnl": result.unrealized_pnl,
+            "liquidated": result.liquidated,
         }
 
     def generate_param_combinations(self) -> List[Dict]:
