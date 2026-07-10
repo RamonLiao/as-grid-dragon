@@ -20,7 +20,9 @@ class OptimizationResult:
     """優化結果"""
     best_config: Config
     best_result: BacktestResult
-    all_results: pd.DataFrame
+    all_results: pd.DataFrame  # 全部參數組合結果（含淘汰/強平列），僅依 metric 排序，
+                               # 【不保證第一列未被淘汰】。要取最佳解請用 best_params / best_result，
+                               # 或自行用 liquidated 欄過濾。前端呈現時務必對 liquidated 列做視覺區分。
     param_importance: Dict[str, float]
 
     def __str__(self) -> str:
@@ -195,7 +197,12 @@ class GridOptimizer:
             progress_callback: 進度回調函數 (current, total)
 
         Returns:
-            OptimizationResult: 優化結果
+            OptimizationResult: 優化結果。
+
+            注意：result.all_results 保留全部參數組合（含 liquidated=True 的淘汰/強平組），
+            僅依 metric 排序，【不保證第一列未被淘汰】。真實強平組在某個 metric 下
+            完全可能天然排第一。要取最佳解請用 result.best_params / result.best_result，
+            或自行用 liquidated 欄過濾。前端呈現時務必對 liquidated 列做視覺區分。
         """
         combinations = self.generate_param_combinations()
         total = len(combinations)
@@ -245,7 +252,7 @@ class GridOptimizer:
         if eligible.empty:
             n_total = len(df_results)
             n_value_error = int(
-                df_results.get("value_error_eliminated", pd.Series(dtype=bool))
+                df_results["value_error_eliminated"]
                 .astype(bool)
                 .sum()
             )
@@ -293,15 +300,23 @@ class GridOptimizer:
               f"回撤: {result['max_drawdown']*100:.2f}%")
 
     def _calculate_param_importance(self, df: pd.DataFrame, metric: str) -> Dict[str, float]:
-        """計算參數重要性"""
+        """計算參數重要性
+
+        重要：極值哨兵（inf/-inf）會傳染進任何聚合（mean/std/corr），
+        讓整個 group 的平均變成 inf/nan。因此聚合必須在排除淘汰列之後做。
+        這裡使用的 eligible 子集與 run() 選最佳時用的是同一個。
+        """
         importance = {}
 
+        # 過濾掉淘汰列，只對合格的參數組合做聚合
+        df_eligible = df[~df["liquidated"].astype(bool)]
+
         for param in self.param_ranges.keys():
-            if param not in df.columns:
+            if param not in df_eligible.columns:
                 continue
 
             # 計算每個參數值對應的平均指標值的方差
-            grouped = df.groupby(param)[metric].mean()
+            grouped = df_eligible.groupby(param)[metric].mean()
             importance[param] = grouped.std() if len(grouped) > 1 else 0
 
         # 正規化
