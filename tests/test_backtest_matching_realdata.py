@@ -5,7 +5,6 @@
 """
 import csv
 import glob
-import os
 
 import pytest
 
@@ -19,14 +18,23 @@ EXPECTED_CLOSE_CROSS = 86     # close <= limit（舊實作的成交）
 
 
 def _load_bars():
+    """載入 K 線資料：明確跳過 header，資料損毀一律 raise。
+
+    解析失敗（float() 轉換失敗或欄位缺失）一律向上冒泡 —— 資料損毀必須大聲失敗，
+    不得偽裝成「資料變動」而被 skip。skip 只保留給「資料不存在」與「bar 數合法變動」。
+    """
     rows = []
     for fp in sorted(glob.glob(KLINE_GLOB)):
         with open(fp) as f:
-            for r in csv.reader(f):
-                try:
-                    rows.append((float(r[2]), float(r[3]), float(r[4])))  # high, low, close
-                except (ValueError, IndexError):
-                    pass
+            reader = csv.reader(f)
+            header = next(reader, None)
+            if header is None or header[0] != "open_time":
+                raise ValueError(
+                    f"{fp} 缺少預期的 header（第一欄應為 open_time，實得 "
+                    f"{header[0] if header else None}）"
+                )
+            for r in reader:
+                rows.append((float(r[2]), float(r[3]), float(r[4])))  # high, low, close
     return rows
 
 
