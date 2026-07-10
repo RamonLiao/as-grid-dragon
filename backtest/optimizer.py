@@ -88,7 +88,7 @@ class GridOptimizer:
         })
 
     def _run_single_backtest(self, params: Dict) -> Dict:
-        """執行單次回測
+        """執行單次回測。被 run() 的單線程與多進程分支均呼叫。
 
         批次路徑（網格搜尋 / grid search）：should_liquidate() 對無效輸入
         （非有限 price/equity、負倉位等）會 raise ValueError（見
@@ -97,6 +97,21 @@ class GridOptimizer:
         炸掉的不能是整個批次優化 —— 淘汰這一組參數、大聲記錄，讓其餘
         組合繼續跑。只 catch ValueError：其他例外類型（含 KeyboardInterrupt）
         一律照常往上炸，不吞。
+
+        多進程側：executor.submit() 呼叫此方法時發生的 ValueError 會被
+        catch 並回傳淘汰 dict；future.result() 讀回的是該 dict 而非例外，
+        主進程側不會收到例外。單線程側也經此处 catch。
+
+        淘汰 dict 哨兵值原則：值域由實測得出（見 Task 5b commit），
+        非直覺。sorted() 對該指標升序時淘汰組必排最後：
+        - return_pct: -1.0（虧光本金是下界，ascending=False 時排最後）✓
+        - max_drawdown: inf（實測可達 1.1726，需用 inf 代表「無窮差」）
+        - trades: 0（下界，ascending=False 時排最後）✓
+        - win_rate: 0.0（下界，ascending=False 時排最後）✓
+        - profit_factor: 0.0（下界，ascending=False 時排最後）✓
+        - sharpe_ratio: -inf（實測可以任意負，-1e6 不是下界，要用 -inf）
+        - final_equity: -inf（實測可達 -17.26，0.0 不是下界，要用 -inf）
+        - liquidated: True（強平標記，配合優化邏輯一票否決此組）
         """
         config = self._create_config(params)
         try:
@@ -110,12 +125,12 @@ class GridOptimizer:
             return {
                 **params,
                 "return_pct": -1.0,
-                "max_drawdown": 1.0,
+                "max_drawdown": float("inf"),
                 "trades": 0,
                 "win_rate": 0.0,
                 "profit_factor": 0.0,
-                "sharpe_ratio": -1e6,
-                "final_equity": 0.0,
+                "sharpe_ratio": float("-inf"),
+                "final_equity": float("-inf"),
                 "realized_pnl": 0.0,
                 "unrealized_pnl": 0.0,
                 "liquidated": True,
@@ -271,6 +286,10 @@ class GridOptimizer:
         """
         對稱間距搜尋 (止盈=補倉)
 
+        警告：此方法目前無呼叫者（死碼）。迴圈內直接呼叫 bt.run()，未 catch
+        should_liquidate() 的 ValueError；若日後復活，須比照 _run_single_backtest
+        加保護，否則一組壞參數會炸掉整趟掃描。
+
         Args:
             spacings: 間距列表
 
@@ -320,6 +339,10 @@ class GridOptimizer:
     ) -> pd.DataFrame:
         """
         非對稱間距搜尋
+
+        警告：此方法目前無呼叫者（死碼）。迴圈內直接呼叫 bt.run()，未 catch
+        should_liquidate() 的 ValueError；若日後復活，須比照 _run_single_backtest
+        加保護，否則一組壞參數會炸掉整趟掃描。
 
         Args:
             take_profits: 止盈間距列表
@@ -376,6 +399,10 @@ class GridOptimizer:
     def compare_directions(self) -> pd.DataFrame:
         """
         比較不同方向策略
+
+        警告：此方法目前無呼叫者（死碼）。迴圈內直接呼叫 bt.run()，未 catch
+        should_liquidate() 的 ValueError；若日後復活，須比照 _run_single_backtest
+        加保護，否則一組壞參數會炸掉整趟掃描。
 
         Returns:
             結果 DataFrame

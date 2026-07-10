@@ -56,9 +56,9 @@ def test_value_error_from_run_is_caught_and_param_set_eliminated(monkeypatch):
 
     assert result["liquidated"] is True
     assert result["return_pct"] == -1.0
-    assert result["final_equity"] == 0.0
+    assert result["final_equity"] == float("-inf")
     # 目標函數常見排序方向（return_pct/sharpe/profit_factor 越大越好）下必排最後
-    assert result["sharpe_ratio"] < 0
+    assert result["sharpe_ratio"] == float("-inf")
     assert result["profit_factor"] == 0.0
 
 
