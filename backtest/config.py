@@ -39,6 +39,7 @@ class Config:
     # 成本模型（fidelity-first：預設全開）
     slippage_bps: float = 0.0001       # 每次成交向不利方向偏移比例（執行成本 haircut）
     funding_enabled: bool = True       # 是否結算 funding 現金流
+    maintenance_margin_rate: float = 0.005  # 維持保證金率（單一費率代理幣安分層階梯）
 
     # 持倉控制參數 (與實盤 GridStrategy 一致)
     # 如果設為 0，會使用 limit_multiplier/threshold_multiplier 自動計算
@@ -101,6 +102,7 @@ class Config:
             "short_settings": self.short_settings,
             "slippage_bps": self.slippage_bps,
             "funding_enabled": self.funding_enabled,
+            "maintenance_margin_rate": self.maintenance_margin_rate,
         }
 
     @classmethod
@@ -127,6 +129,7 @@ class Config:
             slippage_bps=_norm_slippage(data.get("slippage_bps", 0.0001)),
             funding_enabled=data.get("funding_enabled", True)
                 if isinstance(data.get("funding_enabled", True), bool) else True,
+            maintenance_margin_rate=data.get("maintenance_margin_rate", 0.005),
         )
 
     def save(self, filepath: str):

@@ -21,3 +21,18 @@ def margin_usage(long_pos: float, short_pos: float, price: float,
         return float("inf")
     notional = (long_pos + short_pos) * price
     return (notional / leverage) / equity
+
+
+def should_liquidate(equity: float, long_pos: float, short_pos: float,
+                     price: float, maintenance_margin_rate: float) -> bool:
+    """權益是否已跌破維持保證金 → 觸發強平。
+
+    採 isolated margin 的簡化模型：維持保證金 = 倉位名目 × maintenance_margin_rate。
+    真實幣安是分層階梯（tiered），此處用單一費率代理並在 FIDELITY_NOTES 揭露。
+
+    無倉位 → 永不強平（沒有維持保證金需求）。
+    """
+    notional = (long_pos + short_pos) * price
+    if notional <= 0:
+        return False
+    return equity <= notional * maintenance_margin_rate

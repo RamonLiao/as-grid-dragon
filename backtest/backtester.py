@@ -26,7 +26,7 @@ from grid_engine.enhancements import (
 )
 from backtest.costs import apply_slippage, funding_charge
 from backtest.matching import entry_crossed, tp_crossed
-from backtest.liquidation import margin_usage
+from backtest.liquidation import margin_usage, should_liquidate
 
 # 回測保真限制（樂觀成交模型，與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
@@ -106,6 +106,7 @@ class BacktestResult:
     notes: str = ""  # 保真限制 / 已知差異說明
     funding_paid: float = 0.0  # funding 現金流總額（正=淨付出），不計入 trades
     peak_margin_usage: float = 0.0   # 全程 margin_usage 最大值（強平距離代理）
+    liquidated: bool = False         # 觸發強平 → spec §7 一票否決，不進優化目標
 
     def to_dict(self) -> dict:
         """轉換為字典"""
@@ -123,6 +124,7 @@ class BacktestResult:
             "direction": self.direction,
             "funding_paid": self.funding_paid,
             "peak_margin_usage": self.peak_margin_usage,
+            "liquidated": self.liquidated,
         }
 
     def __str__(self) -> str:
@@ -574,6 +576,7 @@ class GridBacktester:
 
         max_equity = balance
         peak_margin_usage = 0.0
+        liquidated = False
         long_positions: list = []
         short_positions: list = []
         trades: list = []
@@ -745,6 +748,22 @@ class GridBacktester:
                 mu = margin_usage(long_pos_qty, short_pos_qty, price, leverage, equity)
                 if mu > peak_margin_usage:
                     peak_margin_usage = mu
+
+                if should_liquidate(equity, long_pos_qty, short_pos_qty, price,
+                                    cfg.maintenance_margin_rate):
+                    # 全平多空倉（走 _close → 進 trades、反映在 realized_pnl），終止回測
+                    if long_positions and cfg.direction in ("long", "both"):
+                        _close("long", price, sum(p["qty"] for p in long_positions), timestamp)
+                    if short_positions and cfg.direction in ("short", "both"):
+                        _close("short", price, sum(p["qty"] for p in short_positions), timestamp)
+                    liquidated = True
+                    unrealized = 0.0
+                    open_margin = 0.0
+                    equity = balance
+                    max_equity = max(max_equity, equity)
+                    equity_curve.append((timestamp, price, equity))
+                    break
+
                 max_equity = max(max_equity, equity)
                 equity_curve.append((timestamp, price, equity))
         finally:
@@ -803,6 +822,7 @@ class GridBacktester:
             notes=FIDELITY_NOTES,
             funding_paid=funding_paid,
             peak_margin_usage=peak_margin_usage,
+            liquidated=liquidated,
         )
 
     def _run_legacy_mode(self) -> BacktestResult:
