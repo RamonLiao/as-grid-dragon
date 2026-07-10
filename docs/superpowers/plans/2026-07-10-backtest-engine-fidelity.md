@@ -1462,6 +1462,12 @@ Phase A/B/C 的實作計畫在 Phase 0 完成、拿到實際數字之後再寫 �
 
 ## Self-Review 記錄
 
+> **勘誤（執行中發現，2026-07-10）**：這份 self-review 宣稱 spec 覆蓋率 ✅，但**漏了 spec §5.3 要求的 `threshold_multiplier` 預設 `14.0` → `20.0`**（對齊生產值）。Task 6 的 brief 一次都沒提到它。已於執行期間補進 Task 6。
+> 另有兩個 self-review 未抓到的缺陷，皆由執行期的 review 發現：
+> - Task 2 的 fixture 末根 `close` 設成掛單價，無法區分新舊實作（假綠）→ 已修計畫
+> - Task 3 的 `worst_equity > 900.0` 門檻在修法前就通過（實測 969.617）→ 已修計畫
+> **教訓**：計畫的 self-review 檢查了「有沒有 placeholder / 型別一致 / 覆蓋率」，但沒有檢查「每條測試在修法前會不會紅」。後者才是計畫品質的真正守門。
+
 **Spec 覆蓋率**：
 - G4（撮合兩個錯）→ Task 1, 2, 7 ✅
 - G5 / G5-bis（bandit 覆寫間距）→ Task 6（FIDELITY_NOTES）、Task 8（斷言）✅

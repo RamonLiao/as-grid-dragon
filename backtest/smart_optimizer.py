@@ -185,7 +185,7 @@ class SmartOptimizationResult:
             f"  止盈間距: {self.best_params.get('take_profit_spacing', 0)*100:.3f}%\n"
             f"  補倉間距: {self.best_params.get('grid_spacing', 0)*100:.3f}%\n"
             f"  止盈加倍倍數: {self.best_params.get('limit_multiplier', 5.0):.1f}x\n"
-            f"  裝死模式倍數: {self.best_params.get('threshold_multiplier', 14.0):.1f}x\n"
+            f"  裝死模式倍數: {self.best_params.get('threshold_multiplier', 20.0):.1f}x\n"
             f"\n最佳績效:\n"
             f"  目標值: {self.best_objective:.4f}\n"
             f"  收益率: {self.best_metrics.get('return_pct', 0)*100:.2f}%\n"

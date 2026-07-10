@@ -46,7 +46,7 @@ class Config:
     position_threshold: float = 500.0   # 裝死模式閾值：持倉超過此值停止補倉
     position_limit: float = 100.0       # 止盈加倍閾值：持倉超過此值止盈數量加倍
     limit_multiplier: float = 5.0       # 止盈加倍倍數 (position_limit = initial_quantity × limit_multiplier)
-    threshold_multiplier: float = 14.0  # 裝死模式倍數 (position_threshold = initial_quantity × threshold_multiplier)
+    threshold_multiplier: float = 20.0  # 裝死模式倍數 (position_threshold = initial_quantity × threshold_multiplier)；對齊 grid_engine/config.py:30 的生產值
 
     # 策略方向
     direction: str = "both"             # "long" / "short" / "both"
@@ -124,7 +124,7 @@ class Config:
             position_threshold=data.get("position_threshold", 500.0),
             position_limit=data.get("position_limit", 100.0),
             limit_multiplier=data.get("limit_multiplier", 5.0),
-            threshold_multiplier=data.get("threshold_multiplier", 14.0),
+            threshold_multiplier=data.get("threshold_multiplier", 20.0),
             terminal_ui_mode=data.get("terminal_ui_mode", True),
             slippage_bps=_norm_slippage(data.get("slippage_bps", 0.0001)),
             funding_enabled=data.get("funding_enabled", True)
