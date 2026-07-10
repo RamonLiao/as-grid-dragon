@@ -166,9 +166,14 @@ def _decide_side(inputs, side):
     enter_dead = exit_dead = cancel = False
 
     if is_dead_mode(my_pos, inputs.position_threshold):
-        if not dead_flag:
+        entering = not dead_flag
+        if entering:
+            # 接管止盈單所有權：正常模式的殘留單價格由 grid_prices 算出，與裝死
+            # 模式的失衡比例無關。留著它會讓 pending_tp 恆 > 0，下面那張特殊
+            # 止盈永遠掛不出去，倉位永遠降不回 threshold 以下 → 該側永久停擺。
             enter_dead = True
-        if pending_tp <= 0:
+            cancel = True
+        if entering or pending_tp <= 0:
             special = dead_mode_price(price, my_pos, opp_pos, side)
             tp_qty = compute_quantity(inputs, side, True)
             o_side = "sell" if side == "long" else "buy"
