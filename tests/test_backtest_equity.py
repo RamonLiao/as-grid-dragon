@@ -73,3 +73,36 @@ def test_flat_price_no_position_equity_equals_initial_balance():
     res = GridBacktester(_flat_df([100.0] * 5), _zero_cost_cfg(direction="long",
                                                                grid_spacing=0.5)).run()
     assert res.final_equity == pytest.approx(1000.0, abs=1e-9)
+
+
+# ── margin_usage 純層 ────────────────────────────────────────────────
+
+from backtest.liquidation import margin_usage
+
+
+def test_margin_usage_is_notional_over_leverage_over_equity():
+    # 倉位名目 = (2+0) * 100 = 200；margin = 200/10 = 20；equity = 1000
+    assert margin_usage(2.0, 0.0, 100.0, 10.0, 1000.0) == pytest.approx(0.02)
+
+
+def test_margin_usage_sums_both_sides():
+    # hedge mode：多空兩邊都佔保證金
+    assert margin_usage(2.0, 3.0, 100.0, 10.0, 1000.0) == pytest.approx(0.05)
+
+
+def test_margin_usage_is_inf_when_equity_non_positive():
+    """equity <= 0 → 定義為 inf，避免除零；下游一律視為已強平。"""
+    assert margin_usage(1.0, 0.0, 100.0, 10.0, 0.0) == float("inf")
+    assert margin_usage(1.0, 0.0, 100.0, 10.0, -5.0) == float("inf")
+
+
+def test_margin_usage_zero_when_no_position():
+    assert margin_usage(0.0, 0.0, 100.0, 10.0, 1000.0) == 0.0
+
+
+def test_backtest_result_reports_peak_margin_usage():
+    """peak_margin_usage 是強平距離的代理（spec §7），純觀測不影響決策。"""
+    prices = [100.0] * 3 + [99.0, 98.0, 97.0]
+    res = GridBacktester(_flat_df(prices), _zero_cost_cfg()).run()
+    assert res.peak_margin_usage > 0.0
+    assert res.peak_margin_usage < 1.0

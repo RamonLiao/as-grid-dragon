@@ -26,6 +26,7 @@ from grid_engine.enhancements import (
 )
 from backtest.costs import apply_slippage, funding_charge
 from backtest.matching import entry_crossed, tp_crossed
+from backtest.liquidation import margin_usage
 
 # 回測保真限制（樂觀成交模型，與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
@@ -104,6 +105,7 @@ class BacktestResult:
     equity_curve: List[Tuple] = field(default_factory=list)
     notes: str = ""  # 保真限制 / 已知差異說明
     funding_paid: float = 0.0  # funding 現金流總額（正=淨付出），不計入 trades
+    peak_margin_usage: float = 0.0   # 全程 margin_usage 最大值（強平距離代理）
 
     def to_dict(self) -> dict:
         """轉換為字典"""
@@ -120,6 +122,7 @@ class BacktestResult:
             "sharpe_ratio": self.sharpe_ratio,
             "direction": self.direction,
             "funding_paid": self.funding_paid,
+            "peak_margin_usage": self.peak_margin_usage,
         }
 
     def __str__(self) -> str:
@@ -570,6 +573,7 @@ class GridBacktester:
             fund_i += 1
 
         max_equity = balance
+        peak_margin_usage = 0.0
         long_positions: list = []
         short_positions: list = []
         trades: list = []
@@ -736,6 +740,11 @@ class GridBacktester:
                 open_margin = (sum(p["margin"] for p in long_positions)
                                + sum(p["margin"] for p in short_positions))
                 equity = balance + open_margin + unrealized
+                long_pos_qty = sum(p["qty"] for p in long_positions)
+                short_pos_qty = sum(p["qty"] for p in short_positions)
+                mu = margin_usage(long_pos_qty, short_pos_qty, price, leverage, equity)
+                if mu > peak_margin_usage:
+                    peak_margin_usage = mu
                 max_equity = max(max_equity, equity)
                 equity_curve.append((timestamp, price, equity))
         finally:
@@ -793,6 +802,7 @@ class GridBacktester:
             equity_curve=equity_curve,
             notes=FIDELITY_NOTES,
             funding_paid=funding_paid,
+            peak_margin_usage=peak_margin_usage,
         )
 
     def _run_legacy_mode(self) -> BacktestResult:
