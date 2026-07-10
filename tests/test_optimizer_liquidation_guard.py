@@ -55,7 +55,11 @@ def test_value_error_from_run_is_caught_and_param_set_eliminated(monkeypatch):
     result = opt._run_single_backtest({"take_profit_spacing": 0.001, "grid_spacing": 0.002})
 
     assert result["liquidated"] is True
-    assert result["return_pct"] == -1.0
+    # NOTE (Task 5b review R3): return_pct 哨兵值由 -1.0 改成 -inf。
+    # -1.0（虧光本金）曾被誤認為下界，但實測災難組可達 -1.0176（強平滑價
+    # 侵蝕本金以外的部位），不是真下界。淘汰機制已改為 liquidated 旗標 +
+    # run() 選最佳前過濾，哨兵值只是 defense-in-depth 標記，不再靠它排序。
+    assert result["return_pct"] == float("-inf")
     assert result["final_equity"] == float("-inf")
     # 目標函數常見排序方向（return_pct/sharpe/profit_factor 越大越好）下必排最後
     assert result["sharpe_ratio"] == float("-inf")

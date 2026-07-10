@@ -102,16 +102,24 @@ class GridOptimizer:
         catch 並回傳淘汰 dict；future.result() 讀回的是該 dict 而非例外，
         主進程側不會收到例外。單線程側也經此处 catch。
 
-        淘汰 dict 哨兵值原則：值域由實測得出（見 Task 5b commit），
-        非直覺。sorted() 對該指標升序時淘汰組必排最後：
-        - return_pct: -1.0（虧光本金是下界，ascending=False 時排最後）✓
-        - max_drawdown: inf（實測可達 1.1726，需用 inf 代表「無窮差」）
-        - trades: 0（下界，ascending=False 時排最後）✓
-        - win_rate: 0.0（下界，ascending=False 時排最後）✓
-        - profit_factor: 0.0（下界，ascending=False 時排最後）✓
-        - sharpe_ratio: -inf（實測可以任意負，-1e6 不是下界，要用 -inf）
-        - final_equity: -inf（實測可達 -17.26，0.0 不是下界，要用 -inf）
-        - liquidated: True（強平標記，配合優化邏輯一票否決此組）
+        淘汰機制（Task 5b review R3 修正）：淘汰**不再靠排序**，而是靠
+        `liquidated` 旗標 + `run()` 在選最佳前的一票否決過濾（見 run()）。
+        前兩輪嘗試用「哨兵值排最後」表達淘汰，連錯三次 —— 因為真實災難組
+        的指標可以比任何事先猜測的哨兵值更差（max_drawdown 實測達 1.1726
+        > 舊哨兵 1.0；final_equity 實測達 -17.26 < 舊哨兵 0.0；return_pct
+        實測達 -1.0176 < 舊哨兵 -1.0）。只要哨兵值不是真正的數學下界/上界，
+        排序法就有機率讓淘汰組奪冠、進而在 run() 重跑 best_row 時再次炸出
+        同一個 ValueError。
+
+        以下哨兵值僅是「明確無效標記」（defense-in-depth：萬一有人繞過
+        run() 直接對 self.results 排序，至少不會拿到假的好結果），
+        **不再承擔淘汰責任**：
+        - return_pct / sharpe_ratio / final_equity: -inf（數學下界，恆成立）
+        - max_drawdown: inf（數學上界，恆成立）
+        - trades: 0、win_rate: 0.0、profit_factor: 0.0（維持原值）
+        - liquidated: True（真正的淘汰依據，由 run() 過濾）
+        - value_error_eliminated: True（供 run() 統計「因例外淘汰」與
+          「因真實強平淘汰」的組數，寫入 RuntimeError 訊息）
         """
         config = self._create_config(params)
         try:
@@ -124,7 +132,7 @@ class GridOptimizer:
             )
             return {
                 **params,
-                "return_pct": -1.0,
+                "return_pct": float("-inf"),
                 "max_drawdown": float("inf"),
                 "trades": 0,
                 "win_rate": 0.0,
@@ -134,6 +142,7 @@ class GridOptimizer:
                 "realized_pnl": 0.0,
                 "unrealized_pnl": 0.0,
                 "liquidated": True,
+                "value_error_eliminated": True,
             }
 
         return {
@@ -148,6 +157,7 @@ class GridOptimizer:
             "realized_pnl": result.realized_pnl,
             "unrealized_pnl": result.unrealized_pnl,
             "liquidated": result.liquidated,
+            "value_error_eliminated": False,
         }
 
     def generate_param_combinations(self) -> List[Dict]:
@@ -223,16 +233,38 @@ class GridOptimizer:
                     if progress_callback:
                         progress_callback(i + 1, total)
 
-        # 轉換為 DataFrame 並排序
+        # 轉換為 DataFrame 並排序（保留全部列，含淘汰/強平組，供使用者檢視）
         df_results = pd.DataFrame(self.results)
         df_results = df_results.sort_values(metric, ascending=ascending)
 
-        # 取得最佳結果
-        best_row = df_results.iloc[0]
+        # 一票否決：liquidated == True 的列（含真實強平與 ValueError 淘汰組）
+        # 一律排除於「選最佳」之外。這是淘汰機制本身 —— 不是排序，是過濾。
+        # df_results 仍保留全部列（見上方），只有這裡的 eligible 子集用於選最佳。
+        eligible = df_results[~df_results["liquidated"].astype(bool)]
+
+        if eligible.empty:
+            n_total = len(df_results)
+            n_value_error = int(
+                df_results.get("value_error_eliminated", pd.Series(dtype=bool))
+                .astype(bool)
+                .sum()
+            )
+            n_real_liquidation = n_total - n_value_error
+            raise RuntimeError(
+                f"全部 {n_total} 組參數皆遭淘汰或強平，無可用最佳解"
+                f"（其中 {n_value_error} 組因 ValueError 例外被淘汰，"
+                f"{n_real_liquidation} 組為正常回測後強平 liquidated=True）。"
+                f"請檢查參數範圍是否過於激進，或回測資料是否異常。"
+            )
+
+        # 取得最佳結果（僅從未淘汰組中選）
+        best_row = eligible.iloc[0]
         best_params = {k: best_row[k] for k in self.param_ranges.keys()}
         best_config = self._create_config(best_params)
 
-        # 重新執行最佳配置以取得完整結果
+        # 重新執行最佳配置以取得完整結果 —— best_row 已保證非淘汰組，
+        # 理論上不會再拋 ValueError；即便拋出也不 catch，讓它照常往上炸
+        # （代表回測本身不具確定性，是更嚴重的問題，不該被靜默吞掉）。
         bt = GridBacktester(self.df.copy(), best_config)
         best_result = bt.run()
 
