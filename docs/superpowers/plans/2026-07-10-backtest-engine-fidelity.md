@@ -253,30 +253,33 @@ def _zero_cost_cfg(**kw):
 def test_long_entry_fills_at_limit_price_not_at_close():
     """G-0a2：零成本下，成交價必須嚴格等於掛單價。
 
-    第 1 根 close=100 → 掛進場限價 100*(1-0.006)=99.4。
-    第 2 根 low=98（刺穿）但 close=100（未穿越）→ 必須成交，且成交價 = 99.4。
-    第 3 根收在 99.4 → 以 99.4 開的倉 unrealized 恰為 0。
+    第 1 根 close=100 → 掛進場限價 100*(1-0.006) = 99.4。
+    第 2 根 low=98（刺穿 99.4）但 close=100（未穿越）→ 正確實作應成交於 99.4。
+    第 3 根收在 99.5（**高於掛單價**）→ 舊實作在這根也不會成交。
 
-    三種實作的分辨：
-      舊（close 判穿越、close 成交）      → 第 2 根不成交 → 沒開倉
-      半修（low 判穿越、仍以 close 成交）  → 成交於 98 → unrealized = +1.4
-      正確（low 判穿越、成交於 limit）     → 成交於 99.4 → unrealized = 0
+    三種實作產生三個互相可區分的 unrealized_pnl（qty=1）：
+      舊（close 判穿越、成交於 close）     → 兩根都不成交 → 0.0，final_equity == 100000
+      半修（low 判穿越、仍成交於 close）    → 成交於 98    → 99.5 - 98.0  = 1.5
+      正確（low 判穿越、成交於 limit）      → 成交於 99.4  → 99.5 - 99.4 = 0.1
 
-    第一個斷言擋掉「沒開倉」，第二個斷言擋掉「成交於 close」。
-    兩者都對，本測試才綠。
+    第一條斷言擋掉「沒開倉」（舊實作），第二條擋掉「成交於 close」（半修）。
+
+    註：末根 close 不可設成 99.4 —— 那會讓舊實作在第 3 根以 close=99.4 成交，
+    結果與正確實作在第 2 根成交於 99.4 數值完全相同，fixture 就失去鑑別力。
+    （此陷阱在計畫初稿中真實發生過。）
     """
     df = _ohlc_df([
         (100.0, 100.0, 100.0, 100.0),   # 掛單：entry @ 99.4
         (100.0, 100.5,  98.0, 100.0),   # low 刺穿 99.4 → 應成交於 99.4
-        (99.4,   99.4,  99.4,  99.4),   # 末根收在 99.4 → unrealized == 0
+        (99.5,   99.5,  99.5,  99.5),   # 末根收在 99.5（> 99.4）→ 舊實作仍不成交
     ])
     res = GridBacktester(df, _zero_cost_cfg()).run()
     assert res.final_equity != pytest.approx(100000.0, abs=1e-9), (
-        "沒有開倉：low 未被用來判穿越"
+        "沒有開倉：low 未被用來判穿越（舊實作行為）"
     )
-    assert res.unrealized_pnl == pytest.approx(0.0, abs=1e-9), (
+    assert res.unrealized_pnl == pytest.approx(0.1, abs=1e-6), (
         f"成交價不等於掛單價 99.4（unrealized={res.unrealized_pnl}；"
-        f"若為 +1.4 表示成交於該根 close=98）"
+        f"若為 1.5 表示成交於該根 close=98）"
     )
 
 
@@ -295,11 +298,15 @@ def test_long_entry_does_not_fill_when_low_never_reaches_limit():
 - [ ] **Step 2: 跑測試確認它失敗**
 
 Run: `uv run python -m pytest tests/test_backtest_matching.py::test_long_entry_fills_at_limit_price_not_at_close -q`
-Expected: FAIL — `AssertionError: 沒有開倉：low 未被用來判穿越`
+Expected: FAIL — `AssertionError: 沒有開倉：low 未被用來判穿越（舊實作行為）`
 
-> 舊實作用 close 判穿越，第 2 根 `close=100.0 > 99.4` 不成交 → 沒有倉位。
-> 若只寫 `assert unrealized_pnl == 0` 這一條斷言，**舊實作會假綠**（沒開倉時 unrealized 也是 0）。
-> 這就是為什麼第一條斷言必須先擋掉「沒開倉」。
+已用現行實作實測確認：此 fixture 下 `final_equity == 100000.0`、`trades_count == 0`、`unrealized_pnl == 0`。
+
+> **兩個假綠陷阱，都必須避開**：
+> 1. 若只寫 `assert unrealized_pnl == 0`，舊實作會假綠（沒開倉時 unrealized 也是 0）。故第一條斷言先擋掉「沒開倉」。
+> 2. 若末根 `close` 設成掛單價 `99.4`，舊實作會在該根以 `close=99.4` 成交，數值與正確實作完全相同 → fixture 失去鑑別力。故末根收在 `99.5`。
+>
+> **若這個測試在改動前意外通過，立刻停止並回報 NEEDS_CONTEXT** —— 那代表 fixture 無法區分新舊實作，證明不了任何事。
 
 - [ ] **Step 3: 改 import（`backtest/backtester.py:19-27` 區塊）**
 
