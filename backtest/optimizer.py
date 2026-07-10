@@ -20,9 +20,9 @@ class OptimizationResult:
     """優化結果"""
     best_config: Config
     best_result: BacktestResult
-    all_results: pd.DataFrame  # 全部參數組合結果（含淘汰/強平列），僅依 metric 排序，
-                               # 【不保證第一列未被淘汰】。要取最佳解請用 best_params / best_result，
-                               # 或自行用 liquidated 欄過濾。前端呈現時務必對 liquidated 列做視覺區分。
+    all_results: pd.DataFrame  # 全部參數組合結果（含淘汰/強平列），先按 liquidated 升序、
+                               # 再按 metric 排序，故第一列必為合格解（若存在）。
+                               # 淘汰列仍保留在尾端供使用者檢視；前端呈現時務必對 liquidated 列做視覺區分。
     param_importance: Dict[str, float]
 
     def __str__(self) -> str:
@@ -200,9 +200,8 @@ class GridOptimizer:
             OptimizationResult: 優化結果。
 
             注意：result.all_results 保留全部參數組合（含 liquidated=True 的淘汰/強平組），
-            僅依 metric 排序，【不保證第一列未被淘汰】。真實強平組在某個 metric 下
-            完全可能天然排第一。要取最佳解請用 result.best_params / result.best_result，
-            或自行用 liquidated 欄過濾。前端呈現時務必對 liquidated 列做視覺區分。
+            先按 liquidated 升序、再按 metric 排序，故第一列必為合格解（若存在合格解）。
+            淘汰列仍保留在尾端供使用者檢視；前端呈現時務必對 liquidated 列做視覺區分。
         """
         combinations = self.generate_param_combinations()
         total = len(combinations)
@@ -240,9 +239,15 @@ class GridOptimizer:
                     if progress_callback:
                         progress_callback(i + 1, total)
 
-        # 轉換為 DataFrame 並排序（保留全部列，含淘汰/強平組，供使用者檢視）
+        # 轉換為 DataFrame 並排序（保留全部列，含淘汰/強平組，供使用者檢視）。
+        # liquidated 是主排序鍵（升序，False < True）、metric 是次要鍵，確保
+        # all_results.iloc[0] 在任何 metric 下都保證是合格解（若存在）——
+        # 否則 web/pages/3_🔬_回測優化.py 直接對 all_results 取 iloc[0] 會選中
+        # 爆倉組（例如 metric="max_drawdown" 時，爆倉組的回撤可能天然排最小）。
         df_results = pd.DataFrame(self.results)
-        df_results = df_results.sort_values(metric, ascending=ascending)
+        df_results = df_results.sort_values(
+            ["liquidated", metric], ascending=[True, ascending]
+        )
 
         # 一票否決：liquidated == True 的列（含真實強平與 ValueError 淘汰組）
         # 一律排除於「選最佳」之外。這是淘汰機制本身 —— 不是排序，是過濾。

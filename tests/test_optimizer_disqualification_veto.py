@@ -285,3 +285,78 @@ def test_best_never_liquidated_across_metrics(monkeypatch, metric, ascending):
 
     assert result.best_result.liquidated is False
     assert result.best_config.leverage == 22
+
+
+# ── R1 dual-review Important #2：all_results 第一列必須保證合格 ────────────
+#
+# run() 內部已用 eligible = df_results[~liquidated] 正確挑選 best_params。但
+# OptimizationResult.all_results 只依 metric 排序、含爆倉列。web/services/
+# backtest_service.py 的 run_grid_optimization() 直接回傳 all_results，
+# web/pages/3_🔬_回測優化.py:446 對它做 `results_df.iloc[0].to_dict()` 取
+# best_params。若第一列是爆倉組，使用者會照榜單採用一組實際會爆倉的參數當
+# 實盤設定——目前只是靠預設 metric="return_pct" 降序時爆倉組的 return_pct
+# ≈ -1.02 會沉底而僥倖安全；任何改 metric 的呼叫都會踩雷（例如
+# metric="max_drawdown", ascending=True 時，爆倉組的回撤可能天然比正常組小）。
+
+@pytest.mark.parametrize("metric,ascending", [
+    ("return_pct", False),
+    ("sharpe_ratio", False),
+    ("profit_factor", False),
+    ("max_drawdown", True),
+    ("final_equity", False),
+])
+def test_all_results_first_row_is_eligible_under_any_metric(monkeypatch, metric, ascending):
+    """all_results.iloc[0] 必須是合格解（liquidated=False），無論用哪個 metric 排序。
+
+    構造一組真實爆倉（liquidated=True）且在該 metric 下天然排第一的結果，混入
+    一組正常（liquidated=False）但在該 metric 下較差的結果。
+
+    改動前必紅（例如 metric="max_drawdown", ascending=True 時：舊碼
+    `df_results.sort_values(metric, ascending=ascending)` 只依 max_drawdown
+    排序，爆倉組 max_drawdown=0.12 < 正常組 0.30，爆倉組被排到 iloc[0]）。
+    """
+    # 讓爆倉組在每個 metric 下都「看起來最好」；正常組在每個 metric 下都較差。
+    disaster_result = _br(
+        final_equity=999.0, return_pct=5.0, max_drawdown=0.01,
+        profit_factor=99.0, sharpe_ratio=99.0, liquidated=True,
+    )
+    normal_result = _br(
+        final_equity=110.0, return_pct=0.10, max_drawdown=0.30,
+        profit_factor=1.8, sharpe_ratio=1.5, trades_count=8, win_rate=0.7,
+        liquidated=False,
+    )
+
+    def dispatch(params):
+        lev = params["leverage"]
+        r = disaster_result if lev == 20 else normal_result
+        return {
+            **params,
+            "return_pct": r.return_pct, "max_drawdown": r.max_drawdown,
+            "trades": r.trades_count, "win_rate": r.win_rate,
+            "profit_factor": r.profit_factor, "sharpe_ratio": r.sharpe_ratio,
+            "final_equity": r.final_equity, "realized_pnl": r.realized_pnl,
+            "unrealized_pnl": r.unrealized_pnl, "liquidated": r.liquidated,
+            "value_error_eliminated": False,
+        }
+
+    def dispatch_bt_run(config):
+        return disaster_result if config.leverage == 20 else normal_result
+
+    opt = _base_opt(
+        param_ranges={
+            "take_profit_spacing": [0.001], "grid_spacing": [0.002],
+            "leverage": [20, 22],
+        },
+        dispatch_run_single=dispatch,
+        dispatch_bt_run=dispatch_bt_run,
+        monkeypatch=monkeypatch,
+    )
+
+    result = opt.run(metric=metric, ascending=ascending, n_jobs=1)
+
+    assert result.all_results.iloc[0]["liquidated"] == False, (
+        f"metric={metric!r} 下 all_results 第一列不是合格解——前端對 all_results "
+        f"做 iloc[0] 會選中一組實際會爆倉的參數。"
+    )
+    # 淘汰組仍必須保留在 all_results 裡供使用者檢視（不是被過濾掉，只是排到後面）。
+    assert len(result.all_results) == 2

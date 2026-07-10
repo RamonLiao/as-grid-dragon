@@ -49,7 +49,12 @@ FIDELITY_NOTES = (
     "比較換手率差異大的方案時必須做 cost sensitivity(scripts/cost_sensitivity.py)，"
     "排序若在合理成本範圍內翻轉則不得下結論; "
     "(9) 強平模型——維持保證金=倉位名目×maintenance_margin_rate(單一費率代理幣安分層階梯)；"
-    "觸發即全平並終止回測，liquidated=True 的參數組應一票否決; "
+    "判定用本根盤中最不利價(hedge mode 多空混合時 low/high 各算一次取權益較小者)，"
+    "非收盤價，理由同 (1)：盤中已爆倉、收盤回升的 K 線不該判為存活；"
+    "但盤中的先後順序未建模——本根進場/止盈成交(_settle)恆先於強平判定，"
+    "實際市場中三者(entry/tp/liquidation)的真實時序未知；"
+    "peak_margin_usage 亦以盤中最不利價計算；觸發即以該最不利價全平並終止回測，"
+    "liquidated=True 的參數組應一票否決; "
     "(10) margin_usage 為單 symbol，實盤 state.margin_usage 是帳戶層(跨 symbol)，結論不得外推; "
     "(11) legacy 路徑(initial_quantity<=0)不含成本模型、不含強平、不含 high/low 撮合。"
 )
@@ -637,6 +642,14 @@ class GridBacktester:
                     pos["margin"] -= close_margin
                     remaining = 0
 
+        def _equity_at(p: float) -> float:
+            """權益 at 假設價格 p（用於盤中最不利價強平判定，非權益曲線）。"""
+            u = sum((p - x["price"]) * x["qty"] for x in long_positions)
+            u += sum((x["price"] - p) * x["qty"] for x in short_positions)
+            om = (sum(x["margin"] for x in long_positions)
+                  + sum(x["margin"] for x in short_positions))
+            return balance + om + u
+
         def _settle(side: str, bar_low: float, bar_high: float, ts) -> None:
             """結算既有 pending（上一根掛的單）對本根 K 線的成交。
 
@@ -746,6 +759,8 @@ class GridBacktester:
 
                 # 計算淨值。balance 已扣除未平倉位的 margin（_open 扣、_close 才加回），
                 # 故必須把 open_margin 加回來，否則權益被低估、回撤被虛增（G8）。
+                # 這是「權益曲線」的 equity，恆用收盤價算 —— equity_curve 是曲線，
+                # 不是風險指標，不該用盤中最不利價（那會讓曲線鋸齒狀跳動，失去可讀性）。
                 unrealized = sum((price - p["price"]) * p["qty"] for p in long_positions)
                 unrealized += sum((p["price"] - price) * p["qty"] for p in short_positions)
                 open_margin = (sum(p["margin"] for p in long_positions)
@@ -753,17 +768,33 @@ class GridBacktester:
                 equity = balance + open_margin + unrealized
                 long_pos_qty = sum(p["qty"] for p in long_positions)
                 short_pos_qty = sum(p["qty"] for p in short_positions)
-                mu = margin_usage(long_pos_qty, short_pos_qty, price, leverage, equity)
+
+                # 強平判定與 peak_margin_usage 必須用「本根 K 線內對持倉最不利的價格」，
+                # 不能用收盤價 —— 撮合已改用 high/low 判穿越（真實 K 線實測 close-only
+                # 漏掉 48.5% 成交，見 tests/test_backtest_matching_realdata.py），同一個
+                # 「盤中觸及才是真相」的論證完全適用於強平：盤中已爆倉、收盤回升的
+                # K 線若判為存活，就是讓回測比真實好看。hedge mode 下可能多空同時持倉，
+                # 最不利點不保證落在 low 或 high，兩個都算、取權益較小者。
+                # 注意：本根的進場/止盈成交（_settle）已在上面先發生，此處只判斷
+                # 「結算後剩下的倉位」會不會被強平——盤中三者（entry/tp/liquidation）
+                # 的真實時序未建模，見 FIDELITY_NOTES (9)。
+                worst_price, worst_equity = min(
+                    ((p, _equity_at(p)) for p in (bar_low, bar_high)),
+                    key=lambda t: t[1],
+                )
+
+                mu = margin_usage(long_pos_qty, short_pos_qty, worst_price, leverage, worst_equity)
                 if mu > peak_margin_usage:
                     peak_margin_usage = mu
 
-                if should_liquidate(equity, long_pos_qty, short_pos_qty, price,
+                if should_liquidate(worst_equity, long_pos_qty, short_pos_qty, worst_price,
                                     cfg.maintenance_margin_rate):
-                    # 全平多空倉（走 _close → 進 trades、反映在 realized_pnl），終止回測
+                    # 全平多空倉（走 _close → 進 trades、反映在 realized_pnl），終止回測。
+                    # 以 worst_price 平倉：強平價是盤中最不利價，不是收盤價。
                     if long_positions and cfg.direction in ("long", "both"):
-                        _close("long", price, sum(p["qty"] for p in long_positions), timestamp)
+                        _close("long", worst_price, sum(p["qty"] for p in long_positions), timestamp)
                     if short_positions and cfg.direction in ("short", "both"):
-                        _close("short", price, sum(p["qty"] for p in short_positions), timestamp)
+                        _close("short", worst_price, sum(p["qty"] for p in short_positions), timestamp)
                     liquidated = True
                     unrealized = 0.0
                     open_margin = 0.0

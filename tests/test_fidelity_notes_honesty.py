@@ -125,6 +125,20 @@ class TestFidelityNotesHonesty:
             "若改為絕對陳述，使用者會誤認為完全等同實盤。"
         )
 
+    def test_notes_disclose_liquidation_uses_intrabar_worst_price(self):
+        """強平判定改用盤中最不利價（dual-review R1 Important #1）必須揭露。
+
+        撮合已用 high/low 判穿越，但強平判定原本只看收盤價——同一個「盤中觸及
+        才是真相」的論證沒被套用，導致盤中已爆倉、收盤回升的 K 線被判為存活。
+        notes 必須說明修正後的行為，否則使用者無法知道強平判定用的是哪個價格。
+
+        若有人把強平判定改回收盤價、或刪掉這段揭露卻沒同步改實作，本測試轉紅。
+        """
+        assert "盤中" in FIDELITY_NOTES or "最不利價" in FIDELITY_NOTES, (
+            "FIDELITY_NOTES 應揭露強平判定使用『盤中最不利價』而非收盤價。"
+            "若刪除此提及，使用者會誤以為強平只看收盤價（與撮合的 high/low 邏輯矛盾）。"
+        )
+
     def test_notes_fee_claim_matches_actual_default(self):
         """成本模型的文件與實作必須同步
 
