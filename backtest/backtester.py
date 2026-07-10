@@ -729,10 +729,13 @@ class GridBacktester:
                     if sd.new_anchor_price is not None:
                         anchor[side] = sd.new_anchor_price
 
-                # 計算淨值
+                # 計算淨值。balance 已扣除未平倉位的 margin（_open 扣、_close 才加回），
+                # 故必須把 open_margin 加回來，否則權益被低估、回撤被虛增（G8）。
                 unrealized = sum((price - p["price"]) * p["qty"] for p in long_positions)
                 unrealized += sum((p["price"] - price) * p["qty"] for p in short_positions)
-                equity = balance + unrealized
+                open_margin = (sum(p["margin"] for p in long_positions)
+                               + sum(p["margin"] for p in short_positions))
+                equity = balance + open_margin + unrealized
                 max_equity = max(max_equity, equity)
                 equity_curve.append((timestamp, price, equity))
         finally:
@@ -744,7 +747,9 @@ class GridBacktester:
         unrealized_pnl += sum((p["price"] - final_price) * p["qty"] for p in short_positions)
 
         realized_pnl = sum(t["pnl"] for t in trades)
-        final_equity = balance + unrealized_pnl
+        final_open_margin = (sum(p["margin"] for p in long_positions)
+                             + sum(p["margin"] for p in short_positions))
+        final_equity = balance + final_open_margin + unrealized_pnl
 
         winning = [t for t in trades if t["pnl"] > 0]
         losing = [t for t in trades if t["pnl"] < 0]
