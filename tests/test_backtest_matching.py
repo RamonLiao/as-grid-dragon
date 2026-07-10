@@ -140,3 +140,84 @@ def test_long_entry_does_not_fill_when_low_never_reaches_limit():
     res = GridBacktester(df, _zero_cost_cfg()).run()
     assert res.unrealized_pnl == pytest.approx(0.0, abs=1e-9)
     assert res.trades_count == 0
+
+
+# ── 回歸：止盈不得平掉本根才剛開的倉（reduce_only 語意） ────────────────
+
+def _both_side_doubling_cfg(**kw):
+    """direction=both 讓對手側持倉可以累積；threshold_multiplier=1.0 讓
+    position_threshold == initial_quantity，一次進場成交即可觸發
+    grid_engine.decision.tp_quantity() 的止盈加倍（opposite_position >= threshold，
+    不看自己這一側持倉）。limit_multiplier 拉大到不可能觸發的量級，
+    確保加倍只由 opposite_position 這條路徑觸發，排除另一條 my_position>limit 路徑。"""
+    return _zero_cost_cfg(direction="both", threshold_multiplier=1.0,
+                          limit_multiplier=100.0, **kw)
+
+
+def test_tp_fill_cannot_close_more_than_the_position_that_existed_before_this_bars_entry():
+    """止盈單是 reduce_only：交易所只允許平『成交當下已存在』的倉位。
+    high/low 判穿越後，同一根 K 線常常「進場」與「止盈」同時觸及（Task 2 G4 前幾乎
+    不可能，現在很常見）。_settle 讓 entry 先於 tp 結算（保守：先增加曝險），但 _close
+    走 FIFO 平倉，若止盈量大於「entry 結算前」的持倉量，會一路平到本根才剛開的倉——
+    這張倉在止盈單成交的當下根本還不存在，回測卻樂觀地把它記為獲利了結。
+
+    構造：
+      bar1 close=100 → 掛 long entry@99.4(=100*0.994)、short entry@100.6(=100*1.006)，qty=1.0。
+      bar2 (low=99, high=101) 讓 long/short 的 entry 同時成交 → long_position=short_position=1.0，
+        觸及 position_threshold(=initial_quantity*1.0=1.0，opposite_position>=threshold 用 >=)，
+        於是 decide() 為兩側都掛出加倍止盈單：long tp@100.4(=100*1.004) qty=2.0、
+        short tp@99.6(=100*0.996) qty=2.0（連同新的 entry@99.4/100.6 qty=1.0 一併掛出）。
+      bar3 (low=99, high=101) 同時穿越四個掛單：long/short 的 entry 與 tp 全部觸及。
+        entry 先結算 → long/short 持倉各變成 2.0（bar2 那 1.0 + bar3 新開的 1.0）。
+        止盈量 2.0 > 「entry 結算前」的持倉 1.0（bar2 那筆）。
+
+    期望（clamp 到 prior_qty）：止盈只平掉 bar2 那筆（entry 結算前已存在的倉），
+    bar3 新開的倉留著、算進 unrealized：
+      trades_count == 2（long 1 筆 + short 1 筆，各平 1.0）
+      realized_pnl == (100.4-99.4)*1.0 + (100.6-99.6)*1.0 == 2.0
+      unrealized_pnl == (100-99.4)*1.0 + (100.6-100)*1.0 == 1.2（final close=100，bar3 新倉各 1.0）
+
+    修法前（bug）：止盈量 2.0 用 FIFO 吃光兩筆倉位（bar2 舊倉 + bar3 新倉），
+    trades_count == 4、realized_pnl == 4.0、unrealized_pnl == 0.0 —— 把還不存在的倉記成獲利。
+    """
+    df = _ohlc_df([
+        (100.0, 100.0, 100.0, 100.0),   # bar1: 建立初始掛單（entry@99.4 / 100.6）
+        (100.0, 101.0,  99.0, 100.0),   # bar2: entry 雙邊成交 → 觸發加倍止盈
+        (100.0, 101.0,  99.0, 100.0),   # bar3: entry 與 tp 同根雙觸發（本測試核心場景）
+    ])
+    res = GridBacktester(df, _both_side_doubling_cfg()).run()
+
+    assert res.trades_count == 2, (
+        f"trades_count={res.trades_count}：若為 4，代表止盈把 bar3 剛開的倉也平掉了"
+        "（reduce_only 不可能平未來才存在的倉）"
+    )
+    assert res.realized_pnl == pytest.approx(2.0, abs=1e-6), (
+        f"realized_pnl={res.realized_pnl}：若為 4.0，代表 bar3 新倉被錯誤地計入已實現獲利"
+    )
+    assert res.unrealized_pnl == pytest.approx(1.2, abs=1e-6), (
+        f"unrealized_pnl={res.unrealized_pnl}：bar3 新開的 long/short 倉應仍持有中"
+    )
+
+
+# ── monkey：髒 high/low 型別不得讓 run() 崩潰 ────────────────────────
+
+@pytest.mark.parametrize("dirty_value", [None, "not_a_number"])
+def test_run_degrades_to_close_instead_of_crashing_when_high_low_have_wrong_type(dirty_value):
+    """high/low 若來自 object dtype 欄位，可能混入 None 或字串（例如上游資料源
+    某根 K 線缺值、或型別轉換失敗但未整根丟棄）。防禦迴圈只有 try/finally（沒有
+    except），math.isfinite(None) / math.isfinite('x') 會直接拋 TypeError 讓 run()
+    整個崩潰，而不是照設計退化為用 close 撮合。加 isinstance 守衛後應正常跑完、
+    不拋例外——退化行為與 price 欄位既有的防禦一致（同檔 line ~649）。"""
+    df = _ohlc_df([
+        (100.0, 100.0, 100.0, 100.0),
+        (100.0, 100.5,  99.5, 100.0),
+        (100.0, 100.0, 100.0, 100.0),
+    ])
+    df["high"] = df["high"].astype(object)
+    df["low"] = df["low"].astype(object)
+    df.loc[1, "high"] = dirty_value
+    df.loc[1, "low"] = dirty_value
+
+    res = GridBacktester(df, _zero_cost_cfg()).run()  # 不得拋例外
+
+    assert res.trades_count >= 0  # 只要跑完就是通過；退化根用 close 撮合

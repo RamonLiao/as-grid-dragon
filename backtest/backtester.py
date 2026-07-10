@@ -627,17 +627,22 @@ class GridBacktester:
 
             穿越用 high/low 判定（限價單盤中觸及即成交）；成交價一律是掛單價。
             close 不再參與撮合——它既不決定有沒有成交，也不決定成交在哪。
-            同根雙觸發時 entry 先於 tp（保守：先增加曝險）；_close 走 FIFO，
-            故本根新開的倉不會被本根止盈平掉。
+            同根雙觸發時 entry 先於 tp（保守：先增加曝險）。止盈單是 reduce_only，
+            交易所只允許平「成交當下已存在」的倉位；entry 先成交會讓 _close 的
+            FIFO 誤平到本根才剛開的倉（樂觀，污染 realized_pnl）。故先快照
+            entry 結算前的持倉量，止盈可平數量 clamp 在該快照之內。
             """
             positions = long_positions if side == "long" else short_positions
+            prior_qty = sum(p["qty"] for p in positions)
             e = pend[side]["entry"]
             if e is not None and entry_crossed(side, bar_low, bar_high, e["price"]):
                 if _open(side, e["price"], e["qty"]):
                     pend[side]["entry"] = None
             t = pend[side]["tp"]
             if t is not None and positions and tp_crossed(side, bar_low, bar_high, t["price"]):
-                _close(side, t["price"], t["qty"], ts)
+                closable = min(t["qty"], prior_qty)
+                if closable > 0:
+                    _close(side, t["price"], closable, ts)
                 pend[side]["tp"] = None
 
         try:
@@ -657,7 +662,8 @@ class GridBacktester:
                 # 先結算成交（用上一根掛出的 pending）；穿越判定吃本根 high/low
                 bar_high = row['high']
                 bar_low = row['low']
-                if not (math.isfinite(bar_high) and math.isfinite(bar_low)
+                if not (isinstance(bar_high, (int, float)) and isinstance(bar_low, (int, float))
+                        and math.isfinite(bar_high) and math.isfinite(bar_low)
                         and bar_low > 0 and bar_high >= bar_low):
                     bar_high = bar_low = price   # 髒 OHLC 退化為 close（保守）
                 for side in ("long", "short"):
