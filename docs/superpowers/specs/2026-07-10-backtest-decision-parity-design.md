@@ -130,11 +130,92 @@ glft_enabled 實際值：恆 False        gamma：恆 0.1
 
 ---
 
+## 3bis. 回測引擎本身的缺陷（量化 review 追加，嚴重度高於 G1-G3）
+
+以下四項在原始設計中被遺漏。**它們會使三個選項的相對排序由回測缺陷決定，而非由策略決定。** 必須在 Phase A 之前修復（見 §8 Phase 0）。
+
+### G4. 撮合規則有兩個錯，方向相反、量級不等
+
+`_settle()`（`backtester.py:622-637`）：
+
+```python
+crossed = price <= e["price"]                  # price = 該根 close
+if crossed and _open(side, price, e["qty"])    # ← 以 close 成交，不是以掛單價
+```
+
+- **錯誤一**：只看 close 判斷穿越。限價單盤中被觸及即成交，不需收盤站上去。
+- **錯誤二**：成交價取 close 而非 limit。掛在 100 的買單、close 跌到 98 → 回測讓你用 98 買到。這是**不存在的免費價格改善**，且 close 是掛單當下的未來資訊。
+
+以 `data/futures/um/daily/klines/BNBUSDC/1m/` 的 **44107 根真實 1m K 線**、用實盤有效間距 `0.003`（見 G5）實算多頭補倉單：
+
+| 量測 | 值 |
+|---|---|
+| 真實觸及（`low <= limit`） | 167 次（0.38% of bars） |
+| 回測成交（`close <= limit`） | 86 次（0.19% of bars） |
+| **回測漏掉的成交** | **81 次 = 真實成交的 48.5%** |
+| **每筆免費價格改善** | mean **10.38 bps** / median 6.92 / p90 25.14 |
+| 對照 `slippage_bps` | 1.00 bps |
+| 對照 `fee_pct` 單邊 | 4.00 bps |
+
+**幻覺價格改善是所建模滑價的 10 倍、單邊手續費的 2.6 倍。** 一次網格來回毛利 = `take_profit_spacing` = 30 bps，進場與止盈各拿約 10 bps 幻覺改善 ⇒ **約 20 bps 假獲利，佔毛利三分之二**。
+
+⇒ **FIDELITY_NOTES 第 (8) 條「保守堆疊 → 偏低估、屬刻意保守下界」是錯的。** 實況是「每筆成交偏樂觀、成交筆數偏少」，兩個誤差方向相反且量級差約 2 倍，**淨偏誤不可預測**——比單向偏誤更糟，因為無法宣告下界。
+
+> 根因：`slippage_bps` 是為 **taker** 設計的模型（成交價比預期差）。網格是 **maker**，maker 的風險是**逆選擇**與**排隊落空**，不是滑價。用滑價代理逆選擇，量級差一個數量級。
+
+**修法**（標準限價單回測）：
+- 多頭進場：`low <= limit` → 成交於 **`limit`**；多頭止盈：`high >= tp` → 成交於 **`tp`**
+- 空頭對稱
+- 同根 K 線內進場與止盈皆觸及 → 保守假設**不利者先成交**（進場先）
+
+### G5. 回測跑的不是實盤策略：bandit 無條件覆寫間距
+
+`bot.py:355-358`（`bandit.enabled: true`，**不需要 `all_enhancements_enabled`**）：
+
+```python
+sym_config.grid_spacing = bandit_params.grid_spacing
+sym_config.take_profit_spacing = bandit_params.take_profit_spacing
+```
+
+生產 `logs/decisions.jsonl` 前 60001 筆實測：
+
+| 參數 | 實盤實際值 | `trading_config_max.json` |
+|---|---|---|
+| `grid_spacing` | **0.003**（60001/60001 筆） | 0.006 |
+| `take_profit_spacing` | **0.003**（60001/60001 筆） | 0.004 |
+
+實盤跑的是 **0.003/0.003 對稱網格**；config 那組 0.006/0.004 **從未生效**。
+
+FIDELITY_NOTES 第 (4) 條「Bandit 參數優化不在回測 loop 內重現」**低估了嚴重性** —— 不是「優化不重現」，是**間距參數整個對不上**。此缺口影響**全部三個選項**，非僅 GLFT。
+
+**修法**：回測參數釘在實盤有效值 `0.003/0.003`，並明文揭露「bandit 被 pin 住」。
+
+> **獨立可疑點（另案追查，不在本次範圍）**：60001 筆全部同值，而 `thompson_enabled: true`、`update_interval: 10` 的 bandit 理應探索。要嘛 bandit 卡住（潛在 bug），要嘛已收斂。無論何者，回測都必須用實測有效值而非 config 值。
+
+### G6. 沒有爆倉建模 ⇒ 選項 (b) 根本不可評估
+
+`_open()`（`backtester.py:586-593`）在 `margin + fee >= balance` 時 `return False`，掛單留到下根再試。**倉位永遠不會被強平**；`equity = balance + unrealized` 可為負，回測照跑到底。
+
+選項 (b)「關掉裝死模式」的全部風險就在這裡：**無限加倉 + 不爆倉 = 必勝策略**。回測必然告訴你關掉裝死最好。這不是策略結論，是 martingale 在無限資金假設下的算術恆等式。
+
+**修法**：建模強平事件 —— `equity <= maintenance_margin` → 當根價格全平、記 `liquidated=True`、終止回測。任何 `liquidated=True` 的參數組**一票否決**，不進入優化目標函數。
+
+### G7. 成本模型不是方向中性的，它系統性偏袒「保留裝死模式」
+
+`fee_pct = 0.0004` 是 **taker** 費率；網格全是 maker 單（Binance USDⓈ-M VIP0 maker = 0.02% = 2 bps）。**回測對每筆成交多收一倍手續費**，且 `slippage_bps` 同樣按成交次數收。
+
+高換手選項（關掉裝死、調高 threshold）被多罰，低換手選項（維持現狀）被少罰。**既然要比較的正是換手率差異巨大的三個選項，成本模型的偏差會直接決定排序。**
+
+**修法**：`fee_pct` 改 maker 費率；三選項一律做 **cost sensitivity 網格**（fee ∈ {2, 4} bps × slippage ∈ {0, 1, 2} bps）。**若排序在此範圍內翻轉，則不得下結論。**
+
+---
+
 ## 4. 目標與非目標
 
 ### 目標
 
-1. 讓回測能誠實比較 (a)(b)(c) 三個選項，產出可信數字
+0. **先讓回測引擎本身可信**（G4-G7）—— 撮合、強平、參數對齊、成本中性。這是其餘一切的前提
+1. 讓回測能誠實比較 (a)(b)(c) 三個選項，產出可信數字，**且結論通過樣本外驗證**
 2. 消除 `decide()` 的最後一個洞（G1），讓「決策層單一真理來源」名副其實 —— 完成 #4 沒做完的一半
 3. 讓 `RiskMonitor` 的決策也成為 live/backtest 共用的純層（G2）
 4. 移除會誤導人的假旋鈕
@@ -270,9 +351,13 @@ peak_margin_usage: float = 0.0      # 全程 margin_usage 最大值（強平距�
 
 ## 6. 已知風險與必須揭露的事項
 
-1. **GLFT 與 bandit 的 `gamma` 耦合**（不修，揭露）
-   要測 GLFT 就得開 `all_enhancements_enabled`，而 `bot.py:359-360` 會讓 bandit 每 tick 覆寫 `gamma`。回測沒有 bandit，`gamma` 固定。
+1. **bandit 覆寫策略參數**（Phase 0 部分處理，其餘揭露）
+   `bot.py:355-360`，`bandit.enabled: true` 時每 tick 覆寫：
+   - `grid_spacing` / `take_profit_spacing`：**無條件覆寫**，實測恆為 `0.003/0.003`（見 G5）。Phase 0 以 pin 住實測值處理。
+   - `gamma`：額外需 `all_enhancements_enabled`。回測沒有 bandit，`gamma` 固定。
+
    ⇒ **開 GLFT 的回測結果不能直接對標實盤**，除非實盤同時關掉 `bandit.enabled`。
+   ⇒ 回測全程是「bandit 被凍結在某一 arm」的假設。若 bandit 在實盤重新探索，回測結論即失效。
    若日後決定採用 GLFT，須先處理此耦合（讓 bandit 不覆寫 `gamma`，或讓回測重現 bandit）。
 
 2. **GLFT 的天花板**（預期結論，回測應證實）
@@ -281,6 +366,15 @@ peak_margin_usage: float = 0.0      # 全程 margin_usage 最大值（強平距�
 
 3. **trailing stop 節奏偏離**
    live 每 10s 檢查（`sync_service.py:151`），回測受限於 1m K 線只能每根檢查一次。低估觸發頻率 ⇒ 回測的已實現獲利偏低、持倉偏高 ⇒ **偏向保守，不會騙人開危險參數**。
+
+3bis. **`margin_usage` 層級不一致**
+   live 的 `state.margin_usage` 是**帳戶層**（`state.py:115`，`total_margin / total_equity`，跨 symbol），trailing stop 的閘門讀它。§5.3 的回測建模是**單 symbol**。多 symbol 實盤下 trailing 的觸發時機會完全不同。
+   ⇒ 單 symbol 回測的 trailing 結論**不得外推至多 symbol 實盤**。
+
+3ter. **`threshold_multiplier` 一參數兩用，optimizer 無法歸因**
+   `decision.py:97`：`if my_position > position_limit or opposite_position >= position_threshold: return base_qty * 2`
+   `position_threshold` 同時是**裝死觸發門檻**與**對手側止盈加倍的條件**。調高它 ⇒ 裝死更晚觸發（意圖中）**且**對手側止盈更難加倍（副作用）。回測差異是兩個效應的淨和。
+   ⇒ 實驗期間須把止盈加倍的門檻解耦成獨立參數做 ablation，否則不知道自己在調什麼。
 
 4. **`best_bid`/`best_ask` 用 close 代理**
    1m K 線無盤口。回測的 `pos==0` 重掛價 = 該根 close，live = 當下 `best_bid`。點差量級的偏差，方向中性。
@@ -293,22 +387,56 @@ peak_margin_usage: float = 0.0      # 全程 margin_usage 最大值（強平距�
 
 ## 7. 驗收指標
 
-四個指標互相制衡 —— 成交次數可靠無限加倉刷高，回撤與強平距離就是它的煞車。**必須聯合閱讀，不得單看任一項。**
+指標**分三層**。量化 review 的核心裁定：**`trades_count` 與 `realized_pnl` 不得作為優化目標函數。**
 
-| 指標 | 來源 | 意義 | 陷阱 |
-|---|---|---|---|
-| `trades_count` / `realized_pnl` | 既有 | 「來回賺網格慢慢補回虧損」的直接對應 | 可靠無限加倉刷高 |
-| `max_drawdown` / `peak_margin_usage` | `max_drawdown` 既有；`peak_margin_usage` 新增 | 關掉裝死模式的真正代價 | 缺此指標，優化器會選出爆倉參數 |
-| `dead_mode_pct_long` / `_short` | 新增 | 直接量化「網格停擺多久」 | 與生產症狀一一對應（`long in_dead=100%`） |
-| `return_pct` / `sharpe_ratio` | 既有 | 標準指標 | 單邊趨勢市場中，加倉不止損的策略短期 Sharpe 很好看 |
+> **為什麼**：攤平加倉策略的已實現獲利**恆為正** —— 只有賺錢的倉位會被止盈平掉，虧損全部躺在未實現裡。用它當目標函數，等於獎勵「把虧損藏進未實現」。這是 martingale 假象的標準形態。`final_equity` 與 `max_drawdown` 不會說謊，因為它們吃未實現損益。
 
-**強平距離用 `peak_margin_usage` 作代理**，理由：`fetch_positions()` 回傳的 `liquidationPrice` 目前在 `sync_service.py:60-73` 被丟棄，回測也無交易所的維持保證金階梯表；而 `margin_usage` 已因 trailing stop 而必須建模，複用零成本。誠實命名為代理，不宣稱是真實強平距離。
+### 第一層 — 主指標（優化目標與淘汰條件）
+
+| 指標 | 來源 | 角色 |
+|---|---|---|
+| `liquidated` | **新增**（G6） | **布林，一票否決**。任何觸發強平的參數組直接淘汰，不進目標函數 |
+| `final_equity` | 既有 | 優化目標 |
+| `max_drawdown` | 既有 | 優化目標（equity-based） |
+
+### 第二層 — 決策指標（回答使用者的原始問題）
+
+| 指標 | 來源 | 意義 |
+|---|---|---|
+| `funding_paid` | 既有，**升級為一級** | 裝死模式的本質是長期持有單邊大倉等反彈；單邊多頭 + 正 funding 下，**funding 是該選項的主要成本**，隨持倉時間線性累積。三選項的 funding 差異可能大於其網格收益差異 |
+| `dead_mode_pct_long` / `_short` | 新增 | 直接量化「網格停擺多久」，與生產症狀一一對應（`long in_dead=100%`） |
+| `dead_tp_fill_rate` | **新增**（M1） | 裝死特殊止盈單的成交率。`dead_mode_price()` 在 `opposite_position=0` 時是 `price × 1.05`（生產實例 +4.8%）。**若歷史成交率趨近 0，則「裝死模式」實務上等於「無限期持有 + 付 funding」，而非設計文件宣稱的「等極端反彈」** —— 這個數字直接回答使用者的原始問題 |
+| `peak_margin_usage` | 新增 | 強平距離代理（見下） |
+
+### 第三層 — 診斷指標（**禁止**作為優化目標）
+
+| 指標 | 為何禁用 |
+|---|---|
+| `trades_count` / `realized_pnl` | martingale 假象：恆正，可靠無限加倉刷高 |
+| `win_rate` / `profit_factor` | 同上，攤平策略天生高勝率 |
+| `sharpe_ratio` | `backtester.py:756` 用 1m 報酬 × √525600 年化。網格權益曲線自相關極高，1m 報酬標準差嚴重低估真實波動 ⇒ Sharpe 系統性膨脹。**裝死模式下權益曲線幾乎是價格的線性函數，Sharpe 退化為價格趨勢的度量。** 若要使用，改日報酬或 Newey-West 調整 |
+
+### 關於 `peak_margin_usage` 作為強平距離代理
+
+`fetch_positions()` 回傳的 `liquidationPrice` 目前在 `sync_service.py:60-73` 被丟棄，回測亦無交易所維持保證金階梯表；而 `margin_usage` 已因 trailing stop 必須建模，複用零成本。**誠實命名為代理，不宣稱是真實強平距離。** G6 的 `liquidated` 事件建模落地後，代理不再是唯一風險訊號。
 
 ---
 
 ## 8. 分階段實作與守門條件
 
-沿用 #4 / #5 已驗證的模式：把「重構」與「刻意行為變更」分開。**三個階段各有一個可證偽的守門條件**；兩種刻意變更（風控接線、`pos==0`）分屬不同階段，不得混在同一個 diff 裡，否則任一階段的數字變化都無法歸因。
+沿用 #4 / #5 已驗證的模式：把「重構」與「刻意行為變更」分開。**每個階段各有一個可證偽的守門條件**；每種刻意變更分屬不同階段，不得混在同一個 diff 裡，否則任一階段的數字變化都無法歸因。
+
+### Phase 0 — 回測引擎保真度修復（**前置，不可跳過**）
+
+G4/G5/G6/G7 是後續所有數字的前提。**在 Phase 0 完成前，回測輸出的任何數字都不得用於策略決策。**
+
+| 子階段 | 內容 | 守門 |
+|---|---|---|
+| **0-a** | 撮合改為 `high`/`low` 判穿越、成交於**掛單價**；同根雙觸發時不利者（進場）先成交 | **G-0a1**：以 `data/futures/.../BNBUSDC/1m/` 真實 K 線實測，多頭進場成交次數由 86 → 167（±rounding）<br>**G-0a2**：零成本（`slippage_bps=0, fee_pct=0`）下，每筆成交價**嚴格等於**掛單價（斷言無價格改善） |
+| **0-b** | 建模強平：`equity <= maintenance_margin` → 當根全平、`liquidated=True`、終止回測 | **G-0b1**：構造必爆參數組（極高 `threshold_multiplier` + `dead_mode_enabled=False` + 單邊趨勢資料），斷言 `liquidated is True` 且回測提前終止<br>**G-0b2**：正常參數組 `liquidated is False`，且結果與未加此邏輯前一致 |
+| **0-c** | `fee_pct` 改 maker 費率；回測策略參數釘在實盤有效值 `0.003/0.003`；FIDELITY_NOTES 第 (4)(8) 條改寫 | **G-0c1**：cost sensitivity 網格（fee ∈ {2,4} bps × slippage ∈ {0,1,2} bps）可跑出 6 組結果<br>**G-0c2**：FIDELITY_NOTES 不再宣稱「保守下界」 |
+
+> **G-0a2 是本階段的核心守門**：它把「幻覺價格改善」變成一個可自動偵測的斷言。零成本下若成交價 ≠ 掛單價，測試必紅。
 
 ### Phase A — 行為零變更（純重構）
 
@@ -318,6 +446,7 @@ peak_margin_usage: float = 0.0      # 全程 margin_usage 最大值（強平距�
 
 守門（皆須實測，非宣稱）：
 - **G-A1**：backtester 在「零成本（`slippage_bps=0, funding_enabled=False`）+ 全增強關 + `dead_mode_enabled=True` + `risk_enabled=False`」下，改造前後 `BacktestResult` 的 `final_equity` / `trades_count` / `realized_pnl` **bit-identical**
+  > **基準是 Phase 0 完成後的 backtester**，不是原始版本。Phase 0 已刻意改變回測數字（撮合修正），Phase A 之後的每一個 golden 都以 Phase 0 的輸出為基準。基準漂移必須顯式記錄在測試 fixture 裡。
 - **G-A2**：`tests/test_characterization_grid.py` 既有斷言**不改而綠**
 - **G-A3**：`RiskMonitor` 委派 `risk.py` 後，`tests/test_components.py` 的跨組件接線斷言不改而綠
 - **G-A4**：生產 config（無 `dead_mode_enabled` 鍵）經 `from_dict` → `to_dict` round-trip 後行為不變
@@ -342,12 +471,33 @@ peak_margin_usage: float = 0.0      # 全程 margin_usage 最大值（強平距�
 >
 > 同一條教訓的另一半：Phase C 落地後，須逐條回問每個 characterization 斷言「這行為為什麼是對的」。`dead_flag` 在 `pos==0` 不清除就是一個答不漂亮但可證明 inert 的例子（見 §5.1），已明文記錄而非默許。
 
+> **Phase C 的撮合語意必須明確定義（M2）**：貼 `best_bid` 的限價買單是 maker，可能永不成交。Phase 0 修好撮合後，`low <= best_bid` 在回測中幾乎恆真 ⇒ 每根都成交 ⇒ **嚴重高估 `pos==0` 的倉位重建速度**。Phase C 必須明文規定貼價單在回測中的成交條件（建議：要求 `low < best_bid` 嚴格小於，代表價格確實走過該價位而非僅觸及），並在 FIDELITY_NOTES 揭露。
+
+### Phase D — 樣本外驗證（**產出結論的必要條件**）
+
+`threshold_multiplier` 是**尾部風險參數**：成本只在罕見大趨勢中兌現，收益（更多網格成交）天天兌現。在單一歷史路徑上跑 Optuna（`smart_optimizer.py` 已在 optimize 它，範圍 6~80），**必然把它推到上界** —— 因為樣本內那根尾巴沒出現。使用者多頭卡住的那四天，正是尾巴出現時的樣子。
+
+**沒有 Phase D，Phase 0~C 交付的只是一台精確的 overfit 機器。**
+
+要求：
+1. **train/test 時間切分**，且 test **必須包含一段單邊趨勢**（例如 2026-07-06~07-10 多頭卡死那段）
+2. **跨 symbol**：`BNBUSDC` 與 `XRPUSDC`（兩者資料皆已在 `data/` 下）
+3. **報告最差 regime 表現**，而非只報平均
+4. **對 `threshold_multiplier` 輸出 sensitivity curve**，不得只報最佳點 —— 尾部參數的最佳點永遠在懸崖邊
+5. **cost sensitivity**（G7）：若三選項排序在 fee ∈ {2,4} bps × slippage ∈ {0,1,2} bps 範圍內翻轉，**不得下結論**
+6. **`threshold_multiplier` ablation**（風險 3ter）：把止盈加倍門檻解耦成獨立參數，分離兩個效應
+
+守門 **G-D1**：任一選項在 test 期間 `liquidated=True` → 該選項淘汰，不論 train 期表現。
+守門 **G-D2**：結論書面陳述必須附上 sensitivity curve 與最差 regime 數字，不得只給單點最佳值。
+
 ---
 
 ## 9. 測試策略
 
 - **`risk.py` 純層單元測試**：trailing 五態（margin 未達閾值 → reset；未啟動且 pnl 未達標；未啟動且 pnl 達標 → activate；追蹤中創新高 → new_peak；追蹤中回撤達標 → flatten + deactivate）；`decide_reduce` 的 AND 條件、`0.8T` 邊界、60s cooldown。
 - **`decision.py` 新行為測試**：`dead_mode_enabled=False` 且倉位遠超 threshold → 仍掛 entry 單（釘住「這是刻意的」，並在測試名稱寫明 why）。
+- **撮合正確性**（Phase 0）：零成本下成交價 **嚴格等於** 掛單價（G-0a2）；`low` 觸及但 `close` 未穿越的 K 線**必須成交**（釘死 G4 錯誤一）；`close` 穿越但成交價非 `close`（釘死 G4 錯誤二）。
+- **強平**（Phase 0）：必爆參數組 → `liquidated is True` 且提前終止（G-0b1）。
 - **`pos==0` characterization**（Phase C 改造**之前**寫，見 G-C1）。
 - **backtester golden**（G-A1），Phase B 沿用以證明無風控路徑未受污染（G-B1）。
 - **主路徑守門**：斷言實驗配置走 `_run_terminal_ui_mode` 而非 legacy（風險 6）。
@@ -359,8 +509,9 @@ peak_margin_usage: float = 0.0      # 全程 margin_usage 最大值（強平距�
 
 ## 10. 後續（不在本次範圍）
 
-1. 用本次交付的工具跑 optimizer，定奪 (a)(b)(c) —— progress.md 未決事項第 1 項的本體
+1. 用本次交付的工具跑 optimizer，定奪 (a)(b)(c) —— progress.md 未決事項第 1 項的本體。**必須走 Phase D 的樣本外流程**
 2. 若採用 GLFT → 先解 §6 風險 1 的 bandit/gamma 耦合
+2bis. **追查 bandit 是否卡住**：`decisions.jsonl` 60001 筆 `grid_spacing`/`take_profit_spacing` 全同值，而 `thompson_enabled: true`、`update_interval: 10`。若 bandit 從未探索，`bandit_state.json` 的持久化與 `select_arm` 路徑有 bug 的可能。**這同時意味著 #6 的 bandit 持久化功能可能從未真正生效過。**
 3. `glft_controller` 重複實作收斂（`enhancements.py:767` vs `decision.py:107`）
 4. `_sync_positions()` 多空 `unrealizedPnl` 加總（`sync_service.py:73`）
 5. anchor 語意污染（`bot.py:406`）
