@@ -82,10 +82,43 @@ def test_decide_normal_long_full():
 
 
 def test_decide_dead_long_enter():
+    # 進入裝死 → 接管整側（撤舊單）+ 掛出 dead_mode_price 的特殊止盈
     dec = d.decide(_inputs(long_position=70, sell_long_orders=0, long_dead_mode=False))
     s = dec.long
-    assert s.enter_dead_mode is True and s.cancel_side is False
+    assert s.enter_dead_mode is True and s.cancel_side is True
     assert len(s.orders) == 1 and s.orders[0].price == pytest.approx(2.625)
+
+
+def test_entering_dead_mode_takes_over_stale_tp_so_position_can_escape():
+    """進入裝死模式時，帳上可能還有正常模式掛的止盈單（價格用 grid_prices 算，
+    與 dead_mode_price 無關）。裝死模式必須接管止盈單的所有權：撤掉舊的、
+    掛上自己依失衡比例算出的那張。
+
+    否則殘留單讓 pending_tp > 0，裝死分支的 `if pending_tp <= 0` 永不成立，
+    dead_mode_price() 一次都不會執行；而 cancel=False 又不撤舊單。倉位因此
+    永遠降不到 threshold 以下，exit_dead_mode 永不觸發 —— 該側網格永久停擺。
+
+    生產實證：logs/decisions.jsonl 63619 筆 / 104.5h，long 側 has_tp=0%、
+    exit_dead=0、long_position 恆為 0.58（threshold=0.4）。
+    """
+    dec = d.decide(_inputs(
+        long_position=70,        # > threshold(60) → 裝死
+        short_position=0,        # 無對手倉 → fallback 1.05 → 2.5*1.05 = 2.625
+        buy_long_orders=0,       # 裝死不補倉（與生產一致），順帶讓 should_adjust=True
+        sell_long_orders=1,      # ← 正常模式殘留的止盈單
+        long_dead_mode=False,    # 這個 tick 才進入裝死
+    ))
+    s = dec.long
+
+    assert s.enter_dead_mode is True
+    assert s.cancel_side is True, "進入裝死必須撤掉正常模式殘留的止盈單"
+
+    tps = [o for o in s.orders if o.reduce_only]
+    assert len(tps) == 1, "進入裝死必須掛出自己的特殊止盈單"
+    assert tps[0].price == pytest.approx(2.625)
+    assert tps[0].quantity == pytest.approx(6.0)   # tp_quantity: 70 > limit(15) → 3*2
+
+    assert not [o for o in s.orders if not o.reduce_only], "裝死模式不得補倉"
 
 
 def test_decide_side_not_adjust_returns_empty():

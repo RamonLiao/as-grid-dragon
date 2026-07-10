@@ -55,14 +55,15 @@ async def test_normal_mode_long_places_tp_and_entry():
 # ──────────────────────────── 多頭：裝死模式 ────────────────────────────
 
 @pytest.mark.asyncio
-async def test_dead_mode_enter_places_special_tp_no_cancel():
-    """裝死（持倉 > threshold=60）且無 pending tp：只掛特殊止盈，不撤單，設 dead flag。"""
+async def test_dead_mode_entry_takes_over_the_side_so_grid_can_stop_adding():
+    """進入裝死必須接管整側掛單：撤掉正常模式的殘留單（含開倉單，否則「停止補倉」
+    只是不掛新單、舊單照樣成交），再掛出自己的特殊止盈。"""
     bot = _make_bot()
     sc = bot.config.symbols[SYMBOL]
     st = _state(bot, latest_price=2.5, long_position=70, short_position=0,
                 sell_long_orders=0, long_dead_mode=False)
     await bot._place_grid(SYMBOL, sc, "long")
-    bot.order_executor.cancel_orders_for_side.assert_not_awaited()
+    bot.order_executor.cancel_orders_for_side.assert_awaited_once_with(SYMBOL, "long")
     assert st.long_dead_mode is True
     # 無對手倉 → fallback 1.05 → 2.625；tp_qty：long_pos(70) > limit(15) → 加倍 = 6
     bot.order_executor.place_order.assert_awaited_once_with(
@@ -70,13 +71,36 @@ async def test_dead_mode_enter_places_special_tp_no_cancel():
 
 
 @pytest.mark.asyncio
-async def test_dead_mode_with_pending_tp_does_nothing():
-    """裝死且已有 pending tp（sell_long_orders>0）：不下單。"""
+async def test_dead_mode_entry_replaces_stale_tp_instead_of_yielding_to_it():
+    """進入裝死時帳上已有正常模式的止盈單：必須撤掉並改掛 dead_mode_price 那張。
+
+    回歸守衛：舊實作的 `if pending_tp <= 0` 讓殘留單擋住特殊止盈，倉位永遠
+    降不回 threshold 以下 → 該側永久停擺（生產實證 104.5h / 63619 筆決策，
+    long 側 has_tp=0%、exit_dead=0）。
+    """
+    bot = _make_bot()
+    sc = bot.config.symbols[SYMBOL]
+    _state(bot, latest_price=2.5, long_position=70, short_position=0,
+           sell_long_orders=1, long_dead_mode=False)
+    await bot._place_grid(SYMBOL, sc, "long")
+    bot.order_executor.cancel_orders_for_side.assert_awaited_once_with(SYMBOL, "long")
+    bot.order_executor.place_order.assert_awaited_once_with(
+        SYMBOL, "sell", pytest.approx(2.625), 6.0, True, "long")
+
+
+@pytest.mark.asyncio
+async def test_dead_mode_steady_state_does_not_rehang_tp_every_tick():
+    """已在裝死中且止盈單還掛著：不重掛。
+
+    `should_adjust` 在裝死下恆為 True（無開倉單），生產約每 6 秒一個 tick，
+    每 tick 撤單重掛會直接餵給 order_executor 的下單斷路器。節流靠此分支。
+    """
     bot = _make_bot()
     sc = bot.config.symbols[SYMBOL]
     _state(bot, latest_price=2.5, long_position=70, sell_long_orders=1, long_dead_mode=True)
     await bot._place_grid(SYMBOL, sc, "long")
     bot.order_executor.place_order.assert_not_awaited()
+    bot.order_executor.cancel_orders_for_side.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -111,14 +135,14 @@ async def test_normal_mode_short_places_tp_and_entry():
 # ──────────────────────────── 空頭鏡像：裝死模式 ────────────────────────────
 
 @pytest.mark.asyncio
-async def test_dead_mode_enter_places_special_tp_no_cancel_short():
-    """裝死空頭且無 pending tp：只掛特殊止盈(buy)，不撤單，設 dead flag。"""
+async def test_dead_mode_entry_takes_over_the_side_so_grid_can_stop_adding_short():
+    """空頭鏡像：進入裝死接管整側掛單，再掛特殊止盈(buy)。"""
     bot = _make_bot()
     sc = bot.config.symbols[SYMBOL]
     st = _state(bot, latest_price=2.5, long_position=0, short_position=70,
                 buy_short_orders=0, short_dead_mode=False)
     await bot._place_grid(SYMBOL, sc, "short")
-    bot.order_executor.cancel_orders_for_side.assert_not_awaited()
+    bot.order_executor.cancel_orders_for_side.assert_awaited_once_with(SYMBOL, "short")
     assert st.short_dead_mode is True
     # 無對手倉 → fallback 0.95 → 2.375；tp_qty：short_pos(70) > limit(15) → 加倍 = 6
     bot.order_executor.place_order.assert_awaited_once_with(
