@@ -62,6 +62,15 @@ class Config:
     # 是否使用終端 UI 兼容模式 (order_value = initial_quantity × price)
     terminal_ui_mode: bool = True
 
+    # 初始持倉注入（seed position）：讓回測從既有倉位起跑，重現生產裝死狀態。
+    # qty>0 時 pre-populate 一張 lot @ seed price（單 lot 均價，pnl 只看價差故等價於
+    # 多 lot 加權平均）；margin 從 balance 扣、不扣 fee（既存倉位非本回測新成交）。
+    # 全 0（預設）→ 與空倉起跑 bit-identical。
+    seed_long_qty: float = 0.0
+    seed_long_price: float = 0.0
+    seed_short_qty: float = 0.0
+    seed_short_price: float = 0.0
+
     @property
     def long_settings(self) -> dict:
         """多頭設定：上方止盈(小間距)，下方補倉(大間距)"""
@@ -104,6 +113,10 @@ class Config:
             "funding_enabled": self.funding_enabled,
             "maintenance_margin_rate": self.maintenance_margin_rate,
             "dead_mode_enabled": self.dead_mode_enabled,
+            "seed_long_qty": self.seed_long_qty,
+            "seed_long_price": self.seed_long_price,
+            "seed_short_qty": self.seed_short_qty,
+            "seed_short_price": self.seed_short_price,
         }
 
     @classmethod
@@ -132,6 +145,10 @@ class Config:
                 if isinstance(data.get("funding_enabled", True), bool) else True,
             maintenance_margin_rate=data.get("maintenance_margin_rate", 0.005),
             dead_mode_enabled=data.get("dead_mode_enabled", True),
+            seed_long_qty=data.get("seed_long_qty", 0.0),
+            seed_long_price=data.get("seed_long_price", 0.0),
+            seed_short_qty=data.get("seed_short_qty", 0.0),
+            seed_short_price=data.get("seed_short_price", 0.0),
         )
 
     def save(self, filepath: str):

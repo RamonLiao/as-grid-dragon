@@ -601,6 +601,18 @@ class GridBacktester:
         trades: list = []
         equity_curve: list = []
 
+        # 初始持倉注入（seed）：pre-populate lot @ seed price，margin 從 balance 扣、
+        # 不扣 fee（既存倉位非本回測新成交）。全 0 → 不 append → 與空倉起跑等價。
+        # 用途：重現生產裝死狀態（空倉起跑碰不到 threshold，見 tests/test_backtest_seed_position.py）。
+        for _side, _qty, _px, _bucket in (
+            ("long", cfg.seed_long_qty, cfg.seed_long_price, long_positions),
+            ("short", cfg.seed_short_qty, cfg.seed_short_price, short_positions),
+        ):
+            if _qty > 0 and _px > 0 and cfg.direction in (_side, "both"):
+                _margin = (_qty * _px) / leverage
+                balance -= _margin
+                _bucket.append({"price": _px, "qty": _qty, "margin": _margin})
+
         # pending 掛單狀態：每側 entry/tp 各為 {"price","qty"} 或 None，驅動 should_adjust
         pend = {"long": {"entry": None, "tp": None},
                 "short": {"entry": None, "tp": None}}
