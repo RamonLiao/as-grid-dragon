@@ -48,12 +48,22 @@ def test_final_equity_includes_margin_locked_in_open_positions():
 
 
 def test_equity_curve_never_dips_below_balance_plus_unrealized():
-    """equity_curve 的每一點也要含 open margin —— max_drawdown 從它算出來。"""
+    """equity_curve 的每一點也要含 open margin —— max_drawdown 從它算出來。
+
+    實測對照（同一筆資料）：
+      修法前（equity 漏算 open_margin，commit 306e9f4）：worst_equity = 969.6170
+      修法後（equity 含 open_margin，commit e10952f）：worst_equity = 993.9700
+
+    原斷言 worst_equity > 900.0 在修法前就會通過，無法守住「equity_curve 必須含 open_margin」
+    這件事。改為 990.0，落在兩個實測值之間，能確保：
+      修法前會紅（969.617 不 > 990.0）
+      修法後會綠（993.970 > 990.0）
+    """
     prices = [100.0] * 3 + [99.0, 98.0, 97.0, 96.0, 95.0]
     res = GridBacktester(_flat_df(prices), _zero_cost_cfg()).run()
     # 全程未平倉、價格單調下跌 → 權益最低點不該低於「本金 - 未實現虧損」
     worst_equity = min(e[2] for e in res.equity_curve)
-    assert worst_equity > 900.0, (
+    assert worst_equity > 990.0, (
         f"權益曲線最低點 {worst_equity} 過低，疑似漏算 open margin"
     )
 
