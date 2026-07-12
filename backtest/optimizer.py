@@ -2,6 +2,7 @@
 參數優化器模組
 網格搜尋與參數優化
 """
+import logging
 import pandas as pd
 from typing import List, Dict, Optional, Callable, Tuple
 from dataclasses import dataclass
@@ -11,13 +12,17 @@ import multiprocessing
 from .config import Config
 from .backtester import GridBacktester, BacktestResult
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class OptimizationResult:
     """優化結果"""
     best_config: Config
     best_result: BacktestResult
-    all_results: pd.DataFrame
+    all_results: pd.DataFrame  # 全部參數組合結果（含淘汰/強平列），先按 liquidated 升序、
+                               # 再按 metric 排序，故第一列必為合格解（若存在）。
+                               # 淘汰列仍保留在尾端供使用者檢視；前端呈現時務必對 liquidated 列做視覺區分。
     param_importance: Dict[str, float]
 
     def __str__(self) -> str:
@@ -85,10 +90,62 @@ class GridOptimizer:
         })
 
     def _run_single_backtest(self, params: Dict) -> Dict:
-        """執行單次回測"""
+        """執行單次回測。被 run() 的單線程與多進程分支均呼叫。
+
+        批次路徑（網格搜尋 / grid search）：should_liquidate() 對無效輸入
+        （非有限 price/equity、負倉位等）會 raise ValueError（見
+        backtest/liquidation.py 的 defense-in-depth 設計）。正常路徑不會
+        觸發它（backtester.py 主迴圈已擋掉髒 K 線），但若上游防禦有洞，
+        炸掉的不能是整個批次優化 —— 淘汰這一組參數、大聲記錄，讓其餘
+        組合繼續跑。只 catch ValueError：其他例外類型（含 KeyboardInterrupt）
+        一律照常往上炸，不吞。
+
+        多進程側：executor.submit() 呼叫此方法時發生的 ValueError 會被
+        catch 並回傳淘汰 dict；future.result() 讀回的是該 dict 而非例外，
+        主進程側不會收到例外。單線程側也經此处 catch。
+
+        淘汰機制（Task 5b review R3 修正）：淘汰**不再靠排序**，而是靠
+        `liquidated` 旗標 + `run()` 在選最佳前的一票否決過濾（見 run()）。
+        前兩輪嘗試用「哨兵值排最後」表達淘汰，連錯三次 —— 因為真實災難組
+        的指標可以比任何事先猜測的哨兵值更差（max_drawdown 實測達 1.1726
+        > 舊哨兵 1.0；final_equity 實測達 -17.26 < 舊哨兵 0.0；return_pct
+        實測達 -1.0176 < 舊哨兵 -1.0）。只要哨兵值不是真正的數學下界/上界，
+        排序法就有機率讓淘汰組奪冠、進而在 run() 重跑 best_row 時再次炸出
+        同一個 ValueError。
+
+        以下哨兵值僅是「明確無效標記」（defense-in-depth：萬一有人繞過
+        run() 直接對 self.results 排序，至少不會拿到假的好結果），
+        **不再承擔淘汰責任**：
+        - return_pct / sharpe_ratio / final_equity: -inf（數學下界，恆成立）
+        - max_drawdown: inf（數學上界，恆成立）
+        - trades: 0、win_rate: 0.0、profit_factor: 0.0（維持原值）
+        - liquidated: True（真正的淘汰依據，由 run() 過濾）
+        - value_error_eliminated: True（供 run() 統計「因例外淘汰」與
+          「因真實強平淘汰」的組數，寫入 RuntimeError 訊息）
+        """
         config = self._create_config(params)
-        bt = GridBacktester(self.df.copy(), config)
-        result = bt.run()
+        try:
+            bt = GridBacktester(self.df.copy(), config)
+            result = bt.run()
+        except ValueError as e:
+            logger.warning(
+                "參數組合觸發 should_liquidate() 的無效輸入防線，淘汰此組並繼續: "
+                "params=%r, error=%s", params, e
+            )
+            return {
+                **params,
+                "return_pct": float("-inf"),
+                "max_drawdown": float("inf"),
+                "trades": 0,
+                "win_rate": 0.0,
+                "profit_factor": 0.0,
+                "sharpe_ratio": float("-inf"),
+                "final_equity": float("-inf"),
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "liquidated": True,
+                "value_error_eliminated": True,
+            }
 
         return {
             **params,
@@ -100,7 +157,9 @@ class GridOptimizer:
             "sharpe_ratio": result.sharpe_ratio,
             "final_equity": result.final_equity,
             "realized_pnl": result.realized_pnl,
-            "unrealized_pnl": result.unrealized_pnl
+            "unrealized_pnl": result.unrealized_pnl,
+            "liquidated": result.liquidated,
+            "value_error_eliminated": False,
         }
 
     def generate_param_combinations(self) -> List[Dict]:
@@ -138,7 +197,11 @@ class GridOptimizer:
             progress_callback: 進度回調函數 (current, total)
 
         Returns:
-            OptimizationResult: 優化結果
+            OptimizationResult: 優化結果。
+
+            注意：result.all_results 保留全部參數組合（含 liquidated=True 的淘汰/強平組），
+            先按 liquidated 升序、再按 metric 排序，故第一列必為合格解（若存在合格解）。
+            淘汰列仍保留在尾端供使用者檢視；前端呈現時務必對 liquidated 列做視覺區分。
         """
         combinations = self.generate_param_combinations()
         total = len(combinations)
@@ -176,16 +239,44 @@ class GridOptimizer:
                     if progress_callback:
                         progress_callback(i + 1, total)
 
-        # 轉換為 DataFrame 並排序
+        # 轉換為 DataFrame 並排序（保留全部列，含淘汰/強平組，供使用者檢視）。
+        # liquidated 是主排序鍵（升序，False < True）、metric 是次要鍵，確保
+        # all_results.iloc[0] 在任何 metric 下都保證是合格解（若存在）——
+        # 否則 web/pages/3_🔬_回測優化.py 直接對 all_results 取 iloc[0] 會選中
+        # 爆倉組（例如 metric="max_drawdown" 時，爆倉組的回撤可能天然排最小）。
         df_results = pd.DataFrame(self.results)
-        df_results = df_results.sort_values(metric, ascending=ascending)
+        df_results = df_results.sort_values(
+            ["liquidated", metric], ascending=[True, ascending]
+        )
 
-        # 取得最佳結果
-        best_row = df_results.iloc[0]
+        # 一票否決：liquidated == True 的列（含真實強平與 ValueError 淘汰組）
+        # 一律排除於「選最佳」之外。這是淘汰機制本身 —— 不是排序，是過濾。
+        # df_results 仍保留全部列（見上方），只有這裡的 eligible 子集用於選最佳。
+        eligible = df_results[~df_results["liquidated"].astype(bool)]
+
+        if eligible.empty:
+            n_total = len(df_results)
+            n_value_error = int(
+                df_results["value_error_eliminated"]
+                .astype(bool)
+                .sum()
+            )
+            n_real_liquidation = n_total - n_value_error
+            raise RuntimeError(
+                f"全部 {n_total} 組參數皆遭淘汰或強平，無可用最佳解"
+                f"（其中 {n_value_error} 組因 ValueError 例外被淘汰，"
+                f"{n_real_liquidation} 組為正常回測後強平 liquidated=True）。"
+                f"請檢查參數範圍是否過於激進，或回測資料是否異常。"
+            )
+
+        # 取得最佳結果（僅從未淘汰組中選）
+        best_row = eligible.iloc[0]
         best_params = {k: best_row[k] for k in self.param_ranges.keys()}
         best_config = self._create_config(best_params)
 
-        # 重新執行最佳配置以取得完整結果
+        # 重新執行最佳配置以取得完整結果 —— best_row 已保證非淘汰組，
+        # 理論上不會再拋 ValueError；即便拋出也不 catch，讓它照常往上炸
+        # （代表回測本身不具確定性，是更嚴重的問題，不該被靜默吞掉）。
         bt = GridBacktester(self.df.copy(), best_config)
         best_result = bt.run()
 
@@ -214,15 +305,23 @@ class GridOptimizer:
               f"回撤: {result['max_drawdown']*100:.2f}%")
 
     def _calculate_param_importance(self, df: pd.DataFrame, metric: str) -> Dict[str, float]:
-        """計算參數重要性"""
+        """計算參數重要性
+
+        重要：極值哨兵（inf/-inf）會傳染進任何聚合（mean/std/corr），
+        讓整個 group 的平均變成 inf/nan。因此聚合必須在排除淘汰列之後做。
+        這裡使用的 eligible 子集與 run() 選最佳時用的是同一個。
+        """
         importance = {}
 
+        # 過濾掉淘汰列，只對合格的參數組合做聚合
+        df_eligible = df[~df["liquidated"].astype(bool)]
+
         for param in self.param_ranges.keys():
-            if param not in df.columns:
+            if param not in df_eligible.columns:
                 continue
 
             # 計算每個參數值對應的平均指標值的方差
-            grouped = df.groupby(param)[metric].mean()
+            grouped = df_eligible.groupby(param)[metric].mean()
             importance[param] = grouped.std() if len(grouped) > 1 else 0
 
         # 正規化
@@ -238,6 +337,10 @@ class GridOptimizer:
     ) -> pd.DataFrame:
         """
         對稱間距搜尋 (止盈=補倉)
+
+        警告：此方法目前無呼叫者（死碼）。迴圈內直接呼叫 bt.run()，未 catch
+        should_liquidate() 的 ValueError；若日後復活，須比照 _run_single_backtest
+        加保護，否則一組壞參數會炸掉整趟掃描。
 
         Args:
             spacings: 間距列表
@@ -288,6 +391,10 @@ class GridOptimizer:
     ) -> pd.DataFrame:
         """
         非對稱間距搜尋
+
+        警告：此方法目前無呼叫者（死碼）。迴圈內直接呼叫 bt.run()，未 catch
+        should_liquidate() 的 ValueError；若日後復活，須比照 _run_single_backtest
+        加保護，否則一組壞參數會炸掉整趟掃描。
 
         Args:
             take_profits: 止盈間距列表
@@ -344,6 +451,10 @@ class GridOptimizer:
     def compare_directions(self) -> pd.DataFrame:
         """
         比較不同方向策略
+
+        警告：此方法目前無呼叫者（死碼）。迴圈內直接呼叫 bt.run()，未 catch
+        should_liquidate() 的 ValueError；若日後復活，須比照 _run_single_backtest
+        加保護，否則一組壞參數會炸掉整趟掃描。
 
         Returns:
             結果 DataFrame

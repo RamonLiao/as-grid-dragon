@@ -25,23 +25,48 @@ from grid_engine.enhancements import (
     DynamicGridManager, LeadingIndicatorManager, GLFTController, MaxEnhancement,
 )
 from backtest.costs import apply_slippage, funding_charge
+from backtest.matching import entry_crossed, tp_crossed
+from backtest.liquidation import margin_usage, should_liquidate
 
-# 回測保真限制（樂觀成交模型，與實盤的已知差異）。寫入 BacktestResult.notes。
+# 回測保真限制（與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
     "回測保真限制: "
-    "(1) 樂觀成交——限價單以當根收盤價成交、無 queue/部分成交佇列; "
+    "(1) 限價單撮合——用該根 high/low 判穿越、成交於掛單價（撮合價=掛單價；執行成本 haircut 另行疊加，見 (7)）；"
+    "無 queue position、無部分成交、無排隊落空(maker 單的真實風險); "
     "(2) flat-entry 近似——零倉位 bootstrap 沿用收盤價觸發即進場; "
     "(3) leading/ATR/GLFT 增強於回測退化為中性(全關); "
-    "(4) Bandit 參數優化不在回測 loop 內重現; "
+    "(4) Bandit 不在回測 loop 內重現。實盤 bandit.enabled=true 時會【無條件覆寫】"
+    "grid_spacing/take_profit_spacing(grid_engine/bot.py:355-358)，config 值不生效——"
+    "故實驗期間必須 bandit.enabled=false 並顯式設定受測間距，否則回測與實盤跑的不是同一個策略; "
     "(5) 決策同源實盤 decide()，實盤每 10s 追價重掛(pos==0)於回測以 should_adjust 偏離門檻近似; "
     "(6) 進場量語意=固定幣量(=initial_quantity，同實盤下單)，舊/新 equity 曲線不可直接比較; "
-    "(7) 成本模型(主路徑)——slippage_bps 執行成本 haircut(逆選擇代理，非訂單簿滑價；"
-    "網格 maker 單實際成交價≤掛單價，此 bps 當保守緩衝) + funding 現金流結算"
+    "(7) 成本模型(主路徑)——fee_pct 預設 maker 0.02%(網格全是限價單) + "
+    "slippage_bps 執行成本 haircut(逆選擇代理，非訂單簿滑價；maker 的風險是逆選擇與排隊落空，"
+    "用滑價代理量級可能差一個數量級) + funding 現金流結算"
     "(真實歷史 settlement 時點，缺漏時點 rate=0；notional 用 bar close 當 mark price 代理"
-    "；funding 快取按 symbol 不按區間，同 symbol 更寬回測區間需先刪 data/funding/<symbol>.csv 重抓，否則尾段缺漏 rate=0); "
-    "(8) 保守堆疊——fee_pct 預設 0.04%(taker)已對 maker 網格偏保守，疊 slippage haircut → "
-    "回測績效偏低估、屬刻意保守下界; "
-    "(9) legacy 路徑(initial_quantity<=0)不含成本模型。"
+    "；funding 快取按 symbol 不按區間，同 symbol 更寬回測區間需先刪 data/funding/<symbol>.csv 重抓); "
+    "(8) 【不宣稱保守下界】——成本按成交次數收，會系統性偏袒低換手方案；"
+    "比較換手率差異大的方案時必須做 cost sensitivity(scripts/cost_sensitivity.py)，"
+    "排序若在合理成本範圍內翻轉則不得下結論; "
+    "(9) 強平模型——維持保證金=倉位名目×maintenance_margin_rate(單一費率代理幣安分層階梯)；"
+    "判定用本根盤中最不利價(hedge mode 多空混合時 low/high 各算一次取權益較小者)，"
+    "非收盤價，理由同 (1)：盤中已爆倉、收盤回升的 K 線不該判為存活；"
+    "但盤中的先後順序未建模——本根進場/止盈成交(_settle)恆先於強平判定，"
+    "實際市場中三者(entry/tp/liquidation)的真實時序未知；"
+    "peak_margin_usage 亦以盤中最不利價計算；觸發即以該最不利價全平並終止回測，"
+    "liquidated=True 的參數組應一票否決; "
+    "(9b) max_drawdown 的谷底同樣改用本根盤中最不利權益(不是收盤價的 equity_curve)，"
+    "峰頂仍用收盤權益的 running max(high-water mark 用收盤價是標準做法)——"
+    "同一個「盤中觸及才是真相」的論證：盤中反覆逼近爆倉、收盤回升的策略若谷底吃收盤價，"
+    "尾部風險會被系統性低估；equity_curve 本身恆用收盤價(供繪圖用，不是風險指標)，"
+    "故 min(equity_curve) 可能高於 max_drawdown 隱含的谷底，兩者不保證一致; "
+    "(10) margin_usage 為單 symbol，實盤 state.margin_usage 是帳戶層(跨 symbol)，結論不得外推; "
+    "(11) legacy 路徑(initial_quantity<=0)不含成本模型、不含強平、不含 high/low 撮合; "
+    "(12) 初始持倉注入(seed position)——注入的 lot 進 index 0，後續 partial TP 走 "
+    "per-lot FIFO 會【先平這張 seed lot】並對其認列 realized(例如多頭高價 690 的 lot)，"
+    "而生產 Binance hedge mode 是對【混合均價】結算；故涉及 seed 部分平倉的實驗"
+    "(threshold 掃描)其 realized_pnl 與 final_equity 會系統性偏離生產，只可看方向、"
+    "不可當精確預測。seed 全 0(預設)時本條不適用(與空倉起跑 bit-identical)。"
 )
 
 
@@ -103,6 +128,8 @@ class BacktestResult:
     equity_curve: List[Tuple] = field(default_factory=list)
     notes: str = ""  # 保真限制 / 已知差異說明
     funding_paid: float = 0.0  # funding 現金流總額（正=淨付出），不計入 trades
+    peak_margin_usage: float = 0.0   # 全程 margin_usage 最大值（強平距離代理）
+    liquidated: bool = False         # 觸發強平 → spec §7 一票否決，不進優化目標
 
     def to_dict(self) -> dict:
         """轉換為字典"""
@@ -119,6 +146,8 @@ class BacktestResult:
             "sharpe_ratio": self.sharpe_ratio,
             "direction": self.direction,
             "funding_paid": self.funding_paid,
+            "peak_margin_usage": self.peak_margin_usage,
+            "liquidated": self.liquidated,
         }
 
     def __str__(self) -> str:
@@ -508,11 +537,39 @@ class GridBacktester:
         Returns:
             BacktestResult: 回測結果
         """
+        self._validate_seed()
         # 使用終端 UI 兼容模式
         if self.config.terminal_ui_mode and self.config.initial_quantity > 0:
             return self._run_terminal_ui_mode()
         else:
             return self._run_legacy_mode()
+
+    def _validate_seed(self) -> None:
+        """初始持倉注入的前置驗證：qty>0 但無法如實注入 → 大聲 raise。
+
+        seed 數字會定實盤 threshold_multiplier 並影響入金決策，靜默空倉起跑
+        （值非法被跳過、或路由走沒有 seed 邏輯的 legacy 路徑）是最危險的
+        失效模式（內部 review I1/M1）。qty==0 = 合法不注入，直接跳過。
+        """
+        cfg = self.config
+        for side, qty, px in (("long", cfg.seed_long_qty, cfg.seed_long_price),
+                              ("short", cfg.seed_short_qty, cfg.seed_short_price)):
+            if qty == 0:
+                continue  # 合法：該側不注入
+            if qty < 0 or not math.isfinite(qty):
+                raise ValueError(f"seed_{side}_qty={qty} 非法（qty!=0 時須 >0 且有限）")
+            if px <= 0 or not math.isfinite(px):
+                raise ValueError(f"seed_{side}_price={px} 非法（qty>0 時須 >0 且有限）")
+            if not (cfg.terminal_ui_mode and cfg.initial_quantity > 0):
+                raise ValueError(
+                    f"seed_{side} 已設定但回測會走 legacy 路徑"
+                    f"（terminal_ui_mode={cfg.terminal_ui_mode}, "
+                    f"initial_quantity={cfg.initial_quantity}）——legacy 無 seed 注入，"
+                    "會靜默空倉起跑；seed 僅支援 terminal_ui_mode 主路徑")
+            if cfg.direction not in (side, "both"):
+                raise ValueError(
+                    f"seed_{side} 已設定但 direction={cfg.direction} 不含該側——"
+                    "回測方向與注入方向矛盾")
 
     def _build_bundle(self) -> ManagerBundle:
         """回測用真 manager 實例，全增強關閉 → build_snapshot 回傳中性間距/bias。
@@ -569,10 +626,33 @@ class GridBacktester:
             fund_i += 1
 
         max_equity = balance
+        min_worst_equity = balance  # max_drawdown 谷底：盤中最不利權益的全程最小值
+        peak_margin_usage = 0.0
+        liquidated = False
         long_positions: list = []
         short_positions: list = []
         trades: list = []
         equity_curve: list = []
+
+        # 初始持倉注入（seed）：pre-populate lot @ seed price，margin 從 balance 扣、
+        # 不扣 fee（既存倉位非本回測新成交）。全 0 → 不 append → 與空倉起跑等價。
+        # 用途：重現生產裝死狀態（空倉起跑碰不到 threshold，見 tests/test_backtest_seed_position.py）。
+        # 注入點自身也 raise（不只靜默跳過），防直接調 _run_terminal_ui_mode 繞過
+        # run() 的 _validate_seed（內部 review M4，defense-in-depth）。qty==0 = 跳過。
+        for _side, _qty, _px, _bucket in (
+            ("long", cfg.seed_long_qty, cfg.seed_long_price, long_positions),
+            ("short", cfg.seed_short_qty, cfg.seed_short_price, short_positions),
+        ):
+            if _qty == 0:
+                continue
+            if (_qty < 0 or not math.isfinite(_qty) or _px <= 0
+                    or not math.isfinite(_px) or cfg.direction not in (_side, "both")):
+                raise ValueError(
+                    f"seed_{_side} 非法或方向矛盾（qty={_qty} px={_px} "
+                    f"direction={cfg.direction}）——不得靜默丟棄")
+            _margin = (_qty * _px) / leverage
+            balance -= _margin
+            _bucket.append({"price": _px, "qty": _qty, "margin": _margin})
 
         # pending 掛單狀態：每側 entry/tp 各為 {"price","qty"} 或 None，驅動 should_adjust
         pend = {"long": {"entry": None, "tp": None},
@@ -621,20 +701,36 @@ class GridBacktester:
                     pos["margin"] -= close_margin
                     remaining = 0
 
-        def _settle(side: str, price: float, ts) -> None:
-            """結算既有 pending（上一根掛的單）對本根價格的成交，樂觀以收盤價成交。"""
+        def _equity_at(p: float) -> float:
+            """權益 at 假設價格 p（用於盤中最不利價強平判定，非權益曲線）。"""
+            u = sum((p - x["price"]) * x["qty"] for x in long_positions)
+            u += sum((x["price"] - p) * x["qty"] for x in short_positions)
+            om = (sum(x["margin"] for x in long_positions)
+                  + sum(x["margin"] for x in short_positions))
+            return balance + om + u
+
+        def _settle(side: str, bar_low: float, bar_high: float, ts) -> None:
+            """結算既有 pending（上一根掛的單）對本根 K 線的成交。
+
+            穿越用 high/low 判定（限價單盤中觸及即成交）；成交價一律是掛單價（執行成本 haircut 已於 _open/_close 內另行疊加）。
+            close 不再參與撮合——它既不決定有沒有成交，也不決定成交在哪。
+            同根雙觸發時 entry 先於 tp（保守：先增加曝險）。止盈單是 reduce_only，
+            交易所只允許平「成交當下已存在」的倉位；entry 先成交會讓 _close 的
+            FIFO 誤平到本根才剛開的倉（樂觀，污染 realized_pnl）。故先快照
+            entry 結算前的持倉量，止盈可平數量 clamp 在該快照之內。
+            """
             positions = long_positions if side == "long" else short_positions
+            prior_qty = sum(p["qty"] for p in positions)
             e = pend[side]["entry"]
-            if e is not None:
-                crossed = price <= e["price"] if side == "long" else price >= e["price"]
-                if crossed and _open(side, price, e["qty"]):
+            if e is not None and entry_crossed(side, bar_low, bar_high, e["price"]):
+                if _open(side, e["price"], e["qty"]):
                     pend[side]["entry"] = None
             t = pend[side]["tp"]
-            if t is not None and positions:
-                crossed = price >= t["price"] if side == "long" else price <= t["price"]
-                if crossed:
-                    _close(side, price, t["qty"], ts)
-                    pend[side]["tp"] = None
+            if t is not None and positions and tp_crossed(side, bar_low, bar_high, t["price"]):
+                closable = min(t["qty"], prior_qty)
+                if closable > 0:
+                    _close(side, t["price"], closable, ts)
+                pend[side]["tp"] = None
 
         try:
             for _, row in self.df.iterrows():
@@ -650,10 +746,16 @@ class GridBacktester:
                 clock.set_clock(lambda t=epoch: t)
                 self._dgm.update_price(sym, price)
 
-                # 先結算成交（用上一根掛出的 pending）
+                # 先結算成交（用上一根掛出的 pending）；穿越判定吃本根 high/low
+                bar_high = row['high']
+                bar_low = row['low']
+                if not (isinstance(bar_high, (int, float)) and isinstance(bar_low, (int, float))
+                        and math.isfinite(bar_high) and math.isfinite(bar_low)
+                        and bar_low > 0 and bar_high >= bar_low):
+                    bar_high = bar_low = price   # 髒 OHLC 退化為 close（保守）
                 for side in ("long", "short"):
                     if cfg.direction in (side, "both"):
-                        _settle(side, price, timestamp)
+                        _settle(side, bar_low, bar_high, timestamp)
 
                 # funding 現金流結算：掃過所有 <= 本根 epoch 的 settlement（data-driven，非 8h 網格）
                 if settlements and epoch > 0:
@@ -714,10 +816,59 @@ class GridBacktester:
                     if sd.new_anchor_price is not None:
                         anchor[side] = sd.new_anchor_price
 
-                # 計算淨值
+                # 計算淨值。balance 已扣除未平倉位的 margin（_open 扣、_close 才加回），
+                # 故必須把 open_margin 加回來，否則權益被低估、回撤被虛增（G8）。
+                # 這是「權益曲線」的 equity，恆用收盤價算 —— equity_curve 是曲線，
+                # 不是風險指標，不該用盤中最不利價（那會讓曲線鋸齒狀跳動，失去可讀性）。
                 unrealized = sum((price - p["price"]) * p["qty"] for p in long_positions)
                 unrealized += sum((p["price"] - price) * p["qty"] for p in short_positions)
-                equity = balance + unrealized
+                open_margin = (sum(p["margin"] for p in long_positions)
+                               + sum(p["margin"] for p in short_positions))
+                equity = balance + open_margin + unrealized
+                long_pos_qty = sum(p["qty"] for p in long_positions)
+                short_pos_qty = sum(p["qty"] for p in short_positions)
+
+                # 強平判定與 peak_margin_usage 必須用「本根 K 線內對持倉最不利的價格」，
+                # 不能用收盤價 —— 撮合已改用 high/low 判穿越（真實 K 線實測 close-only
+                # 漏掉 48.5% 成交，見 tests/test_backtest_matching_realdata.py），同一個
+                # 「盤中觸及才是真相」的論證完全適用於強平：盤中已爆倉、收盤回升的
+                # K 線若判為存活，就是讓回測比真實好看。hedge mode 下可能多空同時持倉，
+                # 最不利點不保證落在 low 或 high，兩個都算、取權益較小者。
+                # 注意：本根的進場/止盈成交（_settle）已在上面先發生，此處只判斷
+                # 「結算後剩下的倉位」會不會被強平——盤中三者（entry/tp/liquidation）
+                # 的真實時序未建模，見 FIDELITY_NOTES (9)。
+                worst_price, worst_equity = min(
+                    ((p, _equity_at(p)) for p in (bar_low, bar_high)),
+                    key=lambda t: t[1],
+                )
+                # max_drawdown 的谷底同樣吃「盤中最不利價」——同一個「盤中觸及才是
+                # 真相」的論證：撮合(1)與強平(9)都已套用，若谷底仍用收盤價的
+                # equity_curve 算，盤中反覆逼近爆倉、收盤回升的策略會被系統性低估
+                # 尾部風險（dual-review R1 第二輪 Important #2）。峰頂仍用收盤價
+                # 的 max_equity（high-water mark 用收盤價是標準做法）。
+                if worst_equity < min_worst_equity:
+                    min_worst_equity = worst_equity
+
+                mu = margin_usage(long_pos_qty, short_pos_qty, worst_price, leverage, worst_equity)
+                if mu > peak_margin_usage:
+                    peak_margin_usage = mu
+
+                if should_liquidate(worst_equity, long_pos_qty, short_pos_qty, worst_price,
+                                    cfg.maintenance_margin_rate):
+                    # 全平多空倉（走 _close → 進 trades、反映在 realized_pnl），終止回測。
+                    # 以 worst_price 平倉：強平價是盤中最不利價，不是收盤價。
+                    if long_positions and cfg.direction in ("long", "both"):
+                        _close("long", worst_price, sum(p["qty"] for p in long_positions), timestamp)
+                    if short_positions and cfg.direction in ("short", "both"):
+                        _close("short", worst_price, sum(p["qty"] for p in short_positions), timestamp)
+                    liquidated = True
+                    unrealized = 0.0
+                    open_margin = 0.0
+                    equity = balance
+                    max_equity = max(max_equity, equity)
+                    equity_curve.append((timestamp, price, equity))
+                    break
+
                 max_equity = max(max_equity, equity)
                 equity_curve.append((timestamp, price, equity))
         finally:
@@ -729,7 +880,9 @@ class GridBacktester:
         unrealized_pnl += sum((p["price"] - final_price) * p["qty"] for p in short_positions)
 
         realized_pnl = sum(t["pnl"] for t in trades)
-        final_equity = balance + unrealized_pnl
+        final_open_margin = (sum(p["margin"] for p in long_positions)
+                             + sum(p["margin"] for p in short_positions))
+        final_equity = balance + final_open_margin + unrealized_pnl
 
         winning = [t for t in trades if t["pnl"] > 0]
         losing = [t for t in trades if t["pnl"] < 0]
@@ -759,7 +912,11 @@ class GridBacktester:
         return BacktestResult(
             final_equity=final_equity,
             return_pct=(final_equity - self.config.initial_balance) / self.config.initial_balance,
-            max_drawdown=1 - (min(e[2] for e in equity_curve) / max_equity) if equity_curve else 0,
+            # 谷底用盤中最不利權益(min_worst_equity)、峰頂用收盤權益(max_equity)——
+            # 不對稱是刻意的，見上方迴圈內註解與 FIDELITY_NOTES (9)。
+            # equity_curve 恆用收盤價，故 min(e[2] for e in equity_curve) 可能高於
+            # 此處隱含的谷底，兩者不保證一致。
+            max_drawdown=1 - (min_worst_equity / max_equity) if equity_curve else 0,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl,
             total_pnl=realized_pnl + unrealized_pnl,
@@ -773,6 +930,8 @@ class GridBacktester:
             equity_curve=equity_curve,
             notes=FIDELITY_NOTES,
             funding_paid=funding_paid,
+            peak_margin_usage=peak_margin_usage,
+            liquidated=liquidated,
         )
 
     def _run_legacy_mode(self) -> BacktestResult:

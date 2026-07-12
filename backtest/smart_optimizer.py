@@ -185,7 +185,7 @@ class SmartOptimizationResult:
             f"  止盈間距: {self.best_params.get('take_profit_spacing', 0)*100:.3f}%\n"
             f"  補倉間距: {self.best_params.get('grid_spacing', 0)*100:.3f}%\n"
             f"  止盈加倍倍數: {self.best_params.get('limit_multiplier', 5.0):.1f}x\n"
-            f"  裝死模式倍數: {self.best_params.get('threshold_multiplier', 14.0):.1f}x\n"
+            f"  裝死模式倍數: {self.best_params.get('threshold_multiplier', 20.0):.1f}x\n"
             f"\n最佳績效:\n"
             f"  目標值: {self.best_objective:.4f}\n"
             f"  收益率: {self.best_metrics.get('return_pct', 0)*100:.2f}%\n"
@@ -228,7 +228,7 @@ class SmartOptimizer:
         "leverage": 20,           # 槓桿固定
         "max_positions": 50,
         "max_drawdown": 0.5,
-        "fee_pct": 0.0004,
+        "fee_pct": 0.0002,
     }
 
     def __init__(
@@ -300,7 +300,7 @@ class SmartOptimizer:
             direction=self.base_config.direction,
             max_drawdown=self.fixed_params.get('max_drawdown', 0.5),
             max_positions=self.fixed_params.get('max_positions', 50),
-            fee_pct=self.fixed_params.get('fee_pct', 0.0004),
+            fee_pct=self.fixed_params.get('fee_pct', 0.0002),
             position_threshold=position_threshold,
             position_limit=position_limit,
             limit_multiplier=limit_mult,
@@ -439,6 +439,20 @@ class SmartOptimizer:
         # 執行回測
         try:
             result = self._run_backtest(params)
+
+            # spec §7 一票否決：liquidated=True 的參數組不得進入目標函數評分。
+            # 用 TrialPruned（而非回傳最差分數）是刻意選擇：
+            # PRUNED 狀態的 trial 完全不進 best_trial 候選集，也不污染
+            # study.trials_dataframe()；回傳 -1e6 只是「分數很低」，trial
+            # 仍是 COMPLETE，會出現在統計與 dataframe 裡 —— 這正是本任務要
+            # 修的磨損形式（弱動詞取代規格裡的強動詞「否決」）。
+            if result.liquidated:
+                self.logger.warning(
+                    f"Trial {trial.number} 觸發強平（spec §7 一票否決），"
+                    f"剪除此 trial：params={params!r}"
+                )
+                raise optuna.TrialPruned()
+
             objective_value = self._calculate_objective(result, objective_type)
 
             # 處理無效值
@@ -471,6 +485,12 @@ class SmartOptimizer:
             self._convergence.append(self._best_value)
 
             return objective_value
+
+        except optuna.TrialPruned:
+            # TrialPruned 繼承自 Exception，若不在此攔截，下面的
+            # `except Exception` 會把它吞掉並回傳 -1e6，等同於一票否決
+            # 完全失效。必須重新拋出讓 Optuna study 收到 PRUNED 狀態。
+            raise
 
         except Exception as e:
             self.logger.warning(f"Trial {trial.number} 失敗: {e}")
@@ -515,6 +535,14 @@ class SmartOptimizer:
         try:
             result = self._run_backtest(params)
 
+            # spec §7 一票否決（理由同 _optuna_objective，見上）
+            if result.liquidated:
+                self.logger.warning(
+                    f"Trial {trial.number} 觸發強平（spec §7 一票否決），"
+                    f"剪除此 trial：params={params!r}"
+                )
+                raise optuna.TrialPruned()
+
             duration = time.time() - start_time
             metrics = {
                 'return_pct': result.return_pct,
@@ -540,6 +568,12 @@ class SmartOptimizer:
                 result.max_drawdown,       # 最小化回撤
                 -result.return_pct         # 最大化收益
             )
+
+        except optuna.TrialPruned:
+            # 同 _optuna_objective：TrialPruned 是 Exception 子類，必須在
+            # `except Exception` 之前重新拋出，否則會被吞掉並回傳最差分數
+            # (1e6, 1e6, 1e6)，一票否決失效。
+            raise
 
         except Exception as e:
             self.logger.warning(f"Trial {trial.number} 失敗: {e}")
@@ -668,7 +702,26 @@ class SmartOptimizer:
 
             pareto_front = None
             best_params = study.best_params
-            best_trial_obj = self._trials[study.best_trial.number] if self._trials else None
+            # 不可用位置索引 self._trials[study.best_trial.number]：
+            # self._trials 只在 COMPLETE 路徑 append（見 _optuna_objective），
+            # 一旦有任何 trial 被 TrialPruned（spec §7 一票否決的常態路徑），
+            # self._trials 的位置索引就不再等於 optuna 的全域 trial.number，
+            # 輕則 IndexError 讓 optimize() 整個炸掉，重則悄悄配對到別的
+            # trial 的 metrics（使用者看到的 Sharpe/return/drawdown 屬於
+            # 另一組參數 —— 這個 optimizer 輸出會被用來選實盤參數）。
+            # 改用 trial_number 精確查找，不依賴 append 順序與 trial.number
+            # 對齊這個已被打破的假設。
+            best_num = study.best_trial.number
+            best_trial_obj = next(
+                (t for t in self._trials if t.trial_number == best_num), None
+            )
+            if best_trial_obj is None:
+                self.logger.warning(
+                    f"best_trial.number={best_num} 在 self._trials 裡找不到"
+                    f"（len={len(self._trials)}）。這代表 trial 收集邏輯有 bug："
+                    f"best trial 理論上必然是 COMPLETE 狀態，應該存在於 "
+                    f"self._trials 中。best_metrics 將回退為空字典。"
+                )
             best_metrics = best_trial_obj.metrics if best_trial_obj else {}
 
         self._study = study

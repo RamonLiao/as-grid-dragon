@@ -34,18 +34,19 @@ class Config:
     # 風控參數
     max_drawdown: float = 0.5           # 最大回撤 50%
     max_positions: int = 50             # 最大持倉數
-    fee_pct: float = 0.0004             # 手續費 0.04%
+    fee_pct: float = 0.0002             # maker 手續費 0.02%（網格全是限價單；taker 為 0.05%）
 
     # 成本模型（fidelity-first：預設全開）
     slippage_bps: float = 0.0001       # 每次成交向不利方向偏移比例（執行成本 haircut）
     funding_enabled: bool = True       # 是否結算 funding 現金流
+    maintenance_margin_rate: float = 0.005  # 維持保證金率（單一費率代理幣安分層階梯）
 
     # 持倉控制參數 (與實盤 GridStrategy 一致)
     # 如果設為 0，會使用 limit_multiplier/threshold_multiplier 自動計算
     position_threshold: float = 500.0   # 裝死模式閾值：持倉超過此值停止補倉
     position_limit: float = 100.0       # 止盈加倍閾值：持倉超過此值止盈數量加倍
     limit_multiplier: float = 5.0       # 止盈加倍倍數 (position_limit = initial_quantity × limit_multiplier)
-    threshold_multiplier: float = 14.0  # 裝死模式倍數 (position_threshold = initial_quantity × threshold_multiplier)
+    threshold_multiplier: float = 20.0  # 裝死模式倍數 (position_threshold = initial_quantity × threshold_multiplier)；對齊 grid_engine/config.py:30 的生產值
 
     # 策略方向
     direction: str = "both"             # "long" / "short" / "both"
@@ -60,6 +61,21 @@ class Config:
 
     # 是否使用終端 UI 兼容模式 (order_value = initial_quantity × price)
     terminal_ui_mode: bool = True
+
+    # 初始持倉注入（seed position）：讓回測從既有倉位起跑，重現生產裝死狀態。
+    # qty>0 時 pre-populate 一張 lot @ seed price；margin 從 balance 扣、不扣 fee
+    # （既存倉位非本回測新成交）。全 0（預設）→ 與空倉起跑 bit-identical。
+    # ⚠️ 單 lot ≡ 多 lot 加權均價只對 mark-to-market（unrealized）與一次性全平
+    #    精確——即「凍結後強平」的重現情境。一旦後續 partial TP 逐格成交，
+    #    backtester 的 per-lot FIFO 會先平這張 index-0 的 seed lot（例如多頭 690
+    #    的高價 lot），認列大額 realized 虧損，而生產 Binance hedge mode 是對
+    #    【混合均價】結算。故涉及 seed 部分平倉的實驗（threshold 掃描），
+    #    realized_pnl 與 final_equity 會系統性偏離生產，只可看方向不可當精確預測
+    #    （內部 review I2）。
+    seed_long_qty: float = 0.0
+    seed_long_price: float = 0.0
+    seed_short_qty: float = 0.0
+    seed_short_price: float = 0.0
 
     @property
     def long_settings(self) -> dict:
@@ -101,6 +117,12 @@ class Config:
             "short_settings": self.short_settings,
             "slippage_bps": self.slippage_bps,
             "funding_enabled": self.funding_enabled,
+            "maintenance_margin_rate": self.maintenance_margin_rate,
+            "dead_mode_enabled": self.dead_mode_enabled,
+            "seed_long_qty": self.seed_long_qty,
+            "seed_long_price": self.seed_long_price,
+            "seed_short_qty": self.seed_short_qty,
+            "seed_short_price": self.seed_short_price,
         }
 
     @classmethod
@@ -116,17 +138,23 @@ class Config:
             grid_spacing=data.get("grid_spacing", 0.006),
             max_drawdown=data.get("max_drawdown", 0.5),
             max_positions=data.get("max_positions", 50),
-            fee_pct=data.get("fee_pct", 0.0004),
+            fee_pct=data.get("fee_pct", 0.0002),
             direction=data.get("direction", "both"),
             grid_refresh_interval=data.get("grid_refresh_interval", 5),
             position_threshold=data.get("position_threshold", 500.0),
             position_limit=data.get("position_limit", 100.0),
             limit_multiplier=data.get("limit_multiplier", 5.0),
-            threshold_multiplier=data.get("threshold_multiplier", 14.0),
+            threshold_multiplier=data.get("threshold_multiplier", 20.0),
             terminal_ui_mode=data.get("terminal_ui_mode", True),
             slippage_bps=_norm_slippage(data.get("slippage_bps", 0.0001)),
             funding_enabled=data.get("funding_enabled", True)
                 if isinstance(data.get("funding_enabled", True), bool) else True,
+            maintenance_margin_rate=data.get("maintenance_margin_rate", 0.005),
+            dead_mode_enabled=data.get("dead_mode_enabled", True),
+            seed_long_qty=data.get("seed_long_qty", 0.0),
+            seed_long_price=data.get("seed_long_price", 0.0),
+            seed_short_qty=data.get("seed_short_qty", 0.0),
+            seed_short_price=data.get("seed_short_price", 0.0),
         )
 
     def save(self, filepath: str):
