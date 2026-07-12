@@ -1,9 +1,262 @@
 # Progress
 
 ## Current Task
-**#10-A config 寫入原子/merge/跨進程鎖（2026-07-08，實作完成待 dual-review）**：branch `fix/10a-atomic-config-save`，base c9c33f7。SDD 4 實作 task 全 spec ✅ review clean，全套 310 passed（294 基線+16 新）。抽 `grid_engine/config_io.py` 共用底層（merge-preserve + pid tmp 原子寫 + fcntl.flock sidecar 鎖），`GlobalConfig.save()` 與 `web/services/config_store.py` 皆 delegate，兩份邏輯合一。修三缺陷：撕裂讀（os.replace）、抹 extras（merge-preserve）、lost-update（flock 序列化 RMW）。順修 config_store 固定 tmp 潛伏 bug + web 側原無跨進程鎖。併發測試證 flock-off 穩定 FAIL（235/300 key 遺失）、flock-on PASS。Monkey：真實 config round-trip 零遺失、損毀檔 raise 不截斷。**待跑 verifier + dual-review 才算完成；B（hard_stop 實作）另開 cycle。**
+**#14（2026-07-11 重新定向）：先回測定 threshold，再談改 code。** 原「修 `dead_mode_price`」的前提被實測推翻——見下。
 
-**#9 web/ 遷移完成（2026-07-06）**：23 commits c924947..1b2dd59，全套 294 passed（270 基線+24 新）。SDD 11 task + final whole-branch review（Ready to merge）+ verifier（ACCEPT 8/8）+ dual-review（Ship as-is）全收斂。**未 push**。剩 #4 人工 Task 10（GCE 部署 ≥24h replay zero-diff）照舊卡人工前置。
+### ★★★ 議倉裁決（真錢，2026-07-11 實測交易所）
+`fetch_positions` / `fetch_balance` 實測（read-only，未下單）：
+| | |
+|---|---|
+| 錢包 / 權益 / 可用 | 150.05 / **82.19** / **4.15**（保證金使用率 95%） |
+| 多頭 | **0.58 @ 690.29**，現價 573.49，**uPnL -67.74**（水下 20.4%） |
+| 空頭 | 0.08 @ 570.17，-0.27 |
+| 強平價 | **412.12**（距現價 -28.1%）；**marginMode = cross**（非 isolated！） |
+| 掛單 | `sell LONG @603.05 x0.04 RO`（= 日誌 03:57:29 那張假出場單，還掛著）、`buy SHORT @572.08 x0.04 RO`、`sell SHORT @575.53 x0.02` |
+
+**關鍵推翻**：
+1. **均價 690，不是貼近現價** → 方案 A（掛均價×1.003 = 692）要漲 **20.7%**，比現在那張 603 還遠。**A 不解凍、讓它更凍。**（教訓：推薦 A 前沒先量均價，被實測打臉。）
+2. **cross margin，非 isolated** → #10-B 判死 hard_stop 的前提（isolated 結構性封頂）**事實層面不成立**。412 全帳戶爆是真尾部。
+3. **裝死停擺 104h 不是 bug**，是裝死正確地阻止對水下 20% 倉位加碼。真正壞的是 threshold 以「幣數量」計價（0.4），從 690 一路買到 573 從不看保證金。
+
+### 使用者裁決：看強/中性 + **願意入金** → 走 C（對沖到 delta-neutral，網格慢慢補，不實現虧損）
+**但發現致命矛盾**：補空到 0.58 → 雙邊都 > threshold 0.4 → **兩側同時進裝死** → 網格停擺 → 「慢慢補」不發生，只鎖定 -68。「對沖 + 慢慢補」與 `threshold=0.4` **數學不相容**（任何值得對沖的倉位都已超 threshold）。
+- C 需配 threshold 提高（讓對沖後雙邊 0.58 回正常網格）。
+- 補空到中性數字：補空 **0.50**（0.08→0.58），需保證金 ≈14.3，可用 4.15 → **需入金**（建議 30-40 留 buffer）。delta-neutral 後 uPnL 幾乎不隨價變，鎖 -68，網格賺 0.3% 間距補回，價回 690 平對沖出場。
+
+### ★ 使用者最終裁決：**先回測看 threshold 調多高**（不急著入金/改 config）
+
+**seed 注入工具完成**（3 commits `e5ad948`→`0218871`→`b9821ef`，全套 434 passed，14 seed 測試）：
+Config 加 `seed_long/short_qty/price`，`_run_terminal_ui_mode` 持倉初始化後 pre-populate seed lot（margin 扣 balance 不扣 fee），seed=0 bit-identical。
+- **review 全走完，verdict = `Ship as-is`**：內部 reviewer（I1 legacy 靜默空倉/I2 FIFO 分歧/M1 inf/M2 套套邏輯）→ 修（`_validate_seed` 前置 raise）→ dual-review 外部輪（**no Critical**；I1 fee_pct=0 假綠/I2 揭露搬進 FIDELITY_NOTES (12)/M3 名不副實/M4 defense-in-depth/M5 NaN）→ 全修 + 3 mutation 驗證（fee/NaN/balance 扣減都 red-once）→ Round 2 專案規則 conform → **verifier ACCEPT 6/6**（fresh-context read-back + 實跑 + 獨立 mutation 3/3）。3 commits e5ad948→0218871→b9821ef，全套 434 passed。
+- **統一原則**：seed qty>0 但任何原因無法如實注入（負/inf/NaN/price≤0/方向矛盾/走 legacy）→ 大聲 raise，不得靜默空倉（數字定實盤參數）。
+- **關鍵保真限制（FIDELITY_NOTES 12）**：per-lot FIFO 先平 index-0 seed lot、與生產 Binance netted 均價分歧 ⇒ 涉及 seed 部分平倉的 threshold 掃描 realized/final_equity 系統性偏離生產，**只可看方向不可當精確預測**。
+
+**threshold 掃描結果**（seed @ 生產均價，資料 06-06~07-10 單一路徑含 -14.8% 下跌，fee 2bps/slip 1bp 基準；起始 equity ≈ 82 吻合生產）：
+
+| 場景 | mult=20(thr0.4) | mult=29(0.58) | mult≥40(≥0.8) | cost sens 最佳 |
+|---|---|---|---|---|
+| **現狀 0.58/0.08** | eq88.1 dd0.56 dead100% | eq86.3 | eq86.9 dd0.49 dead0% | **穩定 mult20** |
+| **對沖後 0.58/0.58** | eq95.7 dd0.50 dead6.5% | **eq107.2** dead6.3% | eq89.7 dd0.47 dead0% | 穩定 mult29 |
+
+**判讀（誠實）**：
+- **`mult=29` 的 107 是過擬合陷阱**：threshold=0.58 恰好卡 seed 持倉量邊界，倉位在邊界反覆進出裝死。lessons「尾部參數最佳點永遠在懸崖邊」典型，**不可信**。
+- **穩健訊號 = `mult≥40`**：40/60/100 **完全無差異**（對這段數據不敏感）→ 對沖後雙邊 0.58 < 0.8 回正常網格，兩側掛單，eq89.7、max_dd 最低 0.469。從起始 82 補回 ~8。
+- **對沖後（雙邊活）比現狀補得多**：mult≥40 對沖後補 7.7 vs 現狀維持補 5.7。支持 C 路線。
+- **局限**：單一歷史路徑、只含一段下跌，未測上漲/震盪。threshold 的真正代價（單邊大趨勢無限加倉）在對沖後被 delta-neutral 吸收，這段數據看不到 → **不能外推到不對沖的情況**。cost sensitivity 內排序穩定但絕對差距小（成本擾動 ±1.3 vs 場景間差距 ~18）。
+
+**⚠️ 這些數字的可信度取決於 seed 注入工具正確性 → 需 dual-review 才能讓使用者據此入金**。
+**初步建議**：走 C（入金補空到中性）時，threshold_multiplier 提到 **40**（thr=0.8，讓對沖後雙邊 0.58 回正常網格）。不要信 mult=29。
+
+**分段窗口驗證（2026-07-12，補「單一路徑只測下跌」局限；script 在 session scratchpad `segment_scan.py`）**：
+W1 上漲 06-06~06-16（574→618, +7.6%）/ W2 下跌 06-15~07-02（617→550, -10.8%）/ W3 震盪 06-25~07-10（564→576, ±5%）× 3 場景（現狀 150 / 對沖後 150 / **對沖後+入金35=185**，上次掃描沒建模入金）× mult {20,29,40,60,100}，60 回測 + 對沖場景 cost sens 54 回測：
+- **對沖後 mult≥40 三段全正**：Δeq 上漲 +0.38 / 下跌 +2.89 / 震盪 +7.68，零強平，40/60/100 恆完全相同（= 對現倉規模等效關裝死，僅留 0.8 防暴衝上限）。上漲段 max_dd 三場景最低。
+- **mult=20（現行）對沖後在上漲 -6.17、下跌 -10.81**，三段兩負 → 對沖 + 現行 threshold 確定是壞組合，數學矛盾被分段實測坐實。
+- **mult=29 再次確認是懸崖**：震盪段 +21.66 貌似大勝，但 thr=0.58 恰等於 seed 量、贏在裝死邊界反覆進出的 artifact；上漲段輸給 40。跨窗口 best 在 29/40 間搖擺（W1=40、W2/W3=29）→ 依 lessons「排序不跨窗口穩定 + 最佳點在邊界」雙重理由棄 29。
+- cost sens：每個窗口內排序對 fee{2,4}bps×slip{0,1,2}bps 全穩定不翻轉。
+- 入金 35 變體：Δeq 與 150 版完全相同（網格行為不變），只墊高權益基數、max_dd 比例下降（0.47→0.39），符合預期 = 入金純粹買安全邊際。
+- **現狀場景警訊**：W1 上漲段 mult=20 Δeq +24.8 遠勝其他 —— 那是凍結的 0.58 淨多頭在漲勢的方向性收益，不是網格能力；同一凍結在 W2 下跌段 -33.6。**「不對沖、維持現狀」= 押方向**，兩段對照是最直接證據。
+- 保真警語不變（FIDELITY_NOTES 12）：涉 seed 部分平倉，數字只看方向不當精確預測。
+- **結論維持並強化：走 C → threshold_multiplier=40**；三種路徑型態下皆正、不靠方向、不踩邊界。
+
+### ★ C 路線執行中（2026-07-12）：config 已改，等使用者重啟 + 入金 + 補空
+使用者裁決走 C。**config 6 處已改完**（停機後直接編輯 JSON 不走終端選單、原子寫、備份 `config/trading_config_max.json.bak-20260712` 已 gitignore、`GlobalConfig.load()` 實載驗證通過）：
+1-3. BNBUSDC `grid_spacing` 0.008→**0.003**、`take_profit_spacing` 0.004→**0.003**（把 bandit arm 0 覆寫出來的實盤實際值寫死成契約）、`threshold_multiplier` 20→**40**（有效 thr=0.8）
+4-6. `bandit.enabled`→**false**（#13 BD1-3 不學習+靜默切 arm 尾部風險）、`leading_indicator.enabled`→**false**、`dgt.enabled`→**false**（回測驗證的是零增強純網格；`bot.py:342`/`:488` 單一 gate 確認關 master 即全關）
+- `all_enhancements_enabled` 維持 false；動態網格判定**不開**：回測器強制增強中性（FIDELITY_NOTES 3）測不了、delta-neutral 後接刀風險已被對沖吸收、min_spacing 0.002 可能把間距收窄到沒測過的值。要開得先給 backtester 接 ATR 增強線再用 seed 工具驗。
+- **副作用已知悉**：mult=40 同時把止盈加倍門檻推到 0.8（`decision.py:97` 一參數兩用，回測同一 decide() 已含此耦合）。
+
+**剩餘步驟（使用者端）**：① 重啟引擎，核對面板 GS/TP=0.30%/0.30%、學習模組停用；② **驗收關鍵**：多頭側應重新出現網格掛單（0.58<0.8 解除裝死），殘留那張 sell LONG @603.05 RO 應被 cancel=True 接管重掛——若多頭側仍零掛單，停下來查，**先不要入金**；③ 入金 ~35 USDC；④ 補空 0.50（0.08→0.58）。
+
+### ★ C 路線執行結果（2026-07-12 完成，最終狀態與計畫的偏差都有使用者裁決）
+1. **重啟驗收全過**：14:51 重啟後 `decisions.jsonl` thr=0.8 生效、多頭進場單重現（104h 裝死解除）、舊 @603.05 凍結單被接管換成貼價單。
+2. **入金 35 到帳**（錢包 184.6）。停機期間網格自己動過：空頭 0.08→0.04（那張 buy SHORT RO 成交）。
+3. **補空執行**（我直接下單，marketable limit 貼買一分批）：0.18 @571.78 + 0.12 @572.22 成交，空頭 0.04→**0.34**。
+4. **執行中發現新假旋鈕：config `leverage: 20` 從未推到交易所**（grep 證實引擎無 set_leverage 呼叫），交易所實際 **5x** → 保證金 4 倍於估算，第二批撞 -2019。改槓桿被權限系統擋（正確），使用者裁決**維持 5x**。
+5. 5x 下補滿 0.58/0.58 需錢包 ≥207（現 184.6），使用者選 **B：不再入金，補到保證金剩 ~5 buffer 為止** → 最終 delta **+0.24**（原 +0.50 減半），非完全中性。
+6. **最終**：多 0.58@690.29 / 空 0.34@571.75，權益 116.0，可用 6.1，**強平價 359→90.8**（尾部風險基本解除），雙側網格掛單正常。
+7. **已知氧氣限制**：可用 6.1 在 5x 只夠網格再加 ~2 層（每層 0.02 押 2.29），空頭側連續進場會撞 -2019 斷續熄火（引擎斷路器會擋，不失控）。日後入金 ~25 可補滿剩餘 0.24 到完全中性。
+8. UI 順手修：`ui.py:153-154` 持倉顯示 `.1f`→`.2f`（trivial，未 commit）。
+
+---
+
+## 舊任務定義存檔（已作廢）：#14 修 `dead_mode_price`（Plan track）
+brainstorming 中發現 `dead_mode_price` 公式 `price×((long/short)/100+1)` 使失衡越大目標越遠（反向風控），且 `if entering or pending_tp<=0` 讓特殊止盈單只掛一次凍結失衡比例。**但議倉實測顯示這公式不是主因**（主因是 threshold 計價 + cross margin + 淨曝險），改它救不了現場。留待 threshold 重做後一併處理。
+
+### ★★ 補資料完成，但**原三選項對照計畫已作廢** —— 前提被實證推翻
+
+**資料已補齊**（本 session 完成，未 commit）：
+- K 線 `2026-06-06` ~ **`2026-07-10`**（50199 根，`07-10` 檔 1239 根為當日部分資料）
+- funding `data/funding/BNBUSDC.csv` 重抓，107 筆，涵蓋到 `2026-07-10 08:00 UTC`
+- ⚠️ 下載前刪掉兩個**毒快取**：`BNBUSDC-1m-2026-07-06.csv` 只有 907 根（當日未過完就存檔，`download()` 的 `if output_path.exists(): continue` 永不回補）；`load_funding()` 的 `if path.exists(): return` 同樣不看區間。備份在 scratchpad。
+- 事實：這些 kline 檔是 **Taipei 日界**（每檔 UTC 16:00 → 次日 15:59），因為 `download()` 用 `datetime(y,m,d).timestamp()`（本地時區）。與 `decisions.jsonl`（UTC）對時要差 8 小時。
+- ⚠️ `07-10` 檔是部分資料，`download()` 的 skip-if-exists 會讓它**永遠停在 1239 根**。下次要延伸資料前必須先刪它。
+
+### 真因（全部來自 `logs/decisions.jsonl` 73123 筆，非推理）
+生產多頭 `long_position` **恆為 0.58**，`long_dead_mode=100%`，`buy_long_orders=0`，跨 104 小時零變動。
+
+1. **裝死死鎖已修**（`60917cc`，`cancel=True` 接管殘留止盈單）。生產引擎 pid 28845 於 `07-10 11:57 Taipei` 重啟，跑的是修好的碼。
+2. 重啟後 **12 秒**（`07-10 03:57:29 UTC`）掛出**全程唯一一張**多頭單：`sell long @ 603.05, qty 0.04, reduce_only`。`orders` 張數分佈 `{0: 73122, 1: 1}`。
+3. 當時 `price=575.245` → 那張單要求 **+4.83%**。之後最高價 **578.25**，未成交。
+4. **根因是 `dead_mode_price` 的公式**：`price × ((long/short)/100 + 1)`。`0.58/0.12=4.83` → +4.83%。日誌裡 `short` 曾低到 `0.02` → 公式要求 **+29%**。**失衡越嚴重，要求的出場漲幅越大** —— 反向風控。
+5. 公式本有自癒設計（價漲 → 空頭加倉 → 失衡降 → 止盈價下移），但 `_decide_side` 的 `if entering or pending_tp <= 0:` 讓那張單**只掛一次**、凍結在掛出當下的失衡比例，自癒從未生效。
+
+### 回測的獨立障礙：空倉起跑**到不了** threshold
+`position_limit = 0.02×5 = 0.1` 之上止盈量加倍（出 0.04 / 進 0.02）→ 持倉被壓在 **0.28** 平衡點，`threshold=0.4` 永遠碰不到。實測（06-06~07-10，價格最大回撤 **14.83%**，632.23→538.45）：
+```
+mult=20   → final_equity 105.2423  trades 513  liquidated=False  max_dd 0.1009
+mult=1e9  → 完全相同
+max_long_pos 0.2800   max_short_pos 0.2800   dead_mode_pct 0.00%
+```
+**補再多資料都一樣。** 要行使裝死路徑，回測必須支援**注入初始持倉**（seed `long=0.58`）。
+
+### 附帶發現（非阻擋）
+- 回測**每根 K 線最多成交一張補倉單**（`_settle` 只有一個 `pend[side]["entry"]`）。實測漏掉 **6.4%** 的層數（219 次成交 / 本可 234 層；5.9% 的 bar 本可吃 ≥2 層）。實盤 tick 級追價會連吃多層。
+- `Config.position_threshold=500.0` / `Config.position_limit=100.0` 在主路徑（`_run_terminal_ui_mode`）**從未被讀** —— `backtester.py:565-566` 一律由 multiplier 重算。又兩個假旋鈕（只有 legacy helper `:72-74` 讀它們）。
+
+### 已作廢的舊計畫（保留理由說明，別再撿回來）
+「補資料 → 跑 (a) 調高 threshold / (b) 關掉裝死 / (c) 開 GLFT 三選項對照」：
+- (a) 只是讓倉位凍結在**更高**的位置，不碰出場問題
+- (b) 關掉裝死 = 無上限補倉
+- (c) 已由分析定案：`clamp(0.5,1.5)` + `max(iq*0.5, q)` 地板 ⇒ 生產 `gamma=0.1` 下只減 **8.7%**
+- **三者都沒碰到真正的缺陷**（出場價公式 + 一次性掛單）
+
+---
+
+## 舊計畫存檔（已作廢，見上）：補資料 → 跑真正的三選項對照
+
+**為什麼是這個，不是寫 Phase A-C 計畫**：
+- **(c) 開 GLFT 已被分析回答** —— `glft_quantity()` 的 `clamp(0.5, 1.5)` + `compute_quantity` 的 `max(initial_quantity*0.5, q)` 地板 ⇒ 多頭開倉量**最多砍到一半、永不停止買入、永不賣出**。生產 `gamma=0.1`、`inventory_ratio` 中位數 0.871 ⇒ 實際只減 **8.7%**。回測會證實，但數學已先說了。且開它需要 `all_enhancements_enabled=true`，那會讓 bandit 開始覆寫 `gamma`（`bot.py:359-360`）。
+- **(a) 調高 threshold 與 (b) 關掉裝死，現在就能測** —— `threshold_multiplier=1e9` 在功能上等價於關掉裝死（實測 `final_equity`/`trades` 與 `mult=20` **完全相同**，因為根本沒觸發）。**不需要 Phase A。**
+- **唯一卡住的是資料。**
+
+### 資料缺口（精確）
+| | 範圍 |
+|---|---|
+| 現有 K 線 | `data/futures/um/daily/klines/BNBUSDC/1m/` 共 31 檔，`2026-06-06` ~ **`2026-07-06`** |
+| 生產決策日誌 | `logs/decisions.jsonl`：**`2026-07-05 23:36`** ~ **`2026-07-10 20:34`** ← 多頭 `in_dead=100%` 的那 4 天 |
+| **缺口** | **`2026-07-06` ~ `2026-07-11`**（含單邊趨勢段） |
+
+這 31 天內單側持倉從未超過 `0.02 × 20 = 0.4`，**裝死模式一次都沒觸發** ⇒ `mult=20` / `mult=40` / 關掉裝死三者數字**完全相同**。問題出在那 4 天，而那 4 天不在資料裡。
+
+### 具體步驟
+1. **補抓 K 線**（會連網、寫 `data/`。生產引擎不讀 `data/`，安全）：
+   ```python
+   from backtest.data_loader import DataLoader
+   DataLoader().download("BNBUSDC", "2026-07-06", "2026-07-11", interval="1m")
+   ```
+   簽名見 `backtest/data_loader.py:367`。抓完確認 `get_date_range("BNBUSDC","1m")`（`:304`）涵蓋到 07-10。
+   ⚠️ funding 快取（`data/funding/BNBUSDC.csv`）也要跟著延伸，否則尾段 `rate=0`（FIDELITY_NOTES 第 (7) 條已揭露）。
+
+2. **確認裝死模式在新資料裡真的會觸發**（否則白做）：
+   跑一次 `mult=20` vs `mult=1e9`，斷言 `trades_count` / `final_equity` **不再相同**。若仍相同 → 停下來查為什麼（可能 `initial_quantity` 或 `direction` 設定與生產不符）。
+
+3. **跑對照**。生產有效參數（**注意不是 config 裡的值**）：
+   ```
+   grid_spacing = 0.003, take_profit_spacing = 0.003   ← bandit arm 0，實盤實際值
+   initial_quantity = 0.02, leverage = 20, direction = "both"
+   limit_multiplier = 5.0, initial_balance = 100
+   fee_pct = 0.0002 (maker), funding_enabled = True
+   ```
+   `scripts/cost_sensitivity.py` 已支援 `--threshold-multiplier 5,10,20,40,1e9`。
+
+4. **驗收指標（spec §7 分層，不得混用）**：
+   - **主**：`liquidated`（布林一票否決）、`final_equity`、`max_drawdown`
+   - **次**：`funding_paid`、`dead_mode_pct_long/short`（**尚未實作，屬 Phase A**）、裝死 TP 成交率
+   - **禁止作為優化目標**：`trades_count` / `realized_pnl`（martingale 假象，攤平策略的已實現獲利恆為正）、`sharpe_ratio`（1m 報酬 ×√525600，自相關嚴重膨脹；強平的回測實測 `-486.97`）
+
+5. **判讀規則**（spec §8 Phase D）：
+   - 任一選項 `liquidated=True` → **該選項淘汰**，不論其他數字
+   - 排序若在 fee ∈ {2,4} bps × slippage ∈ {0,1,2} bps 範圍內**翻轉** → **不得下結論**
+   - 排序未翻轉也要看**差距 vs 成本擾動**。舊資料實測：最佳/次佳差距 `0.120 → 3.219`（放大 **26.9 倍**），低成本端只差 `0.26` ⇒ **落在雜訊裡，結論脆弱**
+   - `threshold_multiplier` 響應曲面**非單調**（`mult=10` 劣於 5 與 20）⇒ 輸出 sensitivity curve，**不要只報單點最佳值**
+
+### 這一步的前置事實（別重新發現一次）
+- **實盤間距不是 config 的值**。`bot.py:355-358` 在 `bandit.enabled=true` 時**無條件覆寫** `grid_spacing`/`take_profit_spacing`。生產 60001 筆決策日誌實測恆為 `0.003/0.003`（arm 0），而 config 寫 `0.006/0.004`。已有測試釘死（`tests/test_bandit_overwrites_config.py`）。
+- **實驗前置條件**：若結論要套用到實盤，必須 `bandit.enabled=false` + config 顯式設定受測間距，否則 live 與 backtest 跑的不是同一個策略。
+- **`threshold_multiplier` 一參數兩用**：`decision.py:97` 的止盈加倍條件也讀 `position_threshold`（`opposite_position >= position_threshold`）。調高它會同時延後裝死觸發**並且**改變對手側止盈加倍時機。optimizer 無法歸因 ⇒ 需要 ablation（把加倍門檻解耦成獨立參數）。
+
+### 未 commit 的東西
+- `tasks/progress.md`（本檔）、`tasks/lessons.md`（untracked，新增 3 條通用教訓，共 27 條 189 行）
+- branch `feat/backtest-engine-fidelity` **未 merge、未 push**（27 commits，dual-review `Ship as-is`）
+- `lessons.md` 已超過 workflow 的 ~50 行門檻。六條同族（假旋鈕 / 死路徑 / 被覆寫 / 重複 class / 未接線欄位 / 隱含不變式，皆為「靜態結構看起來成立、執行期不成立」）可合併成一條通則。
+
+---
+
+### #12 起因：blocker 是假的，但挖出六個真缺陷
+progress.md 原記載「backtester 不共用 decision.py」→ **錯**。主路徑 `_run_terminal_ui_mode` 早已完整呼叫 `decide()`（`backtester.py:696-715`）。那句話描述的是 `_legacy_grid_decision`（`initial_quantity<=0` 才走的死路徑）。
+
+真正的問題是**回測引擎本身不可用**。六個缺陷，每個都有實證：
+
+| 缺口 | 修法 | 實證 |
+|---|---|---|
+| **G4** 撮合兩個錯 | `high`/`low` 判穿越、成交於**掛單價** | 44107 根真實 K 線：漏掉 **48.5%** 成交、每筆送出 **10.38 bps** 幻覺價格改善（= 所建模 slippage 1bp 的 10 倍） |
+| — 止盈越權平倉 | clamp 到本根 entry 結算前的持倉 | `trades_count` 4 → 2 |
+| **G8** 權益漏算 margin | `equity = balance + open_margin + unrealized` | 恆等式缺口 `0.00e+00`（原 988.2 vs 正確 1007.5） |
+| **G6** 無強平建模 | `should_liquidate` + `liquidated` 一票否決 | 必爆組 `final_equity` **-1853 → 強平於價格跌 19%** |
+| — 安全檢查靜默失效 | 無效輸入 `raise` 而非回 `False` | `price=0` 曾讓強平檢查恆回「安全」 |
+| **G7** 成本非方向中性 | `fee_pct` taker→maker + `FIDELITY_NOTES` 誠實化 | 三個 grep 驗收 + 自動化守門測試 |
+| **G5** bandit 覆寫間距 | 釘死為測試（不修 bandit） | 生產 60001 筆：實盤恆 `0.003/0.003`，config 的 `0.006/0.004` **從未生效** |
+| — 強平只看收盤價 | 改用盤中最不利價 | `(low=60, close=93)` 修前 `liquidated=False`、修後 `True` |
+| — `max_drawdown` 只看收盤價 | 谷底取盤中最不利權益 | wick 使其由 `0.000700 → 0.010406` |
+
+### spec §7「一票否決」的六個現場（不變式橫跨模組）
+`optimizer.py` ✅（`eligible` 過濾 + `liquidated` 主排序鍵）、`cost_sensitivity.py` ✅、`smart_optimizer.py` ✅（`TrialPruned`）、`optimizer._calculate_param_importance` ✅、`web/services/backtest_service.py` ✅（警告前置進 `notes`）、`web/pages/` 免改（`iloc[0]` 天然安全）。
+
+### dual-review 戰果（dev-rules 強制）
+- 內部：4 輪 task review + 1 輪 opus whole-branch → **0 個 Important**
+- 外部：4 輪 fresh-context → **1 Critical + 4 Important**，全部實測重現
+- Critical 是**我們自己的 fix 引入的**：`TrialPruned` 讓 prune 從罕見變常態，打破 `self._trials[i].trial_number == i` 這個沒寫下來的不變式 → `IndexError` 殺死 `run_smart_optimization`
+- verifier（fresh-context）：ACCEPT 7/7
+
+### ★ Phase D 的前置阻礙（Phase 0 中途發現）
+真實 K 線只到 **2026-07-06**，而生產出問題的期間是 **07-06 ~ 07-10**。實測 `threshold_multiplier` 掃描：
+```
+mult=5  → final_eq 104.458   trades 153
+mult=10 → final_eq  98.912   trades 257
+mult=20 → final_eq 103.428   trades 490   ← 生產值
+mult=40 → 與 mult=20 完全相同
+關掉裝死 → 與 mult=20 完全相同
+```
+**這段資料裡單側持倉從未超過 0.4，裝死模式從未觸發。** `threshold_multiplier` 在生產值附近是**惰性參數** —— 直接跑 optimizer 會得到「它對績效無影響」，可能被誤讀成「裝死模式關掉也行」。且響應曲面**非單調**（`mult=10` 劣於 5 與 20）。
+
+**Phase D 前置**：用 `backtest/data_loader.py` 補抓 BNBUSDC 1m 至 >= 2026-07-10（含單邊趨勢段）。
+
+### 成本敏感度（`scripts/cost_sensitivity.py` 實跑）
+排序未翻轉（`mult5` 全程最佳），但最佳/次佳差距被成本擾動放大 **26.9 倍**（0.120 → 3.219）。**「排序沒翻轉」不等於「結論穩健」** —— 差距（0.26）小於成本擾動造成的變化（3.1）。
+
+### #12 Follow-up（非阻擋）
+1. `smart_optimizer.py:743` `study.best_value if hasattr(...)` —— `hasattr` 對 property 恆回 `True`（只吞 `AttributeError`），multi-objective study 存取 `best_value` → `RuntimeError`。**既有 bug，與 prune 無關。** ⇒ `web/pages` 的 NSGA-II 多目標選項是**死路徑**。正確寫法 `try/except RuntimeError`。
+2. `margin_usage` 對 `equity<=0` 回 `inf` 即使零倉位（純觀測欄位）。
+3. `optimizer` 三個 sweep 方法死碼、未加 `ValueError` 保護（docstring 已警告）。
+4. `smart_optimizer` 的 `except Exception` 範圍過寬（既有）。
+5. **#13 bandit 三缺陷**：BD1 `trade_count_since_update`/`pending_trades` 未持久化（126 次啟動只有 6 個 run 累積到 `update_interval=10` → **#6 的持久化實務上只存了一個永不改變的種子**）；BD2 `_cold_start_init` 注入捏造的 reward `0.5`；BD3 `load_state:521` 的 `.get('current_arm_idx', 0)` 靜默重置 arm。
+6. Phase A-C 的實作計畫尚未撰寫（spec 已定案，見 §8）。
+
+### 前次任務存檔
+### #10-B 已判死（不做 hard_stop）
+使用者裁決：對沖 + **isolated margin**（每 symbol 最大虧損被交易所結構性封頂），不設 PnL 硬止損，要讓網格掛著慢慢補。頁4 那三欄唯讀揭露（`hard_stop_enabled`/`max_loss_pct`/`max_position_loss_pct`）應移除或改成明確的設計聲明，避免未來又被當成「未完成功能」撿回來做。
+- 若日後要做風險監控，正確方向是**強平距離監控**（`fetch_positions()` 回傳的 `liquidationPrice` 目前在 `sync_service.py:60-73` 被丟棄），純唯讀 + 通知，不碰下單路徑，也不需 backtest 驗證（backtest 不共用 RiskMonitor）。
+- 另一個既有缺口：`check_and_reduce_positions()` 觸發條件是多空**同時**超標（AND），**單邊崩盤不會觸發減倉**。
+
+### Recently Completed
+**#10-A config 寫入原子/merge/跨進程鎖（2026-07-08，已 merged+push）**：`main` 1b2dd59..310f091（11 commits），全套 310 passed（294 基線+16 新）。抽 `grid_engine/config_io.py` 共用底層（merge-preserve + pid tmp 原子寫 + fcntl.flock sidecar 鎖），`GlobalConfig.save()` 與 `web/services/config_store.py` 皆 delegate，兩份邏輯合一。修三缺陷：撕裂讀（os.replace）、抹 extras（merge-preserve）、lost-update（flock 序列化 RMW）。順修 config_store 固定-tmp + web 側無跨進程鎖潛伏 bug。
+- SDD 全程：4 實作 task 全 spec ✅ review clean → opus whole-branch（Ready to merge）→ dual-review（Ship as-is）。
+- 併發守衛實證：flock-off 245/300 key 遺失、flock-on 0。Monkey：真實 config round-trip 零遺失、損毀檔 raise 不截斷。
+- **dual-review R1（獨立）抓到 opus final review 漏掉的 Critical**：`config/.gitignore` 漏 backup 副檔名 → 含真實 api_key/secret 的 `.bak` 未被擋（root gitignore 只擋 `*.json`），已補 `*.bak*`（check-ignore exit 0 驗證）。
+- **重要 accepted risk**：flock 只保護 top-level/symbol 內未知欄位；**symbols 集合的併發新增/刪除仍 last-writer-wins**（呼叫端持鎖外過期快照時丟失/復活 symbol）。已於 config_io docstring 誠實化。
+
+### TODO（下一步候選，優先序）
+1. ~~**#10-B hard_stop**~~ — 已判死，見上方「#10-B 已判死」。
+2. **symbols-set 併發 race**（#10-A 衍生）：終端選單持鎖外過期快照 → 併發新增/刪除 symbol 丟失/復活。修法：save 前 reload-and-remerge，或**砍終端 config 選單**（單一 writer 徹底消除 dual-writer 前提，與既有「砍終端 config 選單」backlog 合流，較根治）。
+3. trading_mode 收編 engine schema（等 #4 驗收後）。
+4. 頁3「clamp 後寫回 session」模式未全站排查。
+
+### Blockers
+- **#4 人工 Task 10**：GCE 部署 ≥24h replay zero-diff，卡人工前置（非我可推進）。
+
+---
+
+**#9 web/ 遷移完成（2026-07-06）**：23 commits c924947..1b2dd59，全套 294 passed（270 基線+24 新）。SDD 11 task + final whole-branch review（Ready to merge）+ verifier（ACCEPT 8/8）+ dual-review（Ship as-is）全收斂。**已 push**（2026-07-06 本 session）。剩 #4 人工 Task 10（GCE 部署 ≥24h replay zero-diff）照舊卡人工前置。
 
 ### #9 成果摘要
 - web 全遷新系統：新增 `web/services/`（config_store merge-preserve+原子寫 / history_reader 容錯讀 / backtest_service 黃金映射+雙優化器歸一）+ tests/web/ 24 測試；砍 bot 生命週期；頁1 降級讀 logs/decisions.jsonl；頁2-4 改接；刪 core/ ui/ exchanges/ main.py（~3千行）；config/models.py 瘦身留 4 indicator config。
