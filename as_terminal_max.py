@@ -1351,5 +1351,7 @@ class MainMenu:
 # ╚══════════════════════════════════════════════════════════════════════════════╝
 
 if __name__ == "__main__":
+    from grid_engine.utils import setup_file_logging
+    setup_file_logging()
     menu = MainMenu()
     menu.main_menu()

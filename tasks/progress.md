@@ -1,7 +1,37 @@
 # Progress
 
 ## Current Task
-**#14（2026-07-11 重新定向）：先回測定 threshold，再談改 code。** 原「修 `dead_mode_price`」的前提被實測推翻——見下。
+**觀察期（2026-07-12 起）：#14 全線收工，網格帶新參數運行中，監控恢復狀況。**
+
+生產現況（2026-07-12 收盤時點）：
+- 引擎跑新 config：純網格 0.3%/0.3%、thr=0.8（mult=40）、bandit/leading/dgt 全關、增強全關
+- 倉位：多 0.58@690.29 / 空 0.34@571.75，**delta +0.24**（使用者裁決 B：維持 5x 不再入金，未補滿中性）
+- 權益 ~116、可用 ~6.1、強平價 90.76（尾部風險已解除）、uPnL ~-68.5 待網格磨回
+- **氧氣限制**：可用 6.1 在 5x 只夠網格再加 ~2 層，空頭側連續進場會撞 -2019（引擎斷路器會擋）
+
+## TODO（優先序）
+1. **觀察期複檢（07-13 之後）**：新 config 已跑 ≥24h 時重跑 replay（期望持續 diff=0）+ income 健檢（`REALIZED_PNL` 是否穩定累積、掛單是否持續在 ±0.3% 刷新）。07-12 首檢時新 config 窗口僅 ~1h、尚無止盈成交，「已實現穩定累積」無法判定。健檢腳本模板見下方 07-12 記錄。
+2. **入金 ~25 補滿 delta +0.24 → 完全中性**（使用者決定時機；5x 下補滿需錢包 ≥207）
+3. **symbols-set 併發 race**（#10-A 衍生）：修法傾向砍終端 config 選單（單一 writer 根治）
+4. lessons 通則落地檢查：`config.leverage` 假旋鈕要不要接線（啟動時 set_leverage 推到交易所）或改名揭露——現況 config 寫 20 交易所 5x 的分歧會再咬人
+5. trading_mode 收編 engine schema（等 #4 驗收後）；頁3 clamp 寫回 session 全站排查
+6. GCE 部署三件套（VM/setup script/IP 白名單）——部署後 replay 驗收要在 GCE 重跑一次
+7. ~~file logger 修繕~~ **全部完成（2026-07-12 20:05 重啟驗收過）**：新 log 每行帶時間戳、引擎雙側掛單正常；202MB 舊檔已歸檔為 `log/as_terminal_max.log.archive-20260712`（gitignored，含觀察期首日與歷史 -2019/斷路記錄）。code 未 commit。
+
+## Blockers
+無硬阻礙。
+
+## Recently Completed（2026-07-12）
+- **TODO 7 重定向後完成（未 commit：grid_engine/utils.py、as_terminal_max.py 尾兩行、tests/test_logger_file_config.py 新檔）**：原前提「-2019/斷路器只噴終端磁碟無痕」是**誤記**——`log/as_terminal_max.log` 一直在收（歷史 1M+ 筆下單失敗、8 筆斷路，多為舊 config 時代產物）。真缺陷三個：(a) format 只有 `%(message)s`，`datefmt` 是死參數 → 事件無時間戳無法定位；(b) 202MB 單檔無 rotation；(c) `basicConfig` 是 import 副作用，web/streamlit 進程也會裝 handler → 換 RotatingFileHandler 後多 writer rollover 會互抽 fd。修法：`%(asctime)s` + RotatingFileHandler(50MB×3, delay=True) + 抽成 `setup_file_logging(force=True)` 只由 `as_terminal_max.py` `__main__` 呼叫（單一 writer）。439 passed（+5 新測試，全部 mutation red-once，含「pytest logging plugin 讓 basicConfig no-op」的假陰性教訓：先綠再紅順序不能省）。dual-review：外部輪 4 should-fix + 3 nit 全修（force=True/subprocess cwd/註解歸因/部署 checklist），Ship as-is；verifier ACCEPT 5/5（獨立 mutation 2/2，mktemp 隔離零污染）。**生效需重啟**，checklist 見 TODO 7。
+- **#4 Task 10 replay 驗收 PASS**：全量 98,402 筆重放，9 筆 diff **全部**落在 07-09 19:12 之前、模式一致（long 進 dead mode 未接管止盈單）——正是 `60917cc`（07-10 10:57）修掉的 bug，屬舊 code 產物。現行 code 窗口（07-10 10:57 起，跨 ~2.2 天）**32,481 筆零 diff**，滿足「≥24h 零 diff」驗收準則（GCE 部署後仍需在 GCE 重跑一次，見 TODO 6）。
+- **觀察期首檢（新 config 窗口 14:51~15:40，~1h）**：決策 20-30 分/筆是純網格 0.3% 的預期頻率（舊 config 增強全開才會 ~6s/筆，勿誤判為故障）；交易所 4 張掛單與最後一筆決策 orders 逐張匹配（價格/數量/reduceOnly），活體 decide→execute 一致 ✅；倉位多 0.58/空 0.34、權益 116.07、可用 6.12、強平 90.76 與收工快照一致 ✅；income since 14:51 僅 COMMISSION -0.06 + TRANSFER +35，尚無 REALIZED_PNL（未觸及止盈，窗口太短）；無 -2019 跡象（空頭 0.04→0.34 成交成長證明下單通道暢通）。健檢腳本（read-only）：scratchpad `health_check.py`——fetch positions/balance/open_orders + `fapiprivate_get_income({'startTime': ...})` 聚合 incomeType。
+- **#14 全線收工並 merge 進 main**（`a49f6b0`，434 passed）：分段窗口驗證（漲/跌/震盪 × 3 場景 × cost sens）確認 mult=40 跨路徑穩健 → config 6 處變更上線 → 入金 35 → 補空 0.30（分批限價，中途撞出 leverage 假旋鈕：config 20 vs 交易所實際 5x）→ 使用者裁決維持 5x、選 B 部分對沖 → delta +0.50→+0.24，強平價 359→90.8
+- lessons.md 整併 202→61 行（六條「靜態成立執行期不成立」同族併通則）；UI 持倉顯示兩位小數
+- branch `feat/backtest-engine-fidelity`（37+5 commits）merge + push，main == origin/main
+
+---
+
+## 存檔：#14（2026-07-11 重新定向）：先回測定 threshold，再談改 code。原「修 `dead_mode_price`」的前提被實測推翻——見下。
 
 ### ★★★ 議倉裁決（真錢，2026-07-11 實測交易所）
 `fetch_positions` / `fetch_balance` 實測（read-only，未下單）：

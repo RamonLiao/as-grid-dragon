@@ -3,6 +3,7 @@
 """
 
 import logging
+import logging.handlers
 import os
 from pathlib import Path
 
@@ -37,12 +38,36 @@ os.makedirs(Path(__file__).parent.parent / "log", exist_ok=True)
 console = Console()
 
 # 日誌配置
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    datefmt="[%X]",
-    handlers=[logging.FileHandler(Path(__file__).parent.parent / "log" / "as_terminal_max.log")]
-)
+# 時間為機器本地時區（本機 Taipei = UTC+8；與 logs/decisions.jsonl 的 UTC 對時要換算）
+LOG_FILE = Path(__file__).parent.parent / "log" / "as_terminal_max.log"
+LOG_FORMAT = "%(asctime)s %(message)s"
+LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
+
+def build_log_handler() -> logging.Handler:
+    # delay=True：建構不開檔，首筆 log 才開（測試進程建 handler 不碰活檔）
+    return logging.handlers.RotatingFileHandler(
+        LOG_FILE, maxBytes=50 * 1024 * 1024, backupCount=3,
+        encoding="utf-8", delay=True,
+    )
+
+
+def setup_file_logging() -> None:
+    """由引擎入口（as_terminal_max.py）顯式呼叫，不做 import 副作用。
+
+    RotatingFileHandler 的 rollover 會 rename 活檔，多進程（web/streamlit
+    也 import 本模組）各自持 handler 對同一檔案輪替會互相抽走 fd —— 只允許
+    引擎進程這一個 writer。
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format=LOG_FORMAT,
+        datefmt=LOG_DATEFMT,
+        handlers=[build_log_handler()],
+        force=True,  # root 已有 handler 時 basicConfig 預設無聲 no-op，會讓事件不落磁碟
+    )
+
+
 logger = logging.getLogger("as_grid_max")
 
 
