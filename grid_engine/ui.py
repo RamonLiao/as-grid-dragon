@@ -150,8 +150,8 @@ class TerminalUI:
             table.add_row(
                 f"{sym_config.coin_name}",
                 price_str,
-                f"[{long_style}]{sym_state.long_position:.1f}[/]",
-                f"[{short_style}]{sym_state.short_position:.1f}[/]",
+                f"[{long_style}]{sym_state.long_position:.2f}[/]",
+                f"[{short_style}]{sym_state.short_position:.2f}[/]",
                 f"[{pnl_style}]{pnl_sign}{pnl:.2f}[/]",
                 status_str,
                 f"[dim]{spacing_str}[/]"
