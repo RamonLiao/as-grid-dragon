@@ -16,7 +16,11 @@
 交易所全程 read-only；寫檔限 data/、docs/、tasks/、tests；
 不碰 config/、logs/、log/；不下單不重啟引擎。
 
-## 可判定驗收（詳見 spec §6）
-校準 gate PASS → 新語意零強平（兩資本場景全窗口）→ Δeq 三段窗口全 ≥ 舊語意
-→ cost sens 排序不翻轉 → 拒單率 >30% 則結論綁入金 → 懸崖偵測（1.5 對照）。
-交易 <30 的 cell 標樣本不足。組合總數揭露。
+## 可判定驗收（詳見 spec §6；2026-07-13 quant reviewer 修訂後）
+① 校準 gate 雙向（低端 live≈0 + 高端 vs 1m backtester [0.2×,1.0×]）→
+② 零強平（強平判定 per-lot 與 netted 雙模型保守取或）→
+③ Δeq 三段全 ≥ 舊（只計獨立事件 ≥30 的 cell，達標段 <2 = inconclusive）→
+④ cost sens 排序不翻轉 → ⑤ 拒單率 >30% 結論綁入金 →
+⑥ 優勝者 factor ±20% + cooldown {2.5,5,10}s 無孤峰 →
+⑦ holdout 05-01~06-05（未開封）最終 OOS，翻車即 inconclusive 不回頭調參。
+窗口不相交；組合總數揭露；spread 假觸發敏感度報告。
