@@ -154,9 +154,17 @@
 改 live 追價語意（factor 0.5 → 1.0）的建議門檻，**全部**滿足才建議：
 
 1. 校準 gate PASS（§4.3，含高端參照 gate）。
-2. 新語意（1.0）零強平，兩資本場景、全窗口。**強平判定平行跑兩套均價模型**
-   （per-lot FIFO 與 Binance netted 均價，後者才是實盤強平的依據——
-   FIDELITY_NOTES 12 / review F7），**任一觸發即記強平**（保守取或）。
+2. 新語意（1.0）零強平，兩資本場景、全窗口。
+   **修訂（2026-07-13，plan review BLOCKER-1 驗算後）**：equity-based 強平判定
+   （`liquidation.py::should_liquidate` 只吃 equity/qty/price）對帳務基礎
+   **可證明不變**——per-lot FIFO 與 netted 兩套獨立平倉帳在同一組成交下
+   equity 逐點相等（realized、釋放 margin、殘餘 uPnL 三項差異恆抵銷；
+   數值驗證見 plan Task 6 測試）。故「雙模型保守取或」在強平通道空洞，
+   改落在**分歧真實存在的通道**：
+   （a）強平：equity 不變性寫成回歸釘測試（若未來改動使兩者分歧 → 測試炸）；
+   （b）**拒單（-2019 等價）**：兩套帳的「可用餘額」確實分歧（FIFO 按 lot 價
+   計 margin、netted 按均價計，Binance 生產為 netted 制）→ `open()` 以
+   **兩套 margin 口徑任一不足即拒單**（保守取或），拒單率統計吃保守值。
 3. 新語意 Δeq 在 W1/W2/W3 三段全 ≥ 舊語意（0.5），且全程窗口為正。
    **本判準只計入獨立事件數 ≥30 的 cell**（review F3）；達門檻的段 <2 →
    結論記 inconclusive（延長樣本期間或等 live 觀察累積，不得硬裁）。
@@ -169,6 +177,10 @@
    holdout 段（§4.1，全程未開封）跑一次：維持「新 ≥ 舊、零強平」才維持
    建議；holdout 翻車 → 結論降級為 inconclusive，如實報告，不得回頭調參
    再驗（holdout 被讀過一次即失效）。
+   **Seed 修訂（plan review SF-8）**：07 月倉位價（690.29/571.75）對 5 月
+   是時間錯置、可能非物理（seed 價遠離段內價格 → 強平判準失去鑑別力）。
+   holdout 段 seed 價改用**段首事件價 at-market**（qty 沿用場景定義），
+   兩 factor 同 seed 對比，維持「比較語意」的目的不變。
 
 任一不滿足 → 產出誠實結論（含「不改、接受倉位凍結、另議出場」路線），
 交使用者裁決。

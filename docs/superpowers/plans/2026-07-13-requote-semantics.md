@@ -532,20 +532,38 @@ git commit -m "feat(backtest): 事件流壓縮 + isBuyerMaker spread 重建（sp
 
 ```python
 class PositionBook:
-    def __init__(self, balance: float, leverage: float, fee_pct: float, slippage_bps: float): ...
+    def __init__(self, balance: float, leverage: float, fee_pct: float, slippage_bps: float,
+                 conservative_reject: bool = False): ...   # True=拒單看 FIFO/netted 兩口徑（tick sim 用）
     def seed(self, side: str, qty: float, price: float) -> None       # margin 扣 balance 不扣 fee（#14 語意）
     def open(self, side: str, price: float, qty: float) -> bool       # False = 保證金不足拒單（-2019 等價）
     def close(self, side: str, price: float, qty: float, ts) -> float # per-lot FIFO，回傳 realized
     def qty(self, side: str) -> float
     def equity_at(self, price: float) -> float                        # balance + open_margin + unrealized
-    def netted_avg(self, side: str) -> float                          # netted 均價（Σqty*px/Σqty；空倉 0）
-    def netted_equity_at(self, price: float) -> float                 # 用 netted 表示法重算（理論上 == equity_at）
+    def netted_avg(self, side: str) -> float                          # netted 均價（獨立平行帳）
+    def netted_equity_at(self, price: float) -> float                 # netted 帳的 equity（數學上 == equity_at，回歸釘）
+    def netted_available(self) -> float                               # netted 帳可用餘額（與 FIFO 帳「真的會分歧」）
     balance: float
     trades: list           # 沿用 backtester Trade 記錄所需欄位
     rejected_entries: int  # open() 回 False 的累計（Task 7/10 拒單率）
 ```
 
 - 語意逐行搬自 `backtester.py:656-733` 現有閉包（open 的 slippage/fee/margin、close 的 FIFO/fee/realized），**不是重寫**——搬完 backtester 委派之，全套既有測試斷言不改全綠 = 行為零變的證據。
+- **netted 平行帳（spec §6.2 修訂版語意，plan review BLOCKER-1 驗算定案）**：
+  PositionBook 額外維護一套獨立 netted 帳（自己的 balance/qty/avg：open/seed 更新
+  加權均價並按 `qty*price/lev` 扣 margin；close 以 `(price-avg)*qty` 記 realized、
+  按 `qty*avg/lev` 釋放 margin，avg 不變）。已驗算：兩帳 equity 逐點相等
+  （分歧只在 balance/margin 拆分），但**可用餘額分歧真實存在**（Binance 生產
+  margin 為 netted 制）。
+  - `equity_at == netted_equity_at` 寫成回歸釘（分歧 = bug）。
+  - **`open()` 拒單判定改保守取或：FIFO 口徑或 netted 口徑任一 margin 不足
+    即回 False**（tick sim 用；backtester 委派時維持原 FIFO-only 判定以保
+    既有測試零變——由建構參數 `conservative_reject: bool = False` 切換，
+    backtester 傳 False、tick sim 傳 True）。
+- **backtester 委派觸點全列（plan review SF-7，抽的時候逐一轉發，漏一個測試就會抓）**：
+  run() 閉包 `_open`/`_close`/`_equity_at`（:656-733）、funding 直接
+  `balance -= charge`（:768）、seed 注入 `balance -= _margin`（:654）、
+  逐 bar equity 曲線內聯計算（:823-827）、max_dd 用 `_equity_at`（:840-850）、
+  強平區塊呼 `_close` 並改 unrealized/open_margin/equity（:856-870）。
 - Task 7 tick sim 直接 import 用。
 
 - [ ] **Step 1: 寫失敗測試**（釘住將搬移的語意 + netted 等式）
@@ -584,13 +602,34 @@ def test_equity_identity():
     assert b.equity_at(110.0) == pytest.approx(1020.0)
 
 def test_netted_equals_perlot_equity_after_partial_close():
-    """FIDELITY_NOTES 12 / review F7：equity 對 lot 結構不變（數學恆等式的回歸釘）。
+    """spec §6.2 修訂版回歸釘：兩套獨立平倉帳（FIFO vs netted）equity 逐點相等。
+    已數值驗算（2026-07-13）：lots [1@100,1@120] close 0.5@130 → FIFO 帳
+    balance=981/margin=34、netted 帳 balance=977/margin=33，uPnL 差恆抵銷。
     若未來改動讓兩者分歧，這裡炸。"""
     b = _book(fee=0.0)
     b.open("long", 100.0, 1.0); b.open("long", 120.0, 1.0)
-    b.close("long", 130.0, 0.5, ts=None)            # 部分平倉後 lot 結構 != netted
+    b.close("long", 130.0, 0.5, ts=None)            # 部分平倉後兩帳 balance 已分歧
     for p in (90.0, 110.0, 140.0):
         assert b.equity_at(p) == pytest.approx(b.netted_equity_at(p))
+
+def test_available_balance_diverges_after_partial_close():
+    """反向釘：兩帳「可用餘額」必須分歧（FIFO 981 vs netted 977）——
+    若有人把 netted 帳實作成 per-lot 換皮（從 lot 重算 avg），這裡炸。"""
+    b = _book(fee=0.0)
+    b.open("long", 100.0, 1.0); b.open("long", 120.0, 1.0)
+    b.close("long", 130.0, 0.5, ts=None)
+    assert b.balance == pytest.approx(981.0)
+    assert b.netted_available() == pytest.approx(977.0)
+
+def test_conservative_reject_uses_worse_margin():
+    """保守取或：netted 口徑不足即拒單，即使 FIFO 口徑足夠"""
+    b = PositionBook(balance=1000.0, leverage=5.0, fee_pct=0.0, slippage_bps=0.0,
+                     conservative_reject=True)
+    b.open("long", 100.0, 1.0); b.open("long", 120.0, 1.0)
+    b.close("long", 130.0, 0.5, ts=None)            # FIFO 可用 981 / netted 977
+    # 構造需 margin 介於 977 與 981 之間的開倉：qty*price/5 = 979 → qty=48.95@100
+    assert b.open("long", 100.0, 48.95) is False
+    assert b.rejected_entries == 1
 
 def test_seed_no_fee():
     b = _book()
@@ -665,6 +704,11 @@ def run_tick_sim(events: pd.DataFrame, cfg: TickSimConfig) -> TickSimResult
 5. 決策 gate（鏡射 live `_handle_ticker`→`adjust_grid`→`_grid_step`）：per-side 檢查（i）該側掛單缺失（無 active/pending entry 或 tp）→ 觸發；（ii）`|price-anchor|/anchor >= grid_spacing*factor` → 觸發；再過 per-side cooldown（距上次該側 requote ≥ cooldown_sec）。觸發 → 組 `DecisionInputs`（enh 中性快照：dynamic=base、bias=1.0；orders 欄位 = 含 pending 的張數）→ `decide()` → 依 SideDecision 施行（cancel_side → 舊單標 expire；orders → 新單標 effective；anchor 更新；dead mode 旗標維護）。`requote_count += 1`。
 6. round_trips：TP 成交一次 +1。
 7. equity 曲線：逐事件 `equity_at(price)` 追蹤 max_drawdown（tick 級最不利價，天然含 wick）。
+8. PositionBook 以 `conservative_reject=True` 建構（拒單看 FIFO/netted 雙口徑，spec §6.2 修訂版）。
+9. **已知語意差異（plan review NIT-10，落 FIDELITY_NOTES 揭露不修）**：live 對
+   `position==0` 的側走 10s timer 單獨掛 entry 路徑（`bot.py:395-416`），tick sim
+   統一走 deviation gate + cooldown。seed 場景恆有倉位，影響限「某側完全平光後」
+   的重掛節奏。
 
 - [ ] **Step 1: 寫失敗測試**（手工事件 fixtures；每條測一個機制，fixture 的待測維度不退化）
 
@@ -727,7 +771,9 @@ def test_decision_delay_keeps_old_order_alive():
     assert any(f["kind"] == "entry" and f["price"] == pytest.approx(99.7) for f in r.fills)
 
 def test_margin_rejection_counted():
-    cfg = TickSimConfig(**{**BASE, "initial_balance": 0.5}, requote_threshold_factor=1.0)
+    # 開一層需 margin = 0.02*99.7/5 ≈ 0.399 → balance 0.1 必拒
+    # （plan review SF-3：原 fixture 0.5 > 0.399 會開倉成功，fixture 退化）
+    cfg = TickSimConfig(**{**BASE, "initial_balance": 0.1}, requote_threshold_factor=1.0)
     r = run_tick_sim(_ev((0, 100.0), (1000, 99.69)), cfg)
     assert r.rejected_entries >= 1 and r.fills == []
 
@@ -805,7 +851,10 @@ def test_degenerate_equivalence():
                                                    unit="ms", utc=True)})
     r_bar = GridBacktester(bt_cfg).run(df)   # 實作時對齊實際 run() 簽名（讀 backtester.py:504 起）
     assert r_tick.final_equity == pytest.approx(r_bar.final_equity, abs=1e-9)
-    assert len(r_tick.fills) == r_bar.trades_count
+    # 口徑對齊（plan review SF-2）：backtester 的 trades 只在 _close append
+    # （entry 不記 trade），所以拿 TP 成交數對 TP 成交數，不拿全部 fills。
+    tp_fills = [f for f in r_tick.fills if f["kind"] == "tp"]
+    assert len(tp_fills) == r_bar.trades_count
 ```
 
 **已知語意差異必須先消掉再比（實作時逐一處理，不許用容差掩蓋）**：1m `_settle` 用 touch（`low<=limit`）而 tick sim 用嚴格穿越 → fixture 路徑全部嚴格穿越可繞開；1m 每 bar 至多一張 entry 成交 → fixture 每步至多觸發一張。若對齊後仍 diff → 停下來查，不放寬容差。
@@ -831,13 +880,25 @@ git commit -m "test(backtest): tick sim 與 GridBacktester 退化路徑等價守
 - Consumes: Task 4/5/7。
 - Produces: `uv run python scripts/calibration_gate.py --end <YYYY-MM-DD>` → stdout 報告 + exit code（0=全 PASS）。純函數 `judge_low_gate(sim_fills_per_day: float) -> bool`（≤2.0）、`judge_high_gate(tick_fills: int, bar_fills: int) -> bool`（`0.2*bar <= tick <= 1.0*bar`；bar==0 → False 並要求換窗口）、`judge_june_alignment(sim_daily: dict[str,int], live_daily: dict[str,int]) -> bool`（live>0 的日子 sim 也 >0 的比例 ≥ 0.5，且 sim 月總量 ≤ 10× live 月總量）。
 
-**Gate 資料definition（spec §4.3）**：
+- [ ] **Step 0（plan review SF-4）: factor 接進 1m backtester**——否則高端 gate 是
+  tick(1.0) 對 1m(0.5)，「同參數」不成立。`backtest/config.py::Config` 加
+  `requote_threshold_factor: float = 0.5`；`backtester.py` 建 `DecisionInputs(...)`
+  處（:777 起）加 `requote_threshold_factor=cfg.requote_threshold_factor,`。
+  回歸：預設 0.5 全套 bit-identical（既有測試不改全綠）。加一條測試
+  （tests/test_calibration_gate.py 內）：`Config(requote_threshold_factor=1.0)`
+  跑退化 bar 路徑，decide 的 should_adjust 行為隨 factor 變（mutation：接線
+  暫時拔掉 → 必紅）。
+
+**Gate 資料 definition（spec §4.3）**：
 - 低端：factor=0.5、seed 現倉（多 0.58@690.29/空 0.34@571.75）、balance 184.6、lev 5、cooldown 5s、delay 500ms，事件流 = 07-12（14:51 Taipei 起）~ `--end`。live ground truth = 0 筆（寫死在 script 註解，附本 session `fetch_my_trades` 證據日期）。
 - 高端：factor=1.0 同參數，窗口 06-16~06-24（選型段中段、非 W 邊界日），對照 GridBacktester 同窗口 1m bars 同參數的 fills 數。
 - 6 月對齊：factor=0.5 掃 06-06~06-30 逐日 fills，對照 live income 實測（COMMISSION 按日聚合，數字寫死於 script：06-17:3、06-19:1、06-22:1、06-23:1、06-25:3、06-28:1，其餘 0——出處 2026-07-13 健檢）。
 
 - [ ] **Step 1: 寫失敗測試**（三個 judge 函數的邊界：2.0 過/2.1 不過；0.2×/1.0× 邊界；bar=0 強制 False；對齊比例 0.5 邊界）
-- [ ] **Step 2: 確認紅** → **Step 3: 實作**（judge 純函數 + main：下載缺日 → 壓縮 → 跑三 gate → 報告逐 gate PASS/FAIL + 數字）
+- [ ] **Step 2: 確認紅** → **Step 3: 實作**（judge 純函數 + main：下載缺日 → 壓縮 →
+  **載 funding**（plan review SF-5：`DataLoader.load_funding("BNBUSDC", start, end)` →
+  轉 `[(epoch_sec, rate)]` 灌 `TickSimConfig.funding_events`，兩個 sim 段都要）→
+  跑三 gate → 報告逐 gate PASS/FAIL + 數字）
 - [ ] **Step 4: 綠 + Mutation**（judge_high_gate 的 `bar==0 → False` 暫時改 True → 對應測試紅；改回）
 - [ ] **Step 5: 實跑三 gate**：`uv run python scripts/calibration_gate.py --end 2026-07-13`。**任一 FAIL → 本 plan 暫停，回報使用者，不進 Task 10。**
 - [ ] **Step 6: Commit**
@@ -866,7 +927,17 @@ git commit -m "feat(scripts): 校準 gate（低端 live≈0 / 高端 vs 1m [0.2,
 - 決策延遲 {0, 500ms, 1s}：僅基準 fee/slip、全程窗口。
 - 優勝者加掃：factor ±20%（3 點）+ cooldown {2.5, 5, 10}s，基準 fee/slip。
 - spread 抖動敏感度：基準 cell 觸發價 ±half-spread（取 `estimate_spread` 的 median）重跑，requote/成交數變化 >20% → 報告標註。
-- 每 cell 輸出：final_equity、Δeq vs factor=0.5 同窗同本、max_dd、liquidated、fills、round_trips（<30 標「樣本不足」）、rejected_entries 率、requote_count。
+- **funding（plan review SF-5）**：每窗口以 `DataLoader.load_funding` 載入該段
+  真實 funding，轉 `funding_events` 注入所有 cell；報告標注 funding 已計。
+- **單位轉換（plan review SF-6，latent bug 高危）**：`fee_pct`/`slippage_bps` 的
+  底層儲存都是 fraction（`apply_slippage` 直接 `price*(1+bps)`；Config 預設
+  0.0001=1bp）。矩陣展開 **bps→fraction 必乘 1e-4**，寫成具名函數
+  `bps_to_fraction(bps: float) -> float` + 單元測試釘 `bps_to_fraction(1) == 0.0001`
+  （mutation：暫時改 1e-3 → 必紅）。
+- **計算量前測（plan review NIT-9）**：矩陣開跑前先單 cell（全程窗口）計時，
+  外推總時長寫進報告；預估 >2h → 先回報使用者再跑（可選 early-abort：
+  liquidated cell 提前終止已內建於 sim）。
+- 每 cell 輸出：final_equity、Δeq vs factor=0.5 同窗同本、max_dd、liquidated、fills、round_trips（<30 標「樣本不足」）、rejected_entries 率（保守取或口徑）、requote_count。
 - 報告尾：總組合數 N、事件數守門後的有效 cell 清單、§6 判準逐條 PASS/FAIL/inconclusive 預判（holdout 除外）。
 
 - [ ] **Step 1: 寫失敗測試**（`build_matrix()` 組合數正確且不含 holdout 日期；`gate_cells(cells, min_events=30)` 過濾；`verdict_preview(results)` 對 §6.1-6.6 逐條判定的純函數——各給手工 results fixture 測 PASS/FAIL/inconclusive 三態）
@@ -889,7 +960,7 @@ git commit -m "feat(scripts): 追價語意實驗矩陣 + §6 判準預判報告"
 
 **前置（缺一不跑）**：Task 10 結果經使用者過目、§6.1-6.6 全 PASS、優勝 factor 已定。**Holdout 只能跑一次**；跑之前先在 `tasks/progress.md` 記「holdout 開封於 <日期>，優勝者 <factor>」。
 
-- [ ] **Step 1**: `--holdout` 模式實作：下載 05-01~06-05 aggTrades（首次開封）→ 只跑 {優勝 factor, 0.5} × {A, B} × 全 holdout 段 × 基準 fee/slip → 判「新 ≥ 舊、零強平」→ PASS 維持建議 / FAIL 記 inconclusive。**模式內建鎖**：若 `tasks/requote-experiment-results.md` 無「§6.1-6.6 全 PASS」標記則 refuse 執行。
+- [ ] **Step 1**: `--holdout` 模式實作：下載 05-01~06-05 aggTrades（首次開封）→ 只跑 {優勝 factor, 0.5} × {A, B} × 全 holdout 段 × 基準 fee/slip → 判「新 ≥ 舊、零強平」→ PASS 維持建議 / FAIL 記 inconclusive。**Seed 用段首事件價 at-market**（qty 沿場景定義；spec §6.7 修訂——07 月倉位價對 5 月是時間錯置，非物理）。**模式內建鎖**：若 `tasks/requote-experiment-results.md` 無「§6.1-6.6 全 PASS」標記則 refuse 執行（誠實聲明：這是紀律軟鎖，防呆不防惡意；holdout 開封記錄以 progress.md 為準）。funding 同樣載入該段真實資料。
 - [ ] **Step 2**: 實跑一次，結果 append 進 results 檔與 progress.md。
 - [ ] **Step 3: Commit**
 
