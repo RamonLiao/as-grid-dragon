@@ -14,6 +14,18 @@ from .enhancements import (
 from .config_io import merge_preserve_save
 
 
+def _norm_requote_factor(v) -> float:
+    """正規化有倉位重掛閾值係數，非有限/≤0/>10 → fallback 0.5"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        f = float("nan")
+    if not math.isfinite(f) or f <= 0 or f > 10:
+        console.print(f"[yellow]requote_threshold_factor={v!r} 非法，回退 0.5[/]")
+        return 0.5
+    return f
+
+
 @dataclass
 class SymbolConfig:
     """單一交易對配置"""
@@ -115,6 +127,7 @@ class GlobalConfig:
     websocket_url: str = "wss://fstream.binance.com/ws"
     sync_interval: float = 10.0
     position_adjust_cooldown: float = 5.0  # 有倉位時網格重掛最小間隔（秒），0 = 關閉
+    requote_threshold_factor: float = 0.5  # 有倉位重掛閾值係數（0 < factor <= 10）
     symbols: Dict[str, SymbolConfig] = field(default_factory=dict)
     risk: RiskConfig = field(default_factory=RiskConfig)
     max_enhancement: MaxEnhancement = field(default_factory=MaxEnhancement)
@@ -143,6 +156,7 @@ class GlobalConfig:
             "websocket_url": self.websocket_url,
             "sync_interval": self.sync_interval,
             "position_adjust_cooldown": self.position_adjust_cooldown,
+            "requote_threshold_factor": self.requote_threshold_factor,
             "symbols": {k: v.to_dict() for k, v in self.symbols.items()},
             "risk": self.risk.to_dict(),
             "max_enhancement": self.max_enhancement.to_dict(),
@@ -210,6 +224,8 @@ class GlobalConfig:
             sync_interval=data.get("sync_interval", 10.0),
             position_adjust_cooldown=cls._parse_position_adjust_cooldown(
                 data.get("position_adjust_cooldown", 5.0)),
+            requote_threshold_factor=_norm_requote_factor(
+                data.get("requote_threshold_factor", 0.5)),
             legacy_api_detected=False,
             telegram_bot_token=data.get("telegram_bot_token", ""),
             telegram_chat_id=data.get("telegram_chat_id", ""),
