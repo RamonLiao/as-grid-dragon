@@ -41,6 +41,7 @@ class DecisionInputs:
     glft_enabled: bool                  # = max_enhancement.is_feature_enabled('glft')
     gamma: float
     enh: EnhancementSnapshot
+    requote_threshold_factor: float = 0.5   # 追價門檻 = grid_spacing * factor；0.5 為歷史 hardcode
 
 
 @dataclass(frozen=True)
@@ -122,7 +123,7 @@ def should_adjust(inputs, side):
         return True
     if anchor > 0:
         deviation = abs(inputs.price - anchor) / anchor
-        return deviation >= inputs.grid_spacing * 0.5
+        return deviation >= inputs.grid_spacing * inputs.requote_threshold_factor
     return True
 
 
