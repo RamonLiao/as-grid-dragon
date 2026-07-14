@@ -59,3 +59,8 @@
 - config 數值欄位在 `from_dict` 就正規化（型別+範圍+fallback），垃圾值不得流進 runtime loop；功能靜默降級（如 Telegram 未設定）啟動時必須給訊號。
 - 安全示警前先 `git ls-files`/`log -S`/`check-ignore` 三查實際暴露面，別看到明文 key 就喊洩漏。
 - Docker TUI：互動用 `compose run --rm`（`up` 不轉發 stdin）；自定義 SIGINT handler 會吃掉 KeyboardInterrupt，需要處暫時換回 `default_int_handler`。
+
+## 2026-07-15: 驗證器與被驗物共用判準/資料 = 回歸守衛，不是獨立證據
+- Context：校準 gate 用「每筆 fill 有嚴格穿越事件」驗模擬器沒偷跑，745/745 零違規被我當成「強於 ratio 代理的證據」呈給使用者。
+- Error：fill 引擎記錄成交用的就是同一判準同一事件流，驗證對現行引擎**必然**回 0——套套邏輯。它防的是未來回歸（改 touch-fill、記錯 ts），不證明現在沒高估。
+- Rule：設計驗證前先問「這個檢查有沒有可能在現行實作下失敗？」不可能失敗的檢查是回歸守衛，呈報時不得包裝成獨立證據；獨立證據必須來自不同資料源或不同判準（live ground truth、對照模型、人工抽樣）。

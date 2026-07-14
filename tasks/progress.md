@@ -10,13 +10,23 @@
 - **氧氣限制**：可用 6.1 在 5x 只夠網格再加 ~2 層，空頭側連續進場會撞 -2019（引擎斷路器會擋）
 
 ## TODO（優先序）
-1. **觀察期複檢（07-13 之後）**：新 config 已跑 ≥24h 時重跑 replay（期望持續 diff=0）+ income 健檢（`REALIZED_PNL` 是否穩定累積、掛單是否持續在 ±0.3% 刷新）。07-12 首檢時新 config 窗口僅 ~1h、尚無止盈成交，「已實現穩定累積」無法判定。健檢腳本模板見下方 07-12 記錄。
+1. ~~觀察期複檢（07-13 之後）~~ **完成（2026-07-13）：replay PASS，但發現重大 fidelity 落差 → 衍生 TODO 1a**。
+   - **Replay PASS**：全量 98,546 筆重放，9 筆 diff 與首檢完全相同（全部 ≤07-09 19:12 Taipei，舊 code 產物）；修復後窗口 32,630 筆零 diff；新 config 窗口 26.5h、147 筆零 diff。
+   - **健檢過的項目**：倉位多 0.58@690.29 / 空 0.34@571.75 不變、權益 115.3、可用 5.95、強平 90.84；雙側 4 張掛單持續在 ±0.3% 刷新（最後刷新 = 最後決策 17:19 Taipei，一致）；新窗口 log 零 -2019、Telegram 修復後零 403；funding 26h 僅 -0.02；07-13 14:16 一筆瞬時同步失敗（REST 錯誤，之後決策照跑，非阻礙）。
+   - **⚠️ 警訊（健檢主發現）：觀察期 26.5h 網格零成交、零 REALIZED_PNL**。`fetch_my_trades` 確認窗口內僅 4 筆 = 07-12 手動補空；期間價格走 588→568（~3.4%）網格一張未成交。**不是新故障**：income 按日聚合顯示過去一個月成交本來就 0~3 筆/天、REALIZED_PNL 月合計 ≈ **-0.14**。
+   - **機制（code 證據）**：`decision.py:125` `should_adjust` 在偏離 anchor ≥ `grid_spacing*0.5`（=0.15%）就撤單重掛，掛單在 ±0.3% → **掛單被追價永遠搬走**，只有「引擎反應間隙內暴走 >0.3%」才成交。backtester 撮合是「上一根掛單吃整根 1m bar 的 high/low」（`backtester.py:712` `_settle` 先結算後 decide()），掛單存活整整 1 分鐘 → **回測成交率 ~17 筆/天（513 trades/月）vs 實盤 ~1 筆/天，高估一個數量級以上**。FIDELITY_NOTES (5) 有揭露「追價以偏離門檻近似」但未量化幅度。
+   - **對現行計畫的衝擊**：「網格慢慢磨回 uPnL -68」在實盤成交率下不成立（月已實現 ≈ -0.14，磨回遙遙無期）。thr=0.8 的方向結論不受影響（mult 40/60/100 恆同 = 只是關裝死），但 #14 回測的 Δeq 絕對值全部高估。
+1a. ~~成交率斷層的處置~~ **驗證完成（2026-07-15，branch `feat/requote-semantics`，verifier ACCEPT 7/7，dual-review Ship as-is）：數據否決方向 (i)，剩 (ii) 待使用者裁決**。
+   - tick 級實驗（aggTrades 06-06~07-13、校準 gate 三道全 PASS、N=166 組合全揭露）：factor=1.0（掛到成交）§6 判準 3 FAIL——W1 上漲段 -21.1 / W3 震盪 -4.5（只贏 W2 下跌 +27.7，逆選擇主導）；成本 2/2bps 下全程排序翻成 0.5 最優（成交 20 倍但費用吃光 grinding）；factor 0.8 的 +14.9 是 threshold=limit 邊界懸崖（成交驟降 9 倍），依預註冊規則不採納。**「磨回 -68」路線被數據關死；現行 0.5 語意在成本現實下可辯護。**
+   - 已上線的中性產物：`requote_threshold_factor` 參數化（預設 0.5 bit-identical，replay 9/9 不變）、tick 模擬器 + PositionBook + aggTrades 管線（未來 requote 類實驗基礎設施）、FIDELITY_NOTES (13)。holdout 05-01~06-05 保持未開封（§6 未全過，依鎖不跑）。
+   - **剩餘裁決（使用者）**：(ii) 接受倉位近似凍結 → 另議 -68 出場計畫（等價回 690 平多 / 定點認賠 / 入金補中性後長期持有）；或深究 factor 0.8 regime（需新一輪預註冊驗證，不急）。branch merge 決定見對話。
 2. **入金 ~25 補滿 delta +0.24 → 完全中性**（使用者決定時機；5x 下補滿需錢包 ≥207）
 3. **symbols-set 併發 race**（#10-A 衍生）：修法傾向砍終端 config 選單（單一 writer 根治）
 4. lessons 通則落地檢查：`config.leverage` 假旋鈕要不要接線（啟動時 set_leverage 推到交易所）或改名揭露——現況 config 寫 20 交易所 5x 的分歧會再咬人
 5. trading_mode 收編 engine schema（等 #4 驗收後）；頁3 clamp 寫回 session 全站排查
 6. GCE 部署三件套（VM/setup script/IP 白名單）——部署後 replay 驗收要在 GCE 重跑一次
-7. ~~file logger 修繕~~ **全部完成（2026-07-12 20:05 重啟驗收過）**：新 log 每行帶時間戳、引擎雙側掛單正常；202MB 舊檔已歸檔為 `log/as_terminal_max.log.archive-20260712`（gitignored，含觀察期首日與歷史 -2019/斷路記錄）。code 未 commit。
+7. ~~file logger 修繕~~ **全部完成並 commit（`f64ae2f`，2026-07-12 20:05 重啟驗收過）**：新 log 每行帶時間戳、引擎雙側掛單正常；202MB 舊檔已歸檔為 `log/as_terminal_max.log.archive-20260712`（gitignored，含觀察期首日與歷史 -2019/斷路記錄）。main 已與 origin 同步。
+8. ~~Telegram 通知接通~~ **完成（2026-07-12 21:43）**：根因兩個——chat_id 誤填 bot 自身 ID（log 三筆 `403 the bot can't send messages to the bot` 佐證）+ 引擎啟動時憑證為空致 reporter 未建。使用者修正 chat_id=1054193397 後 21:43 重啟，之後零失敗記錄。**07-13 20:00 Taipei 首封每日摘要使用者確認收到，端到端驗收完成。**
 
 ## Blockers
 無硬阻礙。
