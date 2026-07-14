@@ -68,6 +68,11 @@ FIDELITY_NOTES = (
     "而生產 Binance hedge mode 是對【混合均價】結算；故涉及 seed 部分平倉的實驗"
     "(threshold 掃描)其 realized_pnl 與 final_equity 會系統性偏離生產，只可看方向、"
     "不可當精確預測。seed 全 0(預設)時本條不適用(與空倉起跑 bit-identical)。"
+    "(13) 1m 撮合 vs live 追價的成交率差——1m 掛單活滿整根 bar 且僅 bar close 重掛，"
+    "live 每 tick 追價(deviation>=spacing*requote_threshold_factor)+5s cooldown；"
+    "實測 1m ~17 筆/天 vs live ~1 筆/天(2026-07 觀察期)。tick 級對比走 "
+    "backtest/tick_sim.py(共用 decide()/PositionBook)，1m 對 requote 語意的結論"
+    "不可信，factor 敏感實驗一律用 tick sim。"
 )
 
 
