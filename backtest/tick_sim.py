@@ -158,16 +158,20 @@ def run_tick_sim(events: pd.DataFrame, cfg: TickSimConfig) -> TickSimResult:
                     fills.append({"ts_ms": ts, "side": side, "kind": "entry",
                                   "price": o["price"], "qty": o["qty"]})
                     orders.remove(o)   # 成交才撤（拒單則保留，與 _settle 一致）
+            remaining = prior_qty   # 同 tick 多張 tp 依序遞減，防重複計數（防禦性，
+                                     # 現行資料路徑碰不到：requote 生命週期保證每側
+                                     # 每 tick 至多一張 tp eligible）
             for o in tps:
                 crossed = (price < o["price"]) if o["is_buy"] else (price > o["price"])
                 if not crossed:
                     continue   # 未穿越 → tp 靜置（與 _settle 一致，不撤）
-                closable = min(o["qty"], prior_qty)
+                closable = min(o["qty"], remaining)
                 if closable > 0:
                     book.close(side, o["price"], closable, ts)
                     fills.append({"ts_ms": ts, "side": side, "kind": "tp",
                                   "price": o["price"], "qty": closable})
                     round_trips += 1
+                    remaining -= closable
                 orders.remove(o)   # 穿越判定後撤（與 _settle 同：只在觸發時清）
 
         # ---- (b) 強平檢查 ----
@@ -242,12 +246,14 @@ def run_tick_sim(events: pd.DataFrame, cfg: TickSimConfig) -> TickSimResult:
                 requote_threshold_factor=cfg.requote_threshold_factor,
             )
             decision = decide(inputs)
+            adjusted_any = False
             for side in ("long", "short"):
                 if side not in gates:
                     continue
                 sd = decision.long if side == "long" else decision.short
                 if not sd.should_adjust:
                     continue
+                adjusted_any = True
                 if sd.enter_dead_mode:
                     dead[side] = True
                 if sd.exit_dead_mode:
@@ -271,7 +277,9 @@ def run_tick_sim(events: pd.DataFrame, cfg: TickSimConfig) -> TickSimResult:
                 if sd.new_anchor_price is not None:
                     anchor[side] = sd.new_anchor_price
                 last_requote[side] = epoch
-            requote_count += 1   # 每事件計一次（初始佈網=1；brief §5 test_cooldown 註）
+            if adjusted_any:
+                requote_count += 1   # 只在實際執行撤/掛/anchor 更新才計一次
+                                      # （初始佈網=1；brief §5 test_cooldown 註）
 
         # ---- equity 曲線（逐事件 tick 級，天然含 wick）----
         eq = book.equity_at(price)

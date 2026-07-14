@@ -74,7 +74,7 @@ def judge_high_gate(tick_fills: int, bar_fills: int, crossing_violations: int) -
 def judge_june_alignment(sim_daily: dict, live_daily: dict) -> bool:
     """6 月對齊：
       (1) live>0 的日子 sim 也 >0 的比例 >= 0.5；
-      (2) sim 月總量 <= 10x live 月總量（量級不炸）。
+      (2) sim 月總量 <= 15x live 月總量（量級不炸）。
     live 全無活躍日 → 無對齊基準，保守 False。"""
     live_active = [d for d, n in live_daily.items() if n > 0]
     if not live_active:
