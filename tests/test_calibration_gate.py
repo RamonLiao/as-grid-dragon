@@ -29,38 +29,41 @@ def test_low_gate_pass_zero():
 
 
 # ---------------------------------------------------------------------------
-# judge_high_gate: 0.2*bar <= tick <= 1.0*bar；bar==0 -> False（要求換窗口）
+# judge_high_gate（spec 2026-07-14 修訂）：
+#   bar==0 -> False；否則 tick >= 0.2*bar AND crossing_violations == 0
+#   （上界已移除，改由成交真實性機械驗證把關）
 # ---------------------------------------------------------------------------
 def test_high_gate_pass_lower_boundary():
-    # bar=10 -> 0.2*10=2.0；tick=2 恰在下界
-    assert judge_high_gate(2, 10) is True
+    # bar=10 -> 0.2*10=2.0；tick=2 恰在下界，violations=0
+    assert judge_high_gate(2, 10, 0) is True
 
 
 def test_high_gate_fail_below_lower_boundary():
-    assert judge_high_gate(1, 10) is False
+    assert judge_high_gate(1, 10, 0) is False
 
 
-def test_high_gate_pass_upper_boundary():
-    # tick=bar 恰在上界（tick 不得多於 bar）
-    assert judge_high_gate(10, 10) is True
+def test_high_gate_pass_far_above_old_upper_bound():
+    # 舊判準會在此 FAIL（tick > bar）；新判準無上界，只要 violations==0 就 PASS
+    assert judge_high_gate(15, 10, 0) is True
 
 
-def test_high_gate_fail_above_upper_boundary():
-    assert judge_high_gate(11, 10) is False
+def test_high_gate_fail_any_crossing_violation():
+    # tick/bar 比例健康，但 violations=1（存在偷跑 fill）-> 必 FAIL
+    assert judge_high_gate(5, 10, 1) is False
 
 
 def test_high_gate_bar_zero_forces_false():
     # bar==0：分母失效，強制 False（mutation 目標：改成 True 必紅）
-    assert judge_high_gate(0, 0) is False
-    assert judge_high_gate(5, 0) is False
+    assert judge_high_gate(0, 0, 0) is False
+    assert judge_high_gate(5, 0, 0) is False
 
 
 # ---------------------------------------------------------------------------
-# judge_june_alignment:
-#   (live>0 的日子 sim 也 >0 的比例 >= 0.5) AND (sim 月總量 <= 10x live 月總量)
+# judge_june_alignment（spec 2026-07-14 修訂：cap 10x -> 15x）:
+#   (live>0 的日子 sim 也 >0 的比例 >= 0.5) AND (sim 月總量 <= 15x live 月總量)
 # ---------------------------------------------------------------------------
 def test_june_alignment_pass_ratio_boundary():
-    # live 活躍 2 天，sim 命中 1 天 -> ratio 0.5 恰達門檻；量級 2 <= 10*2
+    # live 活躍 2 天，sim 命中 1 天 -> ratio 0.5 恰達門檻；量級 2 <= 15*2
     live = {"2026-06-17": 1, "2026-06-19": 1}
     sim = {"2026-06-17": 1, "2026-06-20": 1}
     assert judge_june_alignment(sim, live) is True
@@ -74,16 +77,16 @@ def test_june_alignment_fail_ratio_below():
 
 
 def test_june_alignment_fail_magnitude():
-    # ratio 命中（1/1）但 sim 月總量 21 > 10*live 總量 2 -> FAIL
+    # ratio 命中（1/1）但 sim 月總量 31 > 15*live 總量 2(=30) -> FAIL
     live = {"2026-06-17": 2}
-    sim = {"2026-06-17": 21}
+    sim = {"2026-06-17": 31}
     assert judge_june_alignment(sim, live) is False
 
 
 def test_june_alignment_pass_magnitude_boundary():
-    # sim 總量 20 == 10*live 總量 2 恰在上界
+    # sim 總量 30 == 15*live 總量 2 恰在上界
     live = {"2026-06-17": 1, "2026-06-19": 1}
-    sim = {"2026-06-17": 10, "2026-06-19": 10}
+    sim = {"2026-06-17": 15, "2026-06-19": 15}
     assert judge_june_alignment(sim, live) is True
 
 

@@ -5,8 +5,9 @@ main() 為薄殼：下載 aggTrades → 壓縮 → 載 funding → 跑 tick/1m �
 
 三 gate（spec §4.3 / task-9-brief）：
   低端  factor=0.5 現倉 seed，07-12(06:51 UTC 起)~--end，對照 live≈0 筆 → sim_fills/day <= 2.0
-  高端  factor=1.0 flat，06-16~06-24 tick vs 同窗口 1m bars 同參數 → 0.2*bar <= tick <= 1.0*bar
-  6 月  factor=0.5 flat，06-06~06-30 逐日 fills，對照 live COMMISSION 逐日聚合
+  高端  factor=1.0 flat，06-16~06-24 tick vs 同窗口 1m bars 同參數
+        → tick >= 0.2*bar（下界）+ 成交真實性驗證 violations == 0（spec 2026-07-14 修訂，上界已移除）
+  6 月  factor=0.5 flat，06-06~06-30 逐日 fills，對照 live COMMISSION 逐日聚合（cap 15x，spec 2026-07-14 修訂）
 
 用法：uv run python scripts/calibration_gate.py --end 2026-07-13
       exit code 0 = 三 gate 全 PASS。
@@ -59,12 +60,15 @@ def judge_low_gate(sim_fills_per_day: float) -> bool:
     return sim_fills_per_day <= 2.0
 
 
-def judge_high_gate(tick_fills: int, bar_fills: int) -> bool:
-    """高端：tick 成交數落在 1m bar 的 [0.2, 1.0] 倍區間。
+def judge_high_gate(tick_fills: int, bar_fills: int, crossing_violations: int) -> bool:
+    """高端（spec §4.3 2026-07-14 修訂）：上界移除，改兩條件並存：
+      (a) 下界：tick >= 0.2x bar（偵測 fill 引擎系統性死亡）；
+      (b) 成交真實性機械驗證：violations == 0（每筆 fill 於 fill 時刻必須存在
+          嚴格穿越 limit 的原始事件，違規 = 偷跑）。
     bar==0 → 分母失效，強制 False 並要求換窗口（該窗口無成交、無鑑別力）。"""
     if bar_fills == 0:
         return False
-    return 0.2 * bar_fills <= tick_fills <= 1.0 * bar_fills
+    return tick_fills >= 0.2 * bar_fills and crossing_violations == 0
 
 
 def judge_june_alignment(sim_daily: dict, live_daily: dict) -> bool:
@@ -79,7 +83,27 @@ def judge_june_alignment(sim_daily: dict, live_daily: dict) -> bool:
     ratio = hit / len(live_active)
     sim_total = sum(sim_daily.values())
     live_total = sum(live_daily.values())
-    return ratio >= 0.5 and sim_total <= 10 * live_total
+    return ratio >= 0.5 and sim_total <= 15 * live_total
+
+
+def _crossing_violations(fills: list, events: pd.DataFrame) -> int:
+    """成交真實性機械驗證（spec §4.3 高端 gate 2026-07-14 修訂）：每筆 fill 在
+    fill 時刻（ts_ms）必須存在嚴格穿越 limit 的原始事件，否則視為偷跑（violation）。
+    buy fill（long entry / short tp）要求事件價 < limit；
+    sell fill（short entry / long tp）要求事件價 > limit。"""
+    ts_index = defaultdict(list)
+    for row in events.itertuples(index=False):
+        ts_index[int(row.ts_ms)].append(float(row.price))
+    violations = 0
+    for f in fills:
+        is_buy = (f["side"] == "long" and f["kind"] == "entry") or \
+                 (f["side"] == "short" and f["kind"] == "tp")
+        limit = f["price"]
+        prices = ts_index.get(int(f["ts_ms"]), [])
+        crossed = any(p < limit for p in prices) if is_buy else any(p > limit for p in prices)
+        if not crossed:
+            violations += 1
+    return violations
 
 
 # ===========================================================================
@@ -212,11 +236,14 @@ def run_high_gate(agg) -> dict:
 
     tick_fills = tick.round_trips
     bar_fills = bar.trades_count
+    crossing_violations = _crossing_violations(tick.fills, ev)
     return {"name": "高端 (high)", "elapsed": tick_elapsed + bar_elapsed,
-            "pass": judge_high_gate(tick_fills, bar_fills),
+            "pass": judge_high_gate(tick_fills, bar_fills, crossing_violations),
             "detail": {"tick_round_trips": tick_fills, "bar_trades_count": bar_fills,
                        "ratio": round(tick_fills / bar_fills, 4) if bar_fills else None,
-                       "band": "[0.2, 1.0] x bar",
+                       "band": ">= 0.2x bar（下界）+ crossing_violations == 0（真實性驗證，"
+                               "上界已移除，spec 2026-07-14 修訂）",
+                       "crossing_violations": crossing_violations,
                        "tick_total_fills": len(tick.fills), "tick_rejected": tick.rejected_entries,
                        "tick_liquidated": tick.liquidated, "bar_liquidated": bar.liquidated,
                        "n_events": len(ev), "n_bars": len(bars),
@@ -242,7 +269,7 @@ def run_june_gate(agg) -> dict:
             "pass": judge_june_alignment(daily, JUNE_LIVE_DAILY),
             "detail": {"sim_total": sim_total, "live_total": live_total,
                        "magnitude_ratio": round(sim_total / live_total, 4) if live_total else None,
-                       "magnitude_cap": "<= 10x live",
+                       "magnitude_cap": "<= 15x live（spec 2026-07-14 修訂：10x→15x）",
                        "hit_ratio": round(len(hit) / len(live_active), 4) if live_active else None,
                        "hit_days": hit, "live_active_days": live_active,
                        "sim_daily_taipei": daily, "sim_daily_utc": daily_utc,
