@@ -82,3 +82,30 @@ class AggTradesLoader:
             df.to_csv(path, index=False, header=False)
             out.append(path)
         return out
+
+
+def compress_events(df: pd.DataFrame) -> pd.DataFrame:
+    """連續同價 tick 合併：qty 加總、ts 取段首。決策只依賴價格穿越門檻，同價段不觸發狀態改變。"""
+    run_id = (df["price"] != df["price"].shift()).cumsum()
+    g = df.groupby(run_id, sort=False)
+    return pd.DataFrame({"ts_ms": g["ts_ms"].first().values,
+                         "price": g["price"].first().values,
+                         "qty": g["qty"].sum().values})
+
+
+def estimate_spread(df: pd.DataFrame, max_gap_ms: int = 1000) -> dict:
+    """用 is_buyer_maker 側別重建 spread：True 打在 bid、False 打在 ask，
+    僅取時間差 <max_gap_ms 的相鄰異側對，避免跨行情比較（spec F6）。"""
+    px, side, ts = df["price"].values, df["is_buyer_maker"].values, df["ts_ms"].values
+    spreads = []
+    for i in range(1, len(px)):
+        if side[i] != side[i - 1] and ts[i] - ts[i - 1] < max_gap_ms:
+            ask = px[i] if not side[i] else px[i - 1]
+            bid = px[i] if side[i] else px[i - 1]
+            if ask >= bid > 0:
+                spreads.append((ask - bid) / bid * 10_000)
+    if not spreads:
+        return {"median_bps": float("nan"), "p90_bps": float("nan"), "n_pairs": 0}
+    s = pd.Series(spreads)
+    return {"median_bps": float(s.median()), "p90_bps": float(s.quantile(0.9)),
+            "n_pairs": len(spreads)}
