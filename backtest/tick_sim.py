@@ -116,6 +116,8 @@ def run_tick_sim(events: pd.DataFrame, cfg: TickSimConfig) -> TickSimResult:
     round_trips = 0
     requote_count = 0
     liquidated = False
+    _prune_counter = 0
+    _PRUNE_EVERY = 1000
 
     funding_sorted = sorted(cfg.funding_events, key=lambda x: x[0])
     fund_i = 0
@@ -275,6 +277,13 @@ def run_tick_sim(events: pd.DataFrame, cfg: TickSimConfig) -> TickSimResult:
         eq = book.equity_at(price)
         max_equity = max(max_equity, eq)
         min_equity = min(min_equity, eq)
+
+        # ---- 定期清除已過期掛單（ts 單調不減 → 一旦 not _present 永遠 not _present，
+        # 清除不改變任何 _present/_fill_eligible 讀取路徑的行為，純 perf）----
+        _prune_counter += 1
+        if _prune_counter >= _PRUNE_EVERY:
+            _prune_counter = 0
+            orders[:] = [o for o in orders if _present(o, ts)]
 
     final_price = last_price if last_price is not None else cfg.initial_balance
     final_equity = book.equity_at(final_price)
