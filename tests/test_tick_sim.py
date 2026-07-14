@@ -84,3 +84,30 @@ def test_round_trip_counting():
     # 完整往返：進場 99.69 成交 → TP sell @ entry*1.003 → 價格上穿 → TP 成交
     r = run_tick_sim(_ev((0, 100.0), (1000, 99.69), (2000, 100.05)), cfg)
     assert r.round_trips == 1
+
+
+def test_positioned_side_requotes_after_tp_fill_factor_above_one():
+    """factor=1.5：TP 成交後（deviation 僅 0.35% < 門檻 0.45%），有倉側缺 tp（entry
+    仍在）須立即觸發重掛（live OR 語意）；若 gate 用 AND-of-absence（要等整側完全
+    無掛單才觸發）則不會補掛新 tp，第二段漲勢（穿越理論上該有的新 tp 價位）就不會
+    再成交一次——系統性低估 factor>1 的成交率（review 2026-07-14 裁定的邊界洞）。
+
+    fixture 推導（BASE: grid_spacing=take_profit_spacing=0.003，seed only long，
+    factor=1.5 → deviation 門檻 0.45%）：
+    - t0=100.0：佈網。long: tp@100.30 (anchor*1.003) + entry@99.70。
+      short（flat）只掛 entry@100.30（與 long tp 同價，網格對稱下的巧合，不影響
+      本測試斷言，因為斷言只篩 side=='long'）。
+    - t1=100.35：long tp@100.30 嚴格穿越成交，long 剩倉 0.02（未平倉，有倉側）。
+      long entry@99.70 仍在（未穿越）→ OR gate：缺 tp 但有 entry → 觸發，
+      decide() 以現價 100.35 補掛新 tp@100.65105（100.35*1.003）+ 新 entry。
+      AND gate 下：entry 仍在場 → 整側非「完全無掛單」→ 不觸發 → 無新 tp。
+    - t2=100.66：穿越新 tp@100.65105（嚴格 100.66>100.65105）。
+      OR-fix 下這裡會再成交一次 long tp（round_trips 累積到 2）；
+      AND 舊語意下該價位根本沒有掛單，t2 對 long 側無任何動作（round_trips 停在 1）。
+    """
+    cfg = TickSimConfig(**BASE, requote_threshold_factor=1.5,
+                        seed_long_qty=0.04, seed_long_price=100.0)
+    r = run_tick_sim(_ev((0, 100.0), (1000, 100.35), (2000, 100.66)), cfg)
+    long_tp_fills = [f for f in r.fills if f["side"] == "long" and f["kind"] == "tp"]
+    assert len(long_tp_fills) == 2                # OR-fix：t1、t2 各成交一次 long tp
+    assert r.round_trips == 2

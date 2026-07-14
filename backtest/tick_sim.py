@@ -16,14 +16,26 @@
 
 模擬語意逐條對照見 .superpowers/sdd/task-7-brief.md §4.2 (1)-(9)。
 
-注意（gate 語意，brief §5 (i) 落地）：觸發條件 (i)「該側掛單缺失」實作為
-「該側**無任何未過期掛單**（entry 與 tp 皆無）」——讀作 `無(entry 或 tp)`。這與
-`decision.should_adjust` 的 `buy_o<=0 OR sell_o<=0`（任一缺即觸發）**不同**：後者在
-flat 側（my_pos==0 → 無 tp 單）會每個事件都觸發，把靜置的 entry 一路搬走，令
-test_strict_crossing / test_resting 的「掛單靜置到被穿越」核心主張失效。故 gate 由
-本模組自行計算（不複用 should_adjust）；decide() 只在 gate 放行後被呼叫來產生掛單，
-其內部 should_adjust 在 gate 放行時恆為 True（空側 → buy_o=0；偏離 → deviation），
-兩者一致。dead 側/flat 側完全平光後的重掛節奏與 live 的差異見 brief §9 FIDELITY_NOTES。
+注意（gate 語意，brief §5 (i) 落地，2026-07-14 review 修正分側）：觸發條件 (i)
+「該側掛單缺失」依持倉分兩個 regime：
+
+- **有倉側**（`book.qty(side) > 0`）：live OR 語意——缺 entry 或缺 tp（各自無任何
+  未過期掛單）任一成立即觸發，鏡射 `decision.should_adjust` 的
+  `buy_o<=0 OR sell_o<=0`。這修正了 `requote_threshold_factor>1` 時的邊界洞：
+  TP 成交後 deviation 尚未達門檻，但 live 會在下個 10s timer tick 立即補掛 tp
+  （§9 已知差異，非 event-driven），舊版 AND-of-absence 會漏掉這個補掛時點，
+  系統性低估 factor>1 的成交率。
+- **flat 側**（`qty == 0`）：維持 AND-of-absence（該側**無任何未過期掛單**，
+  entry 與 tp 皆無才觸發）。flat 側若改用 OR，會因「結構性無 tp 單」（無倉可平）
+  而每個事件都觸發，把靜置的 entry 一路搬走，令 test_strict_crossing /
+  test_resting 的「掛單靜置到被穿越」核心主張失效。
+
+`requote_threshold_factor<=1` 時（deviation 門檻 <= grid_spacing）兩個 regime
+行為與 live 等價（deviation 門檻本身已夠緊，OR/AND 差異不顯現）；factor>1 時只有
+有倉側的 OR 修正會生效。gate 由本模組自行計算（不複用 should_adjust）；decide()
+只在 gate 放行後被呼叫來產生掛單，其內部 should_adjust 在 gate 放行時恆為 True
+（空側 → buy_o=0；有倉側缺單 → 對應 o<=0；偏離 → deviation），兩者一致。
+dead 側/flat 側完全平光後的重掛節奏與 live 的差異見 brief §9 FIDELITY_NOTES。
 """
 from dataclasses import dataclass, field
 
@@ -181,8 +193,18 @@ def run_tick_sim(events: pd.DataFrame, cfg: TickSimConfig) -> TickSimResult:
         short_pos = book.qty("short")
         gates = {}
         for side in ("long", "short"):
-            has_order = any(o["pos_side"] == side and _present(o, ts) for o in orders)
-            trigger = not has_order
+            side_pos = long_pos if side == "long" else short_pos
+            if side_pos > 0:
+                # 有倉側：live OR 語意（缺 entry 或缺 tp 任一即觸發）
+                has_entry = any(o["pos_side"] == side and o["kind"] == "entry"
+                                and _present(o, ts) for o in orders)
+                has_tp = any(o["pos_side"] == side and o["kind"] == "tp"
+                             and _present(o, ts) for o in orders)
+                trigger = not has_entry or not has_tp
+            else:
+                # flat 側：AND-of-absence（完全無掛單才觸發，避免每事件 chasing）
+                has_order = any(o["pos_side"] == side and _present(o, ts) for o in orders)
+                trigger = not has_order
             if not trigger and anchor[side] > 0:
                 trigger = abs(price - anchor[side]) / anchor[side] >= \
                     cfg.grid_spacing * cfg.requote_threshold_factor
