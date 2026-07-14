@@ -244,6 +244,7 @@ class MaxGridBot:
             glft_enabled=max_cfg.is_feature_enabled('glft'),
             gamma=max_cfg.gamma,
             enh=snapshot,
+            requote_threshold_factor=getattr(self.config, "requote_threshold_factor", 0.5),
         )
 
     def _get_adjusted_quantity(
@@ -291,7 +292,8 @@ class MaxGridBot:
     def _should_adjust_grid(self, sym_config: SymbolConfig, sym_state: SymbolState, side: str) -> bool:
         """檢查是否需要調整網格"""
         price = sym_state.latest_price
-        deviation_threshold = sym_config.grid_spacing * 0.5
+        deviation_threshold = sym_config.grid_spacing * getattr(
+            self.config, "requote_threshold_factor", 0.5)
 
         if side == 'long':
             if sym_state.buy_long_orders <= 0 or sym_state.sell_long_orders <= 0:
