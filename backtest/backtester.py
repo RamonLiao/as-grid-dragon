@@ -24,9 +24,10 @@ from grid_engine.snapshot import ManagerBundle, build_snapshot
 from grid_engine.enhancements import (
     DynamicGridManager, LeadingIndicatorManager, GLFTController, MaxEnhancement,
 )
-from backtest.costs import apply_slippage, funding_charge
+from backtest.costs import funding_charge
 from backtest.matching import entry_crossed, tp_crossed
 from backtest.liquidation import margin_usage, should_liquidate
+from backtest.accounting import PositionBook
 
 # 回測保真限制（與實盤的已知差異）。寫入 BacktestResult.notes。
 FIDELITY_NOTES = (
@@ -603,7 +604,9 @@ class GridBacktester:
         self._max_enh = MaxEnhancement()
         bundle = self._build_bundle()
 
-        balance = cfg.initial_balance
+        book = PositionBook(balance=cfg.initial_balance, leverage=leverage,
+                            fee_pct=fee_pct, slippage_bps=cfg.slippage_bps,
+                            conservative_reject=False)
         funding_paid = 0.0
         # funding settlements：(epoch_sec, rate) 排序；pointer 掃過已結算的
         settlements = []
@@ -625,13 +628,15 @@ class GridBacktester:
         while fund_i < len(settlements) and settlements[fund_i][0] < first_epoch:
             fund_i += 1
 
-        max_equity = balance
-        min_worst_equity = balance  # max_drawdown 谷底：盤中最不利權益的全程最小值
+        max_equity = book.balance
+        min_worst_equity = book.balance  # max_drawdown 谷底：盤中最不利權益的全程最小值
         peak_margin_usage = 0.0
         liquidated = False
-        long_positions: list = []
-        short_positions: list = []
-        trades: list = []
+        # 帳務全委派 PositionBook；以下 alias 指向 book 內部 list（供 funding/equity 迴圈
+        # 就地讀取），balance 讀寫一律走 book.balance。
+        long_positions = book.long_positions
+        short_positions = book.short_positions
+        trades = book.trades
         equity_curve: list = []
 
         # 初始持倉注入（seed）：pre-populate lot @ seed price，margin 從 balance 扣、
@@ -639,9 +644,9 @@ class GridBacktester:
         # 用途：重現生產裝死狀態（空倉起跑碰不到 threshold，見 tests/test_backtest_seed_position.py）。
         # 注入點自身也 raise（不只靜默跳過），防直接調 _run_terminal_ui_mode 繞過
         # run() 的 _validate_seed（內部 review M4，defense-in-depth）。qty==0 = 跳過。
-        for _side, _qty, _px, _bucket in (
-            ("long", cfg.seed_long_qty, cfg.seed_long_price, long_positions),
-            ("short", cfg.seed_short_qty, cfg.seed_short_price, short_positions),
+        for _side, _qty, _px in (
+            ("long", cfg.seed_long_qty, cfg.seed_long_price),
+            ("short", cfg.seed_short_qty, cfg.seed_short_price),
         ):
             if _qty == 0:
                 continue
@@ -650,9 +655,7 @@ class GridBacktester:
                 raise ValueError(
                     f"seed_{_side} 非法或方向矛盾（qty={_qty} px={_px} "
                     f"direction={cfg.direction}）——不得靜默丟棄")
-            _margin = (_qty * _px) / leverage
-            balance -= _margin
-            _bucket.append({"price": _px, "qty": _qty, "margin": _margin})
+            book.seed(_side, _qty, _px)  # margin 扣 balance 不扣 fee（FIFO + netted 同步）
 
         # pending 掛單狀態：每側 entry/tp 各為 {"price","qty"} 或 None，驅動 should_adjust
         pend = {"long": {"entry": None, "tp": None},
@@ -660,54 +663,16 @@ class GridBacktester:
         anchor = {"long": 0.0, "short": 0.0}   # last_grid_price_*（上次掛網價）
         dead = {"long": False, "short": False}
 
+        # 帳務三閉包全委派 PositionBook（語意逐行搬至 backtest/accounting.py，行為零變）。
         def _open(side: str, fill_price: float, qty: float) -> bool:
-            nonlocal balance
-            fill_price = apply_slippage(fill_price, side, "entry", cfg.slippage_bps)
-            margin = (qty * fill_price) / leverage
-            fee = qty * fill_price * fee_pct
-            if margin + fee < balance:
-                balance -= (margin + fee)
-                (long_positions if side == "long" else short_positions).append(
-                    {"price": fill_price, "qty": qty, "margin": margin})
-                return True
-            return False
+            return book.open(side, fill_price, qty)
 
         def _close(side: str, fill_price: float, tp_qty: float, ts) -> None:
-            nonlocal balance
-            fill_price = apply_slippage(fill_price, side, "tp", cfg.slippage_bps)
-            positions = long_positions if side == "long" else short_positions
-            remaining = tp_qty
-            while positions and remaining > 0:
-                pos = positions[0]
-                if pos["qty"] <= remaining:
-                    positions.pop(0)
-                    gross = ((fill_price - pos["price"]) if side == "long"
-                             else (pos["price"] - fill_price)) * pos["qty"]
-                    fee = pos["qty"] * fill_price * fee_pct
-                    net = gross - fee
-                    balance += pos["margin"] + net
-                    trades.append({"pnl": net, "type": side, "timestamp": ts})
-                    remaining -= pos["qty"]
-                else:
-                    ratio = remaining / pos["qty"]
-                    close_margin = pos["margin"] * ratio
-                    gross = ((fill_price - pos["price"]) if side == "long"
-                             else (pos["price"] - fill_price)) * remaining
-                    fee = remaining * fill_price * fee_pct
-                    net = gross - fee
-                    balance += close_margin + net
-                    trades.append({"pnl": net, "type": side, "timestamp": ts})
-                    pos["qty"] -= remaining
-                    pos["margin"] -= close_margin
-                    remaining = 0
+            book.close(side, fill_price, tp_qty, ts)
 
         def _equity_at(p: float) -> float:
             """權益 at 假設價格 p（用於盤中最不利價強平判定，非權益曲線）。"""
-            u = sum((p - x["price"]) * x["qty"] for x in long_positions)
-            u += sum((x["price"] - p) * x["qty"] for x in short_positions)
-            om = (sum(x["margin"] for x in long_positions)
-                  + sum(x["margin"] for x in short_positions))
-            return balance + om + u
+            return book.equity_at(p)
 
         def _settle(side: str, bar_low: float, bar_high: float, ts) -> None:
             """結算既有 pending（上一根掛的單）對本根 K 線的成交。
@@ -765,7 +730,7 @@ class GridBacktester:
                             if cfg.direction not in (fside, "both"):
                                 continue
                             charge = funding_charge(fpos, rate, fside, price)
-                            balance -= charge
+                            book.apply_funding(charge)  # FIFO + netted 兩帳同步扣
                             funding_paid += charge
                         fund_i += 1
 
@@ -820,13 +785,11 @@ class GridBacktester:
                 # 故必須把 open_margin 加回來，否則權益被低估、回撤被虛增（G8）。
                 # 這是「權益曲線」的 equity，恆用收盤價算 —— equity_curve 是曲線，
                 # 不是風險指標，不該用盤中最不利價（那會讓曲線鋸齒狀跳動，失去可讀性）。
-                unrealized = sum((price - p["price"]) * p["qty"] for p in long_positions)
-                unrealized += sum((p["price"] - price) * p["qty"] for p in short_positions)
-                open_margin = (sum(p["margin"] for p in long_positions)
-                               + sum(p["margin"] for p in short_positions))
-                equity = balance + open_margin + unrealized
-                long_pos_qty = sum(p["qty"] for p in long_positions)
-                short_pos_qty = sum(p["qty"] for p in short_positions)
+                unrealized = book.unrealized_at(price)
+                open_margin = book.open_margin()
+                equity = book.equity_at(price)
+                long_pos_qty = book.qty("long")
+                short_pos_qty = book.qty("short")
 
                 # 強平判定與 peak_margin_usage 必須用「本根 K 線內對持倉最不利的價格」，
                 # 不能用收盤價 —— 撮合已改用 high/low 判穿越（真實 K 線實測 close-only
@@ -864,7 +827,7 @@ class GridBacktester:
                     liquidated = True
                     unrealized = 0.0
                     open_margin = 0.0
-                    equity = balance
+                    equity = book.balance
                     max_equity = max(max_equity, equity)
                     equity_curve.append((timestamp, price, equity))
                     break
@@ -876,13 +839,10 @@ class GridBacktester:
 
         # 計算結果（final_price 取最後一根有效收盤價，避免 NaN 尾根污染 final_equity）
         final_price = equity_curve[-1][1] if equity_curve else self.config.initial_balance
-        unrealized_pnl = sum((final_price - p["price"]) * p["qty"] for p in long_positions)
-        unrealized_pnl += sum((p["price"] - final_price) * p["qty"] for p in short_positions)
+        unrealized_pnl = book.unrealized_at(final_price)
 
         realized_pnl = sum(t["pnl"] for t in trades)
-        final_open_margin = (sum(p["margin"] for p in long_positions)
-                             + sum(p["margin"] for p in short_positions))
-        final_equity = balance + final_open_margin + unrealized_pnl
+        final_equity = book.equity_at(final_price)
 
         winning = [t for t in trades if t["pnl"] > 0]
         losing = [t for t in trades if t["pnl"] < 0]
