@@ -72,3 +72,18 @@ def test_seed_no_fee():
     b = _book()
     b.seed("long", 1.0, 100.0)
     assert b.balance == pytest.approx(1000 - 20)    # 只扣 margin 不扣 fee
+
+
+def test_netted_identity_with_fee_funding_slippage():
+    """恆等式在 fee>0 + funding + slippage + 雙側 + 多次部分平倉下仍成立。
+    fee/funding 對兩帳現金腿同步增減，不破壞恆等（review 2026-07-14 驗證）。
+    fixture 刻意不退化：fee、slippage、funding 全部非零（lessons 通則 3）。"""
+    b = PositionBook(balance=1000.0, leverage=5.0, fee_pct=0.0004, slippage_bps=0.001)
+    b.open("long", 100.0, 1.0); b.open("long", 120.0, 1.0)
+    b.open("short", 110.0, 0.5)
+    b.apply_funding(0.3)
+    b.close("long", 130.0, 0.5, ts=None)
+    b.close("long", 125.0, 0.7, ts=None)
+    b.close("short", 105.0, 0.2, ts=None)
+    for p in (80.0, 100.0, 118.0, 150.0):
+        assert b.equity_at(p) == pytest.approx(b.netted_equity_at(p), abs=1e-9)
