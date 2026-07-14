@@ -759,6 +759,7 @@ class GridBacktester:
                     glft_enabled=self._max_enh.is_feature_enabled('glft'),
                     gamma=self._max_enh.gamma,
                     enh=snapshot,
+                    requote_threshold_factor=cfg.requote_threshold_factor,
                 )
                 decision = decide(inputs)
 

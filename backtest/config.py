@@ -48,6 +48,10 @@ class Config:
     limit_multiplier: float = 5.0       # 止盈加倍倍數 (position_limit = initial_quantity × limit_multiplier)
     threshold_multiplier: float = 20.0  # 裝死模式倍數 (position_threshold = initial_quantity × threshold_multiplier)；對齊 grid_engine/config.py:30 的生產值
 
+    # 追價門檻因子：should_adjust 偏離門檻 = grid_spacing × factor（純層 decision 用）。
+    # 0.5 為歷史 hardcode（與 tick_sim 一致）；接進 1m backtester 使高端 gate「同參數」成立。
+    requote_threshold_factor: float = 0.5
+
     # 策略方向
     direction: str = "both"             # "long" / "short" / "both"
 
@@ -112,6 +116,7 @@ class Config:
             "position_limit": self.position_limit,
             "limit_multiplier": self.limit_multiplier,
             "threshold_multiplier": self.threshold_multiplier,
+            "requote_threshold_factor": self.requote_threshold_factor,
             "terminal_ui_mode": self.terminal_ui_mode,
             "long_settings": self.long_settings,
             "short_settings": self.short_settings,
@@ -145,6 +150,7 @@ class Config:
             position_limit=data.get("position_limit", 100.0),
             limit_multiplier=data.get("limit_multiplier", 5.0),
             threshold_multiplier=data.get("threshold_multiplier", 20.0),
+            requote_threshold_factor=data.get("requote_threshold_factor", 0.5),
             terminal_ui_mode=data.get("terminal_ui_mode", True),
             slippage_bps=_norm_slippage(data.get("slippage_bps", 0.0001)),
             funding_enabled=data.get("funding_enabled", True)
