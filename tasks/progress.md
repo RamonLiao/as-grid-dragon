@@ -1,13 +1,13 @@
 # Progress
 
 ## Current Task
-**觀察期（2026-07-12 起）：#14 全線收工，網格帶新參數運行中，監控恢復狀況。**
+**待使用者裁決出場路線（requote 實驗已把「網格磨回」關死，見 TODO 1b）；引擎照常運行，無進行中工程任務。**
 
-生產現況（2026-07-12 收盤時點）：
-- 引擎跑新 config：純網格 0.3%/0.3%、thr=0.8（mult=40）、bandit/leading/dgt 全關、增強全關
-- 倉位：多 0.58@690.29 / 空 0.34@571.75，**delta +0.24**（使用者裁決 B：維持 5x 不再入金，未補滿中性）
-- 權益 ~116、可用 ~6.1、強平價 90.76（尾部風險已解除）、uPnL ~-68.5 待網格磨回
-- **氧氣限制**：可用 6.1 在 5x 只夠網格再加 ~2 層，空頭側連續進場會撞 -2019（引擎斷路器會擋）
+生產現況（2026-07-15）：
+- 引擎跑新 config：純網格 0.3%/0.3%、thr=0.8（mult=40）、增強全關；`requote_threshold_factor` 已參數化但**預設 0.5 = 行為不變**（引擎重啟後載入新 code 也不變行為）
+- 倉位：多 0.58@690.29 / 空 0.34@571.75，delta +0.24、權益 ~115、可用 ~6、強平 ~90.8
+- **既定事實（實測）**：本網格實盤成交 ~1 筆/天（追價語意 0.15% 門檻 vs 0.3% 掛單距離），uPnL -68~-70 **不會**被網格磨回——出場要另立計畫
+- main 領先 origin **23 commits 未 push**（requote 實驗全部產物），使用者未指示 push
 
 ## TODO（優先序）
 1. ~~觀察期複檢（07-13 之後）~~ **完成（2026-07-13）：replay PASS，但發現重大 fidelity 落差 → 衍生 TODO 1a**。
@@ -19,8 +19,9 @@
 1a. ~~成交率斷層的處置~~ **驗證完成（2026-07-15，branch `feat/requote-semantics`，verifier ACCEPT 7/7，dual-review Ship as-is）：數據否決方向 (i)，剩 (ii) 待使用者裁決**。
    - tick 級實驗（aggTrades 06-06~07-13、校準 gate 三道全 PASS、N=166 組合全揭露）：factor=1.0（掛到成交）§6 判準 3 FAIL——W1 上漲段 -21.1 / W3 震盪 -4.5（只贏 W2 下跌 +27.7，逆選擇主導）；成本 2/2bps 下全程排序翻成 0.5 最優（成交 20 倍但費用吃光 grinding）；factor 0.8 的 +14.9 是 threshold=limit 邊界懸崖（成交驟降 9 倍），依預註冊規則不採納。**「磨回 -68」路線被數據關死；現行 0.5 語意在成本現實下可辯護。**
    - 已上線的中性產物：`requote_threshold_factor` 參數化（預設 0.5 bit-identical，replay 9/9 不變）、tick 模擬器 + PositionBook + aggTrades 管線（未來 requote 類實驗基礎設施）、FIDELITY_NOTES (13)。holdout 05-01~06-05 保持未開封（§6 未全過，依鎖不跑）。
-   - **剩餘裁決（使用者）**：(ii) 接受倉位近似凍結 → 另議 -68 出場計畫（等價回 690 平多 / 定點認賠 / 入金補中性後長期持有）；或深究 factor 0.8 regime（需新一輪預註冊驗證，不急）。branch merge 決定見對話。
-2. **入金 ~25 補滿 delta +0.24 → 完全中性**（使用者決定時機；5x 下補滿需錢包 ≥207）
+   - branch 已 merge 進 main（fast-forward `fa5aed7..f8d51e1`，19 commits，合併後 525 passed），branch 已刪。
+1b. **【使用者裁決，最高優先的開放決策】-68 uPnL 出場路線**：(a) 接受凍結等價回 690 平多；(b) 定點認賠收斂；(c) 入金補中性後長期持有；(d) 深究 factor 0.8 regime（需新一輪預註冊驗證：完整 sensitivity curve + holdout 05-01~06-05 仍未開封可用，multiple-testing 代價高，不急）。裁決依據全在 `tasks/requote-experiment-results.md`。
+2. **入金 ~25 補滿 delta +0.24 → 完全中性**（使用者決定時機；5x 下補滿需錢包 ≥207；與 1b(c) 合流）
 3. **symbols-set 併發 race**（#10-A 衍生）：修法傾向砍終端 config 選單（單一 writer 根治）
 4. lessons 通則落地檢查：`config.leverage` 假旋鈕要不要接線（啟動時 set_leverage 推到交易所）或改名揭露——現況 config 寫 20 交易所 5x 的分歧會再咬人
 5. trading_mode 收編 engine schema（等 #4 驗收後）；頁3 clamp 寫回 session 全站排查
@@ -29,7 +30,14 @@
 8. ~~Telegram 通知接通~~ **完成（2026-07-12 21:43）**：根因兩個——chat_id 誤填 bot 自身 ID（log 三筆 `403 the bot can't send messages to the bot` 佐證）+ 引擎啟動時憑證為空致 reporter 未建。使用者修正 chat_id=1054193397 後 21:43 重啟，之後零失敗記錄。**07-13 20:00 Taipei 首封每日摘要使用者確認收到，端到端驗收完成。**
 
 ## Blockers
-無硬阻礙。
+無硬阻礙。TODO 1b/2 等使用者裁決；TODO 3-6 隨時可開工。
+
+## Recently Completed（2026-07-13~15）：requote 語意驗證全計畫
+- **流程**：brainstorming → spec（quant reviewer 8 findings 修訂，含 holdout/事件數守門/netted 拒單保守取或）→ plan（reviewer 1 blocker + 7 should-fix 修訂；BLOCKER-1 經親手驗算部分駁回——equity 對帳務基礎不變成立，但可用餘額分歧真實，「保守取或」搬到拒單通道）→ SDD 12 tasks（每 task fresh implementer + reviewer，4 輪 fix 迭代）→ security-review 無 findings → dual-review 外部輪 Ship as-is → verifier ACCEPT 7/7 → merge main（f8d51e1，525 passed）。
+- **關鍵技術產物**：`backtest/accounting.py`（PositionBook 雙帳，backtester 委派行為零變）、`backtest/tick_sim.py`（tick 事件模擬器：嚴格穿越/500ms 延遲/5s cooldown/有倉側 OR gate；stale-orders pruning 修過二次方變慢）、`backtest/aggtrades.py`（UTC 日界+完整性驗證+spread 重建）、`scripts/calibration_gate.py`（三 gate，判準 2026-07-14 修訂留痕）、`scripts/requote_experiment.py`（N=166 矩陣）。
+- **過程中修訂的判準（全留痕於 spec §4.3/§6.2）**：高端 gate 上界「tick≤1m」前提被實測推翻（1m 每分鐘才重掛 vs tick 5s re-arm，1.47x 是機制非 bug）→ 改 0.2x 下界 + 成交真實性回歸守衛（**注意：該守衛對現行引擎是套套邏輯，非獨立證據**，lessons 有記）；6 月 cap 10x→15x（live 受 -2019 壓制未建模）。
+- **重要教訓已入 lessons.md**：套套邏輯驗證（2026-07-15 條）。
+- **07-13**：觀察期複檢 replay PASS + 26.5h 零成交發現（TODO 1 詳記）；Telegram 每日摘要端到端確認。
 
 ## Recently Completed（2026-07-12）
 - **TODO 7 重定向後完成（未 commit：grid_engine/utils.py、as_terminal_max.py 尾兩行、tests/test_logger_file_config.py 新檔）**：原前提「-2019/斷路器只噴終端磁碟無痕」是**誤記**——`log/as_terminal_max.log` 一直在收（歷史 1M+ 筆下單失敗、8 筆斷路，多為舊 config 時代產物）。真缺陷三個：(a) format 只有 `%(message)s`，`datefmt` 是死參數 → 事件無時間戳無法定位；(b) 202MB 單檔無 rotation；(c) `basicConfig` 是 import 副作用，web/streamlit 進程也會裝 handler → 換 RotatingFileHandler 後多 writer rollover 會互抽 fd。修法：`%(asctime)s` + RotatingFileHandler(50MB×3, delay=True) + 抽成 `setup_file_logging(force=True)` 只由 `as_terminal_max.py` `__main__` 呼叫（單一 writer）。439 passed（+5 新測試，全部 mutation red-once，含「pytest logging plugin 讓 basicConfig no-op」的假陰性教訓：先綠再紅順序不能省）。dual-review：外部輪 4 should-fix + 3 nit 全修（force=True/subprocess cwd/註解歸因/部署 checklist），Ship as-is；verifier ACCEPT 5/5（獨立 mutation 2/2，mktemp 隔離零污染）。**生效需重啟**，checklist 見 TODO 7。
