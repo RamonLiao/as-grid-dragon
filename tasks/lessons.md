@@ -60,6 +60,12 @@
 - 安全示警前先 `git ls-files`/`log -S`/`check-ignore` 三查實際暴露面，別看到明文 key 就喊洩漏。
 - Docker TUI：互動用 `compose run --rm`（`up` 不轉發 stdin）；自定義 SIGINT handler 會吃掉 KeyboardInterrupt，需要處暫時換回 `default_int_handler`。
 
+## 2026-07-26: 「不能用預設值當測試值」這條判準，要同時套到驗收腳本**和**測試 fixture
+- Context：TODO 4a 改名任務。我在 A11 bit-identical 驗收上刻意用 `leverage: 7`（≠ 欄位預設 20），並在 spec 寫明「用 20 跑會自廢武功——相容分支若失效、值落回預設 20，結果仍相同」。同一份 spec 卻沒去檢查既有測試 fixture。
+- Error：`tests/web/test_backtest_service.py` 的 fixture 用 `assumed_leverage=20` = dataclass 預設值，於是 `assert cfg.leverage == 20` 是**套套邏輯**。verifier 實測：把三個映射點全改成硬編碼常數，543 條測試**全綠**——這條 branch 的核心主張（「這個欄位唯一的實效是餵回測」）自己沒有守衛。
+- 為什麼會漏：我把「別用預設值」當成**這次新寫的驗收腳本**的注意事項，沒把它當成**通則**去掃既有測試。判準只套在自己剛寫的東西上，是最容易的自我豁免。
+- Rule：任何「驗證欄位 X 有被正確讀取/傳遞」的斷言，**測試值必須 ≠ 該欄位的預設值**。動到某欄位時，`grep` 該欄位在 `tests/` 的所有出現處，逐一問「這個值等於預設值嗎？等於就是假綠」。這條同時適用新寫的與既有的測試——既有測試不會因為它一直是綠的就變成對的（通則 3：斷言錯了會紅，資料退化只會一直綠）。
+
 ## 2026-07-26: 寫「外部系統會回傳什麼欄位」時，SDK 預設路由是必查項——不是可推測項
 - Context：TODO 4 spec §1「問題陳述（**事實，非推測**）」裡寫「`fetch_positions` 回傳本來就含 `leverage`，所以零額外 REST 呼叫」。實測後為假：ccxt 4.5.32 預設路由到 V3 positionRisk，該端點根本不回這欄位（`params={'useV2': True}` 才有）。
 - Error：我看到「ccxt Position 結構有 leverage 欄位」就當成「這個帳戶這條路徑會拿到值」。**統一資料結構的欄位存在 ≠ 該欄位在你走的那條路由上有值**——SDK 的 unified schema 是欄位的聯集，缺的填 `None`。而這份 spec 的全部意義正是在修「假旋鈕」，我在修它的文件裡犯了同一種病（通則 1 第 4 條的第六次現場）。
