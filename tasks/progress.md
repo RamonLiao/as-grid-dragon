@@ -1,39 +1,65 @@
 # Progress
 
 ## Current Task
-**無進行中工程任務。TODO 4a 已收官並 merge+push（2026-07-26）。**
-下一步由使用者選：建議順序 ① 重啟引擎確認正常 → ② TODO 1b 出場裁決（真錢、依據已過時）→ ③ #14 mult=40 槓桿假設複核。
+**無進行中工程任務。健檢（07-15→07-26）已完成，報告 `tasks/health-check-2026-07-26.md`。**
+下一步由使用者選：① TODO 1b 出場裁決（依據已更新）→ ② 新增的 `tp_quantity` 對沖衰減設計問題 → ③ #14 mult=40 槓桿假設複核。
 
-### 🔴 最高優先的兩件事（新 session 開場必讀）
+### 🔴 最高優先（新 session 開場必讀）
 
-**1. 引擎目前是「停止」狀態。** 2026-07-26 為做 config 遷移停機，之後未重啟。
-- 重啟前確認在 **main**（已含改名 code）。切回舊碼啟動會把 `leverage: 20` 寫回，變成新舊雙 key 並存。
-- 重啟後值得確認：面板槓桿顯示 = 5 且文案為「交易所實際槓桿」、雙側網格掛單出現、`logs/decisions.jsonl` 有新決策。
-- 開工前一律先 `ps aux | grep as_terminal_max` 確認實際狀態，不要信本檔（可能已被使用者重啟）。
+**0. 健檢 2026-07-26 的兩個發現（詳見 `tasks/health-check-2026-07-26.md`）**
 
-**2. `#14 mult=40` 是現在生產正在跑的參數，而它的回測槓桿假設不可考。**
+- **網格在系統性拆掉對沖，不是在磨回 -68。** `decision.py:97` `tp_quantity` 的「進 0.02 / 出 0.04」
+  在持倉 > `position_limit`(=0.02×5=0.1) 後**兩側都**無條件生效 ⇒ 每往返雙側各淨減 0.02。
+  空頭基數小 ⇒ 對沖被拆的相對速度是多頭 3 倍。**逐筆對帳零殘差**：空 0.36→0.20（11 天 -44%），
+  多 0.60→0.60，delta +0.24→**+0.40**，強平價 90.8→**288.98**（距現價 -49%）。
+  ⇒ **TODO 2 / 1b(c)「入金補中性後長期持有」被否決**——補到 0.58/0.58 會被同一機制拆回 ~0.1。
+  投影（機制推論）：空頭平衡點約 `position_limit`≈0.1，delta 走向 ~+0.50。
+  **與 mult=40 無關**：加倍的實際觸發條件是 `my_position > 0.1`，`opposite >= 0.8` 那條現行倉位永不成立。
+- **BNBUSDC maker 手續費實查 = 0**（`commissionRate`: maker 0 / taker 4bps；19/19 實盤成交全 maker、
+  income 零 COMMISSION）。全套回測用 fee 2bps ⇒ **成本假設錯**。補跑 fee=0：預註冊 §6.4 由 FAIL 轉 PASS
+  （成本排序 (1.0,1.5,0.5) 跨 slip{0,1,2} 全一致），全程 Δeq 場景B +13.5→**+22.0**、maxDD 5.1% vs 20.0%；
+  **但 §6.3 仍 FAIL**（A/W1 上漲段 -16.8）⇒ **factor 0.5→1.0 仍不通過**，但「成本吃光 grinding」這個
+  理由被推翻，真障礙是 W1 逆選擇。事後新增 30 cell 已揭露；**holdout 05-01~06-05 仍未開封**。
+  ⚠️ 零 maker 費是促銷，非永久 ⇒ 據此的任何上線決策必須綁費率監控。
+
+**1. 引擎狀態：已重啟並在跑**（2026-07-26 20:38，pid 99839）。
+- 驗收過：`grid_spacing/take_profit=0.003/0.003`、`position_threshold=0.8`、雙側 `dead_mode=false`、
+  四張雙側掛單（21:07 重掛）、`assumed_leverage: 5` 四個 symbol、舊 `leverage` key 全清除。
+- 開工前一律先 `ps aux | grep as_terminal_max` 確認實際狀態，不要信本檔。
+
+**2. `#14 mult=40` 的槓桿疑慮已部分解答（2026-07-26 健檢 §8，用實測數字直接算，未重跑回測）**
+- 每層 0.02 @5x @570.66 需保證金 2.283，可用 17.955 ⇒ 只能再加 **7 層** → 多頭最多 0.74 < **裝死門檻 0.8**。
+- ⇒ **mult=40 在現行資本下是惰性參數**，真正的補倉煞車是**交易所拒單 -2019**，不是策略裝死邏輯。
+- 好消息：「回測用 20x 低估保證金 4 倍」不會讓 mult=40 變成災難（限制器不是它）。
+  壞消息：煞車從策略層掉到交易所層，而回測**完全沒建模 -2019 拒單通道**。
+- ⇒ **正式複核（5x 重跑分段掃描）優先度可降**；該補的是**保證金耗盡路徑的建模**，不是重跑 mult 掃描。
+
+**2b. 以下為 2026-07-26 之前的記錄（背景，已被上面 §2 部分取代）：**
 主力 script（`segment_scan.py`）在當時的 session scratchpad、repo 內不存在；同期 `scripts/cost_sensitivity.py:122` 預設 `--leverage 20`，而實盤是 5x。
 該決策的核心正是**保證金與裝死邊界**——用 20x 算保證金會低估需求 4 倍。
-**不得再宣稱 mult=40 安全。** 我認為這比 TODO 4b 更該先做（4b 防未來漂移，這條是現在跑的東西可能建立在錯數字上）。
+**「不得再宣稱 mult=40 安全」修正為**：它的回測依據仍不可考，但 §2 的保證金算式顯示它在現行資本下無效
+⇒ 不該再說它「危險」也不該說它「安全」，正確說法是「**它不是現在的限制器，-2019 才是**」。
 （requote 實驗則已核實乾淨：`scripts/calibration_gate.py:38` 用 `leverage=5.0`。）
 
 ### git 狀態
 main == origin/main（2026-07-26 push 完成，`f64ae2f..1aab450`，37 commits）。
 工作區只有 ` M .gitignore`（既有、與近期任務無關，使用者未指示處理）。
 
-### ⚠️ 生產現況已變（2026-07-26 read-only 實測，現價 571.23）——與 07-15 記錄有實質落差
-| | 07-15 記錄 | **07-26 實測** |
+### ⚠️ 生產現況（2026-07-26 健檢實測，現價 570.66）
+| | 07-15 00:00 UTC（由成交明細反推） | **07-26 實測** |
 |---|---|---|
-| 多 | 0.58 @ 690.29 | **0.60 @ 666.72** |
-| 空 | 0.34 @ 571.75 | **0.20 @ 570.31** |
+| 多 | 0.60 @ 690.29 | **0.60 @ 666.72** |
+| 空 | **0.36** @ 571.75 | **0.20 @ 570.31** |
 | delta | +0.24 | **+0.40** |
-| uPnL | -68 ~ -70 | **-57.5** |
-| 權益 / 可用 | ~115 / ~6 | 114.0 / **18.07** |
-| **強平價** | **90.8** | **288.94**（距現價 -49%，原 -84%） |
+| uPnL | ~-70.7 | **-57.64** |
+| 錢包 / 權益 / 可用 | 184.56 / 116.56 / ~6 | 171.53 / **113.83** / 18.0 |
+| **強平價** | **90.8** | **288.98**（距現價 -49%，原 -84%） |
 
-**空頭被止盈掉 0.14、多頭加 0.02 且均價下移** → 網格這 11 天有動。uPnL 帳面改善，但**對沖被網格自己拆掉一半**：delta +0.24→+0.40，尾部風險實質變差。這不是使用者裁決的結果，是網格行為的自然後果。
-⇒ **TODO 1b/2 的裁決依據需要更新**；建議另開一次完整健檢（income 聚合 + 成交明細）搞清楚 11 天內發生什麼。使用者尚未指示。
-`marginMode` 實測確認 **cross**。
+歸因（見健檢報告 §4）：**Δ錢包 -13.03 = realized -12.65 + funding -0.38**（零手續費、零轉帳），
+其中 -12.10 來自三筆 `sell LONG 0.04` 各 -4（多頭「止盈」價按現價+0.3% 定、不看均價 666.7 ⇒ **實質是認賠單**）。
+**權益只掉 2.73**，同期價格 -1.42%：方向性約 -1.9 + funding -0.38 ⇒ **零費率下網格本身大致打平**。
+uPnL 改善 +10.4 是把浮虧搬成實虧的帳務搬家，**不是收益**。真正變壞的是風險結構（見上「發現 0」）。
+`marginMode` 實測確認 **cross**，兩側 `leverage` 實測 **5.0**。
 
 生產設定：
 - 純網格 0.3%/0.3%、thr=0.8（mult=40）、增強全關
@@ -52,8 +78,13 @@ main == origin/main（2026-07-26 push 完成，`f64ae2f..1aab450`，37 commits�
    - tick 級實驗（aggTrades 06-06~07-13、校準 gate 三道全 PASS、N=166 組合全揭露）：factor=1.0（掛到成交）§6 判準 3 FAIL——W1 上漲段 -21.1 / W3 震盪 -4.5（只贏 W2 下跌 +27.7，逆選擇主導）；成本 2/2bps 下全程排序翻成 0.5 最優（成交 20 倍但費用吃光 grinding）；factor 0.8 的 +14.9 是 threshold=limit 邊界懸崖（成交驟降 9 倍），依預註冊規則不採納。**「磨回 -68」路線被數據關死；現行 0.5 語意在成本現實下可辯護。**
    - 已上線的中性產物：`requote_threshold_factor` 參數化（預設 0.5 bit-identical，replay 9/9 不變）、tick 模擬器 + PositionBook + aggTrades 管線（未來 requote 類實驗基礎設施）、FIDELITY_NOTES (13)。holdout 05-01~06-05 保持未開封（§6 未全過，依鎖不跑）。
    - branch 已 merge 進 main（fast-forward `fa5aed7..f8d51e1`，19 commits，合併後 525 passed），branch 已刪。
-1b. **【使用者裁決，最高優先的開放決策】-68 uPnL 出場路線**：(a) 接受凍結等價回 690 平多；(b) 定點認賠收斂；(c) 入金補中性後長期持有；(d) 深究 factor 0.8 regime（需新一輪預註冊驗證：完整 sensitivity curve + holdout 05-01~06-05 仍未開封可用，multiple-testing 代價高，不急）。裁決依據全在 `tasks/requote-experiment-results.md`。
-2. **入金 ~25 補滿 delta +0.24 → 完全中性**（使用者決定時機；5x 下補滿需錢包 ≥207；與 1b(c) 合流）
+1b. **【使用者裁決，最高優先的開放決策】-68 uPnL 出場路線**：(a) 接受凍結等價回 690 平多；(b) 定點認賠收斂；(c) 入金補中性後長期持有；(d) 深究 factor 0.8 regime（需新一輪預註冊驗證：完整 sensitivity curve + holdout 05-01~06-05 仍未開封可用，multiple-testing 代價高，不急）。
+   - **2026-07-26 健檢後依據已更新**（`tasks/health-check-2026-07-26.md`）：**(a) 與現實不符**——網格並沒有凍結，它在以每張 -4 分期實現虧損並拆對沖；**(c) 需先解 1c 的設計問題**，否則補的中性會被拆回去。
+1c. **【新增，設計問題】`tp_quantity` 不對稱會吃掉任何人工建立的對沖**（健檢 §5，逐筆對帳零殘差）
+   - `decision.py:97`：持倉 > `position_limit`(0.1) → 止盈量加倍 ⇒ 進 0.02/出 0.04，**兩側都適用**，每往返雙側各淨減 0.02。對沖側基數小 ⇒ 相對衰減 3 倍快。
+   - 要讓「補中性後長期持有」成立，須讓對沖側免疫（例如加倍只對淨曝險方向那側生效，或對沖倉走獨立帳本不進網格）。**需 brainstorming，Plan track。**
+   - **調 mult 救不了它**：加倍的實際觸發是 `my_position > 0.1`，`opposite >= threshold(0.8)` 現行倉位永不成立。
+2. ~~入金 ~25 補滿 delta → 完全中性~~ **被健檢否決（2026-07-26）**：補到 0.58/0.58 會被 `tp_quantity` 不對稱拆回 ~0.1。要做須先解 1c。
 3. **symbols-set 併發 race**（#10-A 衍生）：修法傾向砍終端 config 選單（單一 writer 根治）
 4a. ~~`leverage` → `assumed_leverage` 改名與舊 key 清除~~ **完成（2026-07-26，branch `feat/leverage-rename`，11 commits，546 passed / 1 skipped）**
    - **spec/plan**：`docs/superpowers/specs/2026-07-26-leverage-rename-design.md` + `docs/superpowers/plans/2026-07-26-leverage-rename.md`
@@ -72,15 +103,16 @@ main == origin/main（2026-07-26 push 完成，`f64ae2f..1aab450`，37 commits�
    - **`assumed_leverage` 零值域驗證**：填 `-5` 回測會跑完 113 筆交易吐出 **+0.155% 正報酬**（保證金數學全錯但不報錯）；`0` 觸發 divide-by-zero warning 後靜默回 0 筆；`nan`/`inf` 會寫出非嚴格 JSON。既有問題，但 UI 上限 15→125 放寬後可及範圍變大。`grid_engine/config.py:17` 已有 `_norm_requote_factor` 先例可照抄。
    - **`backtest/optimizer.py:55` 仍把 `leverage` 當可搜尋參數**（`[5,10,15,20,25,30]`）——與「槓桿不由 repo 決定」的原則直接衝突，且會系統性挑到高槓桿（收益放大、強平模型又用同一個假槓桿）。`backtest/smart_optimizer.py:228` 已寫死 20，兩處作法不一致。
    - `grid_engine/config.py:166` `legacy_api_detected` 死欄位；`scripts/compare_backtest_engines.py:50` 仍 import 已刪的 `core.backtest`。
-   - **衍生待辦（重要，非本次範圍）**：#14 的 `mult=40` 上線決策，其回測槓桿假設**不可考**（主力 script 在 session scratchpad、repo 內不存在；同期 `cost_sensitivity.py:122` 預設 20x）。**mult=40 未經 5x 複核，而該決策核心正是保證金與裝死邊界。** 不得再宣稱它安全。requote 實驗則已核實用 5x（`calibration_gate.py:38`）乾淨。
+   - **衍生待辦（重要，非本次範圍）**：#14 的 `mult=40` 上線決策，其回測槓桿假設**不可考**（主力 script 在 session scratchpad、repo 內不存在；同期 `cost_sensitivity.py:122` 預設 20x）。**mult=40 未經 5x 複核，而該決策核心正是保證金與裝死邊界。** requote 實驗則已核實用 5x（`calibration_gate.py:38`）乾淨。
+   **2026-07-26 更新**：健檢 §8 用實測保證金算出 mult=40 在現行資本下是惰性參數（到不了 thr=0.8），優先度降；改為「補保證金耗盡/-2019 拒單路徑的建模」。
 5. trading_mode 收編 engine schema（等 #4 驗收後）；頁3 clamp 寫回 session 全站排查
 6. GCE 部署三件套（VM/setup script/IP 白名單）——部署後 replay 驗收要在 GCE 重跑一次
 7. ~~file logger 修繕~~ **全部完成並 commit（`f64ae2f`，2026-07-12 20:05 重啟驗收過）**：新 log 每行帶時間戳、引擎雙側掛單正常；202MB 舊檔已歸檔為 `log/as_terminal_max.log.archive-20260712`（gitignored，含觀察期首日與歷史 -2019/斷路記錄）。main 已與 origin 同步。
 8. ~~Telegram 通知接通~~ **完成（2026-07-12 21:43）**：根因兩個——chat_id 誤填 bot 自身 ID（log 三筆 `403 the bot can't send messages to the bot` 佐證）+ 引擎啟動時憑證為空致 reporter 未建。使用者修正 chat_id=1054193397 後 21:43 重啟，之後零失敗記錄。**07-13 20:00 Taipei 首封每日摘要使用者確認收到，端到端驗收完成。**
 
 ## Blockers
-無硬阻礙。TODO 1b/2 等使用者裁決；4b、4c、3、5、6 隨時可開工。
-**唯一的操作性待辦：引擎停機中，需使用者重啟（見 Current Task 第 1 點）。**
+無硬阻礙。引擎已重啟並驗收過。TODO 1b 等使用者裁決；1c、4b、4c、3、5、6 隨時可開工。
+**新增的成本模型待辦**：`backtest/config.py:37` `fee_pct` 預設 2bps 與實查值（maker 0）不符 ⇒ 所有既有回測的成本假設偏保守。修改前要先決定「促銷費率該不該寫進預設值」（我傾向不寫死，改成必填 + 啟動時實查對帳）。
 
 ## Recently Completed（2026-07-26）：TODO 4a `leverage` → `assumed_leverage`
 - **merge + push 完成**：main `f08ce2c..1aab450`（11 commits，fast-forward），origin 同步，546 passed / 1 skipped。
