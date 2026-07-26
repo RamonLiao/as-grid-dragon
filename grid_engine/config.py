@@ -36,7 +36,8 @@ class SymbolConfig:
     take_profit_spacing: float = 0.004
     grid_spacing: float = 0.006
     initial_quantity: float = 3
-    assumed_leverage: int = 20
+    assumed_leverage: int = 5   # 交易所實測值（2026-07-26）。不推送交易所，
+                                # 僅供回測算保證金/強平；填錯會低估爆倉風險。
 
     limit_multiplier: float = 5.0
     threshold_multiplier: float = 20.0

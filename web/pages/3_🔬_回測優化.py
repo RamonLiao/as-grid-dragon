@@ -199,7 +199,7 @@ def render_backtest_params(sym_config: SymbolConfig):
         )
 
         assumed_leverage = st.number_input(
-            "回測假設槓桿（不推送交易所）",
+            "交易所實際槓桿（不推送交易所，但決定回測保證金/強平計算）",
             min_value=1,
             max_value=125,  # 上限對齊交易所槓桿上限
             value=min(sym_config.assumed_leverage, 125),  # 此值必須等於交易所實際槓桿

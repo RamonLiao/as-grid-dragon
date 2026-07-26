@@ -131,10 +131,10 @@ def render_add_symbol():
             )
 
             assumed_leverage = st.number_input(
-                "回測假設槓桿（不推送交易所）",
+                "交易所實際槓桿（不推送交易所，但決定回測保證金/強平計算）",
                 min_value=1,
                 max_value=125,
-                value=10,
+                value=5,
                 step=1,
                 help="必須填入交易所的實際槓桿。此值不推送交易所，但決定回測如何計算保證金與強平——填錯會使回測低估爆倉風險。"
             )
@@ -254,7 +254,7 @@ def render_edit_symbol():
 
         with col2:
             assumed_leverage = st.number_input(
-                "回測假設槓桿（不推送交易所）",
+                "交易所實際槓桿（不推送交易所，但決定回測保證金/強平計算）",
                 min_value=1,
                 max_value=125,
                 value=min(cfg.assumed_leverage, 125),  # 上限對齊交易所槓桿上限；此值必須等於交易所實際槓桿

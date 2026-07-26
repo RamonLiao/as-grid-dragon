@@ -22,7 +22,7 @@ def test_from_dict_new_key_wins_over_old():
 
 
 def test_from_dict_default_when_absent():
-    assert SymbolConfig.from_dict({}).assumed_leverage == 20
+    assert SymbolConfig.from_dict({}).assumed_leverage == 5
 
 
 def test_to_dict_emits_new_key_only():
