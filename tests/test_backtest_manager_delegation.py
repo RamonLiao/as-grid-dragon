@@ -36,7 +36,11 @@ def _make_config(**overrides):
         take_profit_spacing=0.004,
         grid_spacing=0.006,
         initial_quantity=3,
-        assumed_leverage=20,
+        # 7 是刻意選的非預設值（SymbolConfig.assumed_leverage 預設 20）：
+        # 若 run_backtest/optimize_params 映射被寫死或落回預設，
+        # test_run_backtest_maps_assumed_leverage_to_backtest_config /
+        # test_optimize_params_relay_config_preserves_assumed_leverage 會紅。
+        assumed_leverage=7,
     )
     kwargs.update(overrides)
     return SymbolConfig(**kwargs)
@@ -95,3 +99,59 @@ def test_optimize_params_progress_callback_invoked():
 
     assert len(calls) > 0
     assert calls[-1][0] == calls[-1][1]
+
+
+def test_run_backtest_maps_assumed_leverage_to_backtest_config(monkeypatch):
+    """守衛 grid_engine/backtest.py:146 的
+    BacktestConfig(leverage=config.assumed_leverage, ...) 映射。
+
+    cfg.assumed_leverage=7（非 SymbolConfig 預設值 20，見 _make_config），
+    攔截實際傳入 GridBacktester 的 BacktestConfig，斷言其 leverage 真的
+    等於 7；若映射被寫死（例如 leverage=20）本測試會紅。
+    """
+    import backtest.backtester as backtester_mod
+
+    captured = {}
+    real_init = backtester_mod.GridBacktester.__init__
+
+    def fake_init(self, df, config, funding_map=None):
+        captured["leverage"] = config.leverage
+        real_init(self, df, config, funding_map=funding_map)
+
+    monkeypatch.setattr(backtester_mod.GridBacktester, "__init__", fake_init)
+
+    mgr = BacktestManager()
+    cfg = _make_config(assumed_leverage=7)
+    df = _make_df()
+
+    result = mgr.run_backtest(cfg, df)
+
+    assert isinstance(result, dict)
+    assert captured.get("leverage") == 7
+
+
+def test_optimize_params_relay_config_preserves_assumed_leverage(monkeypatch):
+    """守衛 optimize_params 內建中繼 SymbolConfig（grid_engine/backtest.py:174）：
+    assumed_leverage=config.assumed_leverage，不得被寫死成常數。
+
+    攔截 BacktestManager.run_backtest 收到的中繼 config，斷言
+    assumed_leverage 真的等於傳入 config 的 7（非 SymbolConfig 預設值 20）。
+    """
+    mgr = BacktestManager()
+    cfg = _make_config(assumed_leverage=7)
+    df = _make_df(n=30)  # 小 df 加速；只需驗證關聯欄位透傳
+
+    captured_leverages = []
+    real_run_backtest = BacktestManager.run_backtest
+
+    def fake_run_backtest(self, test_config, df):
+        captured_leverages.append(test_config.assumed_leverage)
+        result = real_run_backtest(self, test_config, df)
+        return result
+
+    monkeypatch.setattr(BacktestManager, "run_backtest", fake_run_backtest)
+
+    mgr.optimize_params(cfg, df)
+
+    assert len(captured_leverages) > 0
+    assert all(lv == 7 for lv in captured_leverages)

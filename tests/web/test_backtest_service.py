@@ -20,7 +20,7 @@ _FAKE_NOTES = "回測保真限制: (test fixture notes, 非真正 FIDELITY_NOTES
 SYM = SymbolConfig(
     symbol="XRPUSDC", ccxt_symbol="XRP/USDC:USDC", enabled=True,
     take_profit_spacing=0.004, grid_spacing=0.006,
-    initial_quantity=3.0, assumed_leverage=20,
+    initial_quantity=3.0, assumed_leverage=7,
     limit_multiplier=5.0, threshold_multiplier=20.0,
 )
 
@@ -29,7 +29,9 @@ def test_to_backtest_config_golden():
     cfg = backtest_service.to_backtest_config(SYM)
     assert cfg.symbol == "XRPUSDC"
     assert cfg.initial_quantity == 3.0          # 預設 0.0=空回測，必須帶入
-    assert cfg.leverage == 20
+    # 7 是刻意選的非預設值（SymbolConfig.assumed_leverage 預設 20）：
+    # 若映射被寫死或落回預設，本斷言會紅（見 mapping-guard-report.md）。
+    assert cfg.leverage == 7
     assert cfg.take_profit_spacing == 0.004     # 兩邊皆小數比例，1:1
     assert cfg.grid_spacing == 0.006
     assert cfg.limit_multiplier == 5.0          # 不帶 → backtester 用預設 5.0（grid_engine/config.py:48）
