@@ -1,8 +1,12 @@
 # Progress
 
 ## Current Task
-**無進行中工程任務。健檢（07-15→07-26）已完成，報告 `tasks/health-check-2026-07-26.md`。**
-下一步由使用者選：① TODO 1b 出場裁決（依據已更新）→ ② 新增的 `tp_quantity` 對沖衰減設計問題 → ③ #14 mult=40 槓桿假設複核。
+**TODO 1c 進行中：對沖免疫的止盈量加倍。**
+- 健檢完成 → brainstorming 完成（使用者裁決見下）→ **spec 已落檔並 commit `7805742`**
+  `docs/superpowers/specs/2026-07-26-hedge-immune-tp-design.md`
+- **現在等 quant spec reviewer（opus、唯讀）回 verdict**。依 quant rules 硬觸發，verdict 前不得開工。
+- 使用者的三個裁決：① 目標 = **delta 主動收斂**（非僅保住對沖）；② 對沖側止盈**減半不加倍**（最小改動，接受下跌段仍外擴）；③ 範圍**含 `risk_monitor`** 雙向減倉改只減大側；④ 上線門檻 = 單測 + replay 結構化 diff + tick_sim 新舊對照。
+- 未上線前**不要重啟引擎**（重啟才生效，但 code 還沒寫）。
 
 ### 🔴 最高優先（新 session 開場必讀）
 
