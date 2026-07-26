@@ -60,6 +60,12 @@
 - 安全示警前先 `git ls-files`/`log -S`/`check-ignore` 三查實際暴露面，別看到明文 key 就喊洩漏。
 - Docker TUI：互動用 `compose run --rm`（`up` 不轉發 stdin）；自定義 SIGINT handler 會吃掉 KeyboardInterrupt，需要處暫時換回 `default_int_handler`。
 
+## 2026-07-26: 寫「外部系統會回傳什麼欄位」時，SDK 預設路由是必查項——不是可推測項
+- Context：TODO 4 spec §1「問題陳述（**事實，非推測**）」裡寫「`fetch_positions` 回傳本來就含 `leverage`，所以零額外 REST 呼叫」。實測後為假：ccxt 4.5.32 預設路由到 V3 positionRisk，該端點根本不回這欄位（`params={'useV2': True}` 才有）。
+- Error：我看到「ccxt Position 結構有 leverage 欄位」就當成「這個帳戶這條路徑會拿到值」。**統一資料結構的欄位存在 ≠ 該欄位在你走的那條路由上有值**——SDK 的 unified schema 是欄位的聯集，缺的填 `None`。而這份 spec 的全部意義正是在修「假旋鈕」，我在修它的文件裡犯了同一種病（通則 1 第 4 條的第六次現場）。
+- 連帶損害：錯誤前提污染了下游的成本權衡（誤算成「換 endpoint 要新增一次 REST 呼叫」，實際只是同一次呼叫加參數）與放棄條件，整個 §7/§8 都要重寫。**錯誤的事實不只錯在那一行，它會沿著推論鏈擴散。**
+- Rule：spec 裡凡是「外部 API/SDK 會回傳 X」的句子，寫下之前先跑一次 read-only 實測並把**原始輸出**貼進 spec；貼不出輸出就不准標成事實，只能寫「待實測」。查 SDK 時要追到**實際被呼叫的那個 endpoint**（`handle_option_and_params` / 預設 method / options 覆寫），不是停在統一介面的 docstring。
+
 ## 2026-07-15: 驗證器與被驗物共用判準/資料 = 回歸守衛，不是獨立證據
 - Context：校準 gate 用「每筆 fill 有嚴格穿越事件」驗模擬器沒偷跑，745/745 零違規被我當成「強於 ratio 代理的證據」呈給使用者。
 - Error：fill 引擎記錄成交用的就是同一判準同一事件流，驗證對現行引擎**必然**回 0——套套邏輯。它防的是未來回歸（改 touch-fill、記錯 ts），不證明現在沒高估。

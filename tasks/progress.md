@@ -1,12 +1,26 @@
 # Progress
 
 ## Current Task
-**待使用者裁決出場路線（requote 實驗已把「網格磨回」關死，見 TODO 1b）；引擎照常運行，無進行中工程任務。**
+**TODO 4（`leverage` 假旋鈕修繕）進行中：brainstorming 完成、使用者核可 B+C 路線、spec v2 已寫、quant reviewer 重審中。**
+spec：`docs/superpowers/specs/2026-07-26-leverage-false-knob-design.md`（權威）+ `tasks/spec.md`（摘要）。
+TODO 1b 出場路線仍待使用者裁決。
 
-生產現況（2026-07-15）：
-- 引擎跑新 config：純網格 0.3%/0.3%、thr=0.8（mult=40）、增強全關；`requote_threshold_factor` 已參數化但**預設 0.5 = 行為不變**（引擎重啟後載入新 code 也不變行為）
-- 倉位：多 0.58@690.29 / 空 0.34@571.75，delta +0.24、權益 ~115、可用 ~6、強平 ~90.8
-- **既定事實（實測）**：本網格實盤成交 ~1 筆/天（追價語意 0.15% 門檻 vs 0.3% 掛單距離），uPnL -68~-70 **不會**被網格磨回——出場要另立計畫
+### ⚠️ 生產現況已變（2026-07-26 read-only 實測，現價 571.23）——與 07-15 記錄有實質落差
+| | 07-15 記錄 | **07-26 實測** |
+|---|---|---|
+| 多 | 0.58 @ 690.29 | **0.60 @ 666.72** |
+| 空 | 0.34 @ 571.75 | **0.20 @ 570.31** |
+| delta | +0.24 | **+0.40** |
+| uPnL | -68 ~ -70 | **-57.5** |
+| 權益 / 可用 | ~115 / ~6 | 114.0 / **18.07** |
+| **強平價** | **90.8** | **288.94**（距現價 -49%，原 -84%） |
+
+**空頭被止盈掉 0.14、多頭加 0.02 且均價下移** → 網格這 11 天有動。uPnL 帳面改善，但**對沖被網格自己拆掉一半**：delta +0.24→+0.40，尾部風險實質變差。這不是使用者裁決的結果，是網格行為的自然後果。
+⇒ **TODO 1b/2 的裁決依據需要更新**；建議另開一次完整健檢（income 聚合 + 成交明細）搞清楚 11 天內發生什麼。使用者尚未指示。
+`marginMode` 實測確認 **cross**。
+
+生產設定（不變）：
+- 純網格 0.3%/0.3%、thr=0.8（mult=40）、增強全關；`requote_threshold_factor` 預設 0.5 = 行為不變
 - main 領先 origin **23 commits 未 push**（requote 實驗全部產物），使用者未指示 push
 
 ## TODO（優先序）
@@ -23,7 +37,11 @@
 1b. **【使用者裁決，最高優先的開放決策】-68 uPnL 出場路線**：(a) 接受凍結等價回 690 平多；(b) 定點認賠收斂；(c) 入金補中性後長期持有；(d) 深究 factor 0.8 regime（需新一輪預註冊驗證：完整 sensitivity curve + holdout 05-01~06-05 仍未開封可用，multiple-testing 代價高，不急）。裁決依據全在 `tasks/requote-experiment-results.md`。
 2. **入金 ~25 補滿 delta +0.24 → 完全中性**（使用者決定時機；5x 下補滿需錢包 ≥207；與 1b(c) 合流）
 3. **symbols-set 併發 race**（#10-A 衍生）：修法傾向砍終端 config 選單（單一 writer 根治）
-4. lessons 通則落地檢查：`config.leverage` 假旋鈕要不要接線（啟動時 set_leverage 推到交易所）或改名揭露——現況 config 寫 20 交易所 5x 的分歧會再咬人
+4. **【進行中】`config.leverage` 假旋鈕修繕**——走 **B+C**（B=讀交易所實測值校準；C=改名 `assumed_leverage`）。方案 A（set_leverage 寫入）使用者裁決不做。
+   - **實測關鍵事實**：ccxt 4.5.32 `fetch_positions` 預設走 V3 positionRisk，**不回 `leverage`**；須 `params={'useV2': True}` 才有（實測 5.0）。使用者裁決走**獨立低頻 V2 呼叫**，實盤 `_sync_positions` 路徑不動。
+   - **實測關鍵事實 2**：`config_io.merge_preserve:52-53` 只 update 不刪 key → 改名若不加 `drop_symbol_keys`，舊 `leverage` 會永久殘留成**第二個假旋鈕**。
+   - **衍生待辦（重要）**：#14 的 mult=40 上線決策，其回測槓桿假設不可考（主力 script 在 session scratchpad，repo 內不存在；同期 `cost_sensitivity.py:122` 預設 20x）。**mult=40 未經 5x 複核，而該決策核心正是保證金與裝死邊界。** 不得再宣稱它安全。requote 實驗則已核實用 5x（`calibration_gate.py:38`）乾淨。
+   - v1 spec 被 quant reviewer 判 Reject（2 blockers 我親自複驗全部成立）；v2 已修訂重審中。
 5. trading_mode 收編 engine schema（等 #4 驗收後）；頁3 clamp 寫回 session 全站排查
 6. GCE 部署三件套（VM/setup script/IP 白名單）——部署後 replay 驗收要在 GCE 重跑一次
 7. ~~file logger 修繕~~ **全部完成並 commit（`f64ae2f`，2026-07-12 20:05 重啟驗收過）**：新 log 每行帶時間戳、引擎雙側掛單正常；202MB 舊檔已歸檔為 `log/as_terminal_max.log.archive-20260712`（gitignored，含觀察期首日與歷史 -2019/斷路記錄）。main 已與 origin 同步。
