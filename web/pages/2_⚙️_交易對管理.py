@@ -256,8 +256,8 @@ def render_edit_symbol():
             assumed_leverage = st.number_input(
                 "回測假設槓桿（不推送交易所）",
                 min_value=1,
-                max_value=15,
-                value=min(cfg.assumed_leverage, 15),  # 舊配置可能超過 15，需要限制
+                max_value=125,
+                value=min(cfg.assumed_leverage, 125),  # 上限對齊交易所槓桿上限；此值必須等於交易所實際槓桿
                 step=1,
                 help="建議 10x，最大 15x"
             )

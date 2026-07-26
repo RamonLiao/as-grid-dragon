@@ -201,8 +201,8 @@ def render_backtest_params(sym_config: SymbolConfig):
         assumed_leverage = st.number_input(
             "回測假設槓桿（不推送交易所）",
             min_value=1,
-            max_value=15,  # 與交易對管理頁面一致，限制 15x
-            value=min(sym_config.assumed_leverage, 15),  # 防止舊配置超過 15
+            max_value=125,  # 上限對齊交易所槓桿上限
+            value=min(sym_config.assumed_leverage, 125),  # 此值必須等於交易所實際槓桿
             step=1,
             help="必須填入交易所的實際槓桿。此值不推送交易所，但決定回測如何計算保證金與強平——填錯會使回測低估爆倉風險。"
         )
