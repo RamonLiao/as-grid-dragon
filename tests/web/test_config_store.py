@@ -133,7 +133,13 @@ def test_roundtrip_real_config_no_field_loss():
             return out
 
         missing = keys_recursive(before) - keys_recursive(after)
-        assert missing == set(), f"存檔遺失欄位: {missing}"
+        # 一次性遷移：leverage → assumed_leverage 是刻意刪除的唯一例外。
+        # 其餘欄位仍須零遺失 —— 這條守衛是 merge-preserve 的核心不變式，
+        # 不因一次遷移而永久弱化。
+        expected_dropped = {f"symbols.{s}.leverage"
+                            for s, v in before.get("symbols", {}).items()
+                            if "leverage" in v}
+        assert missing == expected_dropped, f"非預期的存檔遺失欄位: {missing - expected_dropped}"
 
 
 def test_save_atomic_write_no_tmp_residue(cfg_file):
@@ -149,3 +155,18 @@ def test_save_atomic_write_no_tmp_residue(cfg_file):
     # 驗證主檔可正常 parse 且變更生效
     raw = json.loads(cfg_file.read_text())
     assert raw["symbols"]["XRP/USDC:USDC"]["assumed_leverage"] == 40
+
+
+def test_web_save_drops_legacy_leverage_key(tmp_path):
+    """config_store.save_config 路徑：同樣必須移除舊 key（兩個 writer 都要傳
+    drop_symbol_keys，漏一個就留殘骸）。"""
+    p = tmp_path / "trading_config_max.json"
+    p.write_text(json.dumps({
+        "symbols": {"X/USDC:USDC": {"leverage": 20, "initial_quantity": 1}}}))
+
+    config = config_store.load_config(path=p)
+    config_store.save_config(config, path=p)
+
+    sym = json.loads(p.read_text())["symbols"]["X/USDC:USDC"]
+    assert "leverage" not in sym
+    assert "assumed_leverage" in sym

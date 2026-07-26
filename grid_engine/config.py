@@ -281,7 +281,13 @@ class GlobalConfig:
         return config
 
     def save(self):
-        merge_preserve_save(CONFIG_FILE, self.to_dict())
+        # drop_symbol_keys：一次性遷移，清除舊 leverage key。
+        # merge_preserve 只 update 不刪 key，不顯式 drop 的話舊 key 會與
+        # assumed_leverage 永久並存 ⇒ 使用者手動編輯舊 key 會靜默無效
+        # ＝ 親手製造第二個假旋鈕。
+        # 清除條件：生產 config 確認不含舊 key 後即可移除本參數（backlog）。
+        merge_preserve_save(CONFIG_FILE, self.to_dict(),
+                            drop_symbol_keys={"leverage"})
         console.print("[green]配置已保存[/]")
 
     @classmethod

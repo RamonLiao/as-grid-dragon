@@ -58,4 +58,5 @@ def save_config(config: GlobalConfig,
     """
     config_io.merge_preserve_save(
         _resolve(path), config.to_dict(),
-        symbol_extras=symbol_extras, ensure_backup=True)
+        symbol_extras=symbol_extras, ensure_backup=True,
+        drop_symbol_keys={"leverage"})   # 一次性遷移，見 GlobalConfig.save 註記
