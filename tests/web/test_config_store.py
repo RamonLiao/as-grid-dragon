@@ -139,7 +139,9 @@ def test_roundtrip_real_config_no_field_loss():
         expected_dropped = {f"symbols.{s}.leverage"
                             for s, v in before.get("symbols", {}).items()
                             if "leverage" in v}
-        assert missing == expected_dropped, f"非預期的存檔遺失欄位: {missing - expected_dropped}"
+        assert missing == expected_dropped, (
+            f"非預期遺失: {missing - expected_dropped}; "
+            f"應遺失卻未發生: {expected_dropped - missing}")
 
 
 def test_save_atomic_write_no_tmp_residue(cfg_file):

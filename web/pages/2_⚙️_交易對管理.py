@@ -136,7 +136,7 @@ def render_add_symbol():
                 max_value=15,
                 value=10,
                 step=1,
-                help="建議 10x，最大 15x (降低爆倉風險)"
+                help="僅供回測計算保證金用，不推送交易所。實盤槓桿請在交易所端設定。"
             )
 
         # 交易模式選擇

@@ -146,7 +146,8 @@ class BacktestManager:
             leverage=config.assumed_leverage,
             limit_multiplier=config.limit_multiplier,
             threshold_multiplier=config.threshold_multiplier,
-            direction=getattr(config, "direction", "both"),
+            direction="both",  # SymbolConfig 無此欄位；不得改回帶 default 的 getattr
+                               # （會繞過 __getattr__ 攔截、靜默取預設）
             terminal_ui_mode=True,
         )
 
