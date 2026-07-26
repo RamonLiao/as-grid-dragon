@@ -1075,7 +1075,6 @@ class MainMenu:
                 take_profit_spacing=0.004,
                 grid_spacing=0.006,
                 initial_quantity=3.0,
-                assumed_leverage=20,
             )
             added.append(raw)
 
