@@ -1,11 +1,25 @@
 # Progress
 
 ## Current Task
-**TODO 4a 收官（2026-07-26）：`leverage` → `assumed_leverage` 改名 + 舊 key 清除。dual-review `Ship as-is`、verifier ACCEPT 8/8、546 passed。生產 config 已遷移成 `assumed_leverage: 5`。**
-剩 TODO 4b（讀交易所實測槓桿）開放；TODO 1b 出場路線仍待使用者裁決。
+**無進行中工程任務。TODO 4a 已收官並 merge+push（2026-07-26）。**
+下一步由使用者選：建議順序 ① 重啟引擎確認正常 → ② TODO 1b 出場裁決（真錢、依據已過時）→ ③ #14 mult=40 槓桿假設複核。
 
-⚠️ **引擎於 2026-07-26 停機做 config 遷移**。重啟時務必在 `feat/leverage-rename`（或已 merge 的 main）上——
-切回舊碼啟動會把 `leverage: 20` 寫回，變成新舊雙 key 並存（正是本次要消滅的狀態）。
+### 🔴 最高優先的兩件事（新 session 開場必讀）
+
+**1. 引擎目前是「停止」狀態。** 2026-07-26 為做 config 遷移停機，之後未重啟。
+- 重啟前確認在 **main**（已含改名 code）。切回舊碼啟動會把 `leverage: 20` 寫回，變成新舊雙 key 並存。
+- 重啟後值得確認：面板槓桿顯示 = 5 且文案為「交易所實際槓桿」、雙側網格掛單出現、`logs/decisions.jsonl` 有新決策。
+- 開工前一律先 `ps aux | grep as_terminal_max` 確認實際狀態，不要信本檔（可能已被使用者重啟）。
+
+**2. `#14 mult=40` 是現在生產正在跑的參數，而它的回測槓桿假設不可考。**
+主力 script（`segment_scan.py`）在當時的 session scratchpad、repo 內不存在；同期 `scripts/cost_sensitivity.py:122` 預設 `--leverage 20`，而實盤是 5x。
+該決策的核心正是**保證金與裝死邊界**——用 20x 算保證金會低估需求 4 倍。
+**不得再宣稱 mult=40 安全。** 我認為這比 TODO 4b 更該先做（4b 防未來漂移，這條是現在跑的東西可能建立在錯數字上）。
+（requote 實驗則已核實乾淨：`scripts/calibration_gate.py:38` 用 `leverage=5.0`。）
+
+### git 狀態
+main == origin/main（2026-07-26 push 完成，`f64ae2f..1aab450`，37 commits）。
+工作區只有 ` M .gitignore`（既有、與近期任務無關，使用者未指示處理）。
 
 ### ⚠️ 生產現況已變（2026-07-26 read-only 實測，現價 571.23）——與 07-15 記錄有實質落差
 | | 07-15 記錄 | **07-26 實測** |
@@ -21,9 +35,11 @@
 ⇒ **TODO 1b/2 的裁決依據需要更新**；建議另開一次完整健檢（income 聚合 + 成交明細）搞清楚 11 天內發生什麼。使用者尚未指示。
 `marginMode` 實測確認 **cross**。
 
-生產設定（不變）：
-- 純網格 0.3%/0.3%、thr=0.8（mult=40）、增強全關；`requote_threshold_factor` 預設 0.5 = 行為不變
-- main 領先 origin **23 commits 未 push**（requote 實驗全部產物），使用者未指示 push
+生產設定：
+- 純網格 0.3%/0.3%、thr=0.8（mult=40）、增強全關
+- `requote_threshold_factor: 0.5`（2026-07-26 遷移後**明寫進 config 檔**，原本靠程式碼預設；行為不變）
+- `assumed_leverage: 5`（2026-07-26 遷移，四個 symbol，原 `leverage: 20`）
+  ⇒ **遷移前的回測結果不可再與遷移後直接比較**——保證金/強平模型輸入從 20x 變 5x
 
 ## TODO（優先序）
 1. ~~觀察期複檢（07-13 之後）~~ **完成（2026-07-13）：replay PASS，但發現重大 fidelity 落差 → 衍生 TODO 1a**。
@@ -63,7 +79,21 @@
 8. ~~Telegram 通知接通~~ **完成（2026-07-12 21:43）**：根因兩個——chat_id 誤填 bot 自身 ID（log 三筆 `403 the bot can't send messages to the bot` 佐證）+ 引擎啟動時憑證為空致 reporter 未建。使用者修正 chat_id=1054193397 後 21:43 重啟，之後零失敗記錄。**07-13 20:00 Taipei 首封每日摘要使用者確認收到，端到端驗收完成。**
 
 ## Blockers
-無硬阻礙。TODO 1b/2 等使用者裁決；TODO 3-6 隨時可開工。
+無硬阻礙。TODO 1b/2 等使用者裁決；4b、4c、3、5、6 隨時可開工。
+**唯一的操作性待辦：引擎停機中，需使用者重啟（見 Current Task 第 1 點）。**
+
+## Recently Completed（2026-07-26）：TODO 4a `leverage` → `assumed_leverage`
+- **merge + push 完成**：main `f08ce2c..1aab450`（11 commits，fast-forward），origin 同步，546 passed / 1 skipped。
+- **流程**：brainstorming → spec（v1/v2 連兩輪被 quant reviewer 判 Reject，同形態 blocker「斷言接線存在而未查證」——v1 斷在交易所邊界、v2 斷在行程邊界 → 依 R4 換路徑，拆成 4a/4b）→ 4a spec（Approve with changes）→ plan（Reject → 修 → Approve with changes）→ SDD 3 task（每 task fresh implementer + reviewer）→ whole-branch review（opus，Ready to merge + 2 必修）→ security-review（**零 findings**）→ dual-review Round 1 外部輪（Fix required 2 Important → 修 → **Ship as-is**）+ Round 2 專案規則 → verifier **ACCEPT 8/8**（含 Monkey Testing 專門回合）。
+- **技術產物**：`config_io.merge_preserve(drop_symbol_keys=...)`（獨立最終 pass，drop 永遠勝出）、`SymbolConfig.__getattr__`/`__setattr__` 舊名雙向攔截、`from_dict` 相容分支（`data = dict(data)` 不竄改呼叫端）、三個映射點的非套套邏輯守衛。
+- **實測留痕（重要，別重新發現）**：
+  - ccxt 4.5.32 `fetch_positions` **預設走 V3 positionRisk、不回 `leverage`**；須 `params={'useV2': True}`（實測 5.0，`marginMode=cross`）。切 V2 是同一次呼叫加參數，**不是**新增 REST 呼叫。
+  - `grid_engine/rest_gateway.py` 全文 21 行，只有單 worker executor，**無重試、無斷路器**。別再假設它有。
+  - `config_io.merge_preserve` 只 update **不刪 key** → 任何改名都需配 `drop_symbol_keys`，否則舊 key 永久殘留。
+  - `tests/` **零 import** `as_terminal_max` 與 `web/pages/*` ⇒ 那些檔的漏改/語法錯 pytest 完全抓不到，只能靠逐點 read-back + `py_compile`。
+  - 全套測試須在 `as-grid-dragon` 子目錄跑；monorepo 根目錄會被 `as-grid-auto/test_position_mode.py` 的 collection-time `sys.exit(1)` 打斷。
+- **兩項流程不合規（誠實記錄）**：Red Team Protocol 實作前未列攻擊向量（事後由 spec §4 + 三輪 reviewer 紅隊 + security-review 覆蓋）；Monkey Testing 原本漏做，補在 verifier 那輪。
+- **最有價值的發現**：verifier 13 條自選 mutation **存活 3 條**——三個映射點改成硬編碼常數、543 條測試全綠 ⇒ 這條 branch 的核心主張自己沒有守衛。根因是 fixture 用 `assumed_leverage=20` = dataclass 預設值。已補守衛（測試值 7，同時 ≠ 預設 20 且 ≠ 生產值 5）。lesson 已入 `lessons.md`。
 
 ## Recently Completed（2026-07-13~15）：requote 語意驗證全計畫
 - **流程**：brainstorming → spec（quant reviewer 8 findings 修訂，含 holdout/事件數守門/netted 拒單保守取或）→ plan（reviewer 1 blocker + 7 should-fix 修訂；BLOCKER-1 經親手驗算部分駁回——equity 對帳務基礎不變成立，但可用餘額分歧真實，「保守取或」搬到拒單通道）→ SDD 12 tasks（每 task fresh implementer + reviewer，4 輪 fix 迭代）→ security-review 無 findings → dual-review 外部輪 Ship as-is → verifier ACCEPT 7/7 → merge main（f8d51e1，525 passed）。
