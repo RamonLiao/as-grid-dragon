@@ -1,7 +1,11 @@
 # 止盈加倍只給淨曝險側 — 設計 spec
 
 日期：2026-07-26
-狀態：v2（v1 被 quant spec reviewer 判 Reject，3 blockers；本版已修）
+狀態：**v3 — 可開工**（v1 Reject／3 blockers → v2 Approve with changes／4 項 → v3 全部併入）
+review 軌跡：quant spec reviewer（opus、fresh context、唯讀）兩輪。
+Round 1 = Reject（BL1 漏 caller、BL2 測試變永綠空殼、BL3 risk_monitor 理由算術錯）；
+Round 2 = Approve with changes（NF1 overshoot、NF2 面板 ×2 標籤說謊、NF3 回退門檻不可測、NF4 粒度）。
+Round 2 另撤回其 Round 1 的 SF5 數字（reviewer 重算後採用本 spec 的 delta Δ +0.16 / +0.04）。
 上游證據：`tasks/health-check-2026-07-26.md`（07-15~07-26 實盤逐筆對帳）
 
 > **命名更正（v1 SF5）**：v1 標題用「對沖免疫」，名不符實——新規則下對沖側在下穿時仍以 1×
@@ -103,17 +107,39 @@ def tp_quantity(base_qty, my_position, opposite_position, position_limit):
 推向 `long ≈ short`，且步長固定 0.02、兩側量化到同一格，精確相等**不是零測度事件**
 ⇒ 會在 gross 最高、最需要煞車的狀態下什麼都不做。
 
-**v2 設計**（同一觸發條件 `雙側 ≥ position_threshold × 0.8`、同一 60s cooldown 不變）：
+**v2 提案（大側固定 2×、小側 1×）也錯了**（v2 NF1）。實測反例：`long=0.66, short=0.64`
+（都 ≥0.64 ⇒ 觸發）→ long 0.50 / short 0.56 ⇒ delta 由 **+0.02 翻成 −0.06**，
+`|delta|` 從 0.02 **惡化到 0.06**。而且——比 reviewer 指出的更糟——**任何一次觸發後雙側都掉到
+門檻以下，觸發條件不再成立 ⇒ 根本沒有「下一輪」**，v2 §4 向量 4 說的「最壞是輪流減、
+方向仍正確」兩處都錯。overshoot 的精確條件是 `gap < reduce_qty / 2`。
 
-| 狀態 | 平多 | 平空 | gross | delta |
-|---|---|---|---|---|
-| `long > short` | **2×** reduce_qty | 1× reduce_qty | ↓ 3× | ↓ 1× ✅ |
-| `short > long` | 1× reduce_qty | **2×** reduce_qty | ↓ 3× | ↓ 1× ✅ |
-| `long == short` | 1× | 1×（**= 現行行為**） | ↓ 2× | 不變 ✅ |
+這是本 spec 內**第三次**同型錯誤（把「帶號值下降」當成「收斂」；前兩次是 v1 BL3 與 v2 表格）。
 
-⇒ gross 在**所有**狀態下都下降（煞車保留），且不相等時 delta 同步收斂。
-`reduce_qty` 基數與現行相同（`position_threshold × 0.1`）；下單仍走 `reduce_only=True` 市價，
-量超過實際持倉時由交易所 clamp（既有行為，不新增邏輯）。
+**v3 設計**：把大側的額外減量**夾到 gap**，讓「不 overshoot」成為可證明的不變式，
+而不是靠案例分析。觸發條件與 60s cooldown 不變，`reduce_qty = position_threshold × 0.1`。
+
+```python
+gap = abs(long_position - short_position)
+extra = min(reduce_qty, gap)          # 夾到 gap ⇒ 永不越過中性點
+large_qty = reduce_qty + extra
+small_qty = reduce_qty
+# gap == 0 時 extra == 0 ⇒ 自動退回雙側等量，不需要浮點 `==` 分支
+```
+
+**不變式（A5 要斷言的就是這三條，不是逐案例列表）**：
+1. `new_delta = sign(delta) × max(0, gap − reduce_qty)` ⇒ **`|delta|` 永不增加、永不變號**；
+2. gross 嚴格下降 `2 × reduce_qty + extra`（煞車在所有狀態下都保留）；
+3. `gap == 0` 時退化為現行行為（雙側各 `reduce_qty`）。
+
+驗算：`gap=0.02` → extra 0.02 → delta 0.02→**0**；`gap=0.16` → extra 0.08 → delta 0.16→**0.08**；
+`gap=0` → extra 0 → delta 不變、gross ↓0.16（= 現行）。
+
+**這個寫法順帶消掉浮點相等比較的問題**（v2 NF1 後半）——交易所回來的 `0.6400000000000001`
+不會落進錯誤分支，因為根本沒有 `==` 分支。
+
+下單仍走 `reduce_only=True` 市價，量超過實際持倉時由交易所 clamp（既有行為，不新增邏輯）。
+reviewer 另已驗證：`large_qty ≤ 2 × reduce_qty = 0.2 × threshold < 0.8 × threshold`（觸發門檻）
+⇒ **「某側持倉 < 下單量」在觸發條件下算術上不可能**。
 
 ### 3.3 `grid_engine/bot.py:250-270` — 清掉加倍邏輯的死拷貝
 
@@ -132,7 +158,7 @@ def tp_quantity(base_qty, my_position, opposite_position, position_limit):
 | `decision.py:179`（裝死）/ `:187`（正常） | 兩處都經 `compute_quantity`，見 §4 向量 3 |
 | `bot.py:242-243` 餵 threshold/limit 進 `DecisionInputs` | 不變（`DecisionInputs` 欄位保留，裝死判定 `is_dead_mode` 仍用 threshold） |
 | `backtest/tick_sim.py:104-105`、`backtest/backtester.py:604-605` | 不變（自行從 multiplier 推導後餵 `decide()`）。⚠️ v1 誤引 `:565-566`，那是 `_validate_seed` |
-| `grid_engine/ui.py:126-132` | 不變（只用於面板顏色門檻） |
+| **`grid_engine/ui.py:126-133`** | ✅ **同步修改**（v2 NF2）。它不只上色，還印 `多×2` / `空×2` 標籤，判定只看 `position > position_limit`、**不看對手側** ⇒ 改動後小側實際是 1× 但面板仍顯示「×2」。這會直接**誤觸 §7 回退表第 4 條**（「小側止盈 qty 出現 0.04」），讓操作者以為新規則沒生效。修法：兩個 `elif` 各加 `and my_position > opposite_position` |
 | `grid_engine/replay.py` | 不變；`decisions.jsonl` 的 inputs 已含 `position_limit`（實查確認） |
 
 ### 3.5 `tests/test_backtest_matching.py` 的 reduce_only clamp 測試必須改造（v1 BL2）
@@ -166,7 +192,7 @@ K 線與 v1 相同三根。預期值改為單側版本：
 | 1 | 兩側極接近時 `m > o` 每次成交都翻面 | 判定無害（自穩、無額外 churn）；測試釘死 `m == o` → 兩側皆不加倍 |
 | 2 | 零倉 / 單側零倉 | `m = 0` 不過 `> position_limit`；`_decide_side:189` 另有 `if my_pos > 0` 才掛止盈；零倉引導走 `bot.py:401` 不經此函數。測試覆蓋 0/0、0/x、x/0 |
 | 3 | **裝死分支也吃這個量**（`decision.py:179`） | 裝死側必然 `m > threshold ≥ limit`，通常也是大側 ⇒ 行為不變。但「裝死側反而是小側」（對手更大）時出清變慢——**刻意的行為變更**，需專門測試並記錄 |
-| 4 | risk_monitor 減完後 delta 反向 | 見 §3.2 表：不相等時 delta 只降 1× reduce_qty，最壞是輪流減；相等時退回等量、delta 不動。60s cooldown 保留 |
+| 4 | risk_monitor 減完後 delta 反向或 `\|delta\|` 擴大 | **v2 的答案「最壞是輪流減、方向仍正確」是錯的**（v2 NF1）：任何一次觸發後雙側都掉到門檻以下 ⇒ **沒有下一輪**。v3 改用 `extra = min(reduce_qty, gap)` 讓「`\|delta\|` 永不增加、永不變號」成為可證明的不變式（§3.2），並由 A5 直接斷言該不變式，不靠案例列舉 |
 | 5 | `position_limit` 極小的 symbol（BTCUSDC 0.005）幾乎恆過門檻 ⇒ 規則退化成純淨曝險判定 | 預期行為非缺陷。目前僅 BNBUSDC enabled；其餘啟用前各自複核（§8） |
 | 6 | **保留對沖 ⇒ gross 更大 ⇒ initialMargin 更高 ⇒ entry 被 `-2019` 拒的機率上升**（v1 SF3） | A6 新增 `rejected_entries` 與 `max_drawdown` 逐窗守門；§7 上線後監控 margin usage |
 
@@ -180,7 +206,7 @@ K 線與 v1 相同三根。預期值改為單側版本：
 | A2 | 簽名改 4 引數，**所有** caller 更新 | `grep -rn "tp_quantity" grid_engine backtest scripts tests` 零 5 引數殘留。**必須包含 `backtest/backtester.py:84`**（§3.4） |
 | A3 | `bot.py` 加倍死分支刪除 | grep 證明兩個呼叫點都傳 `False` |
 | A4 | replay 全量 `logs/decisions.jsonl` | 見 §5.1。**A4 是實作 guard，不是策略證據**（§6） |
-| A5 | risk_monitor 三個狀態各一測（`long>short` / `short>long` / `long==short`），斷言下單量比例 2:1 / 1:2 / 1:1 | mutation = 改回一律等量，`long>short` 那條須紅 |
+| A5 | risk_monitor **斷言 §3.2 的三條不變式**（不是列舉案例）：(1) `abs(new_delta) <= abs(old_delta)` 且不變號；(2) gross 嚴格下降；(3) `gap == 0` 時退回雙側等量。測試狀態至少含 `gap < reduce_qty/2`（**v2 的 overshoot 反例 `0.66/0.64`，必測**）、`gap > reduce_qty`（`0.80/0.64`）、`gap == 0`、`short > long`、以及浮點雜訊 `0.6400000000000001/0.64` | mutation 兩條各須紅一次：(a) 改回一律等量 → 不變式 1 在 `0.80/0.64` 紅；(b) 改回 v2 的固定 2×（`extra = reduce_qty`）→ 不變式 1 在 **`0.66/0.64`** 紅 |
 | A6 | tick_sim A/B（§5.2 shim）× 場景 A/B × W1/W2/W3/full、fee=0/slip=0 | 逐窗回報 `max abs(delta)`、`final abs(delta)`、`final_equity`、`max_drawdown`、`liquidated`、`round_trips`、`rejected_entries`。**Gate**：(i) `max abs(delta)` 與 `final abs(delta)` 每窗 ≤ 舊規則；(ii) 零強平；(iii) `final_equity` 劣化 ≤ **1.0 USDC**；(iv) `max_drawdown` 劣化 ≤ **2 個百分點**；(v) `rejected_entries` 增幅 ≤ **50%**；**基準為 0 時改判「新規則 > 5 筆即超標」**（避免 0 基準下任何拒單都算超標）。任一項超標 → **停下報告，不自行放行** |
 | A7 | 全套測試綠 | 基線 546 passed / 1 skipped（須在 `as-grid-dragon` 子目錄跑） |
 | A8 | §3.5 改造後的 clamp 測試，在拿掉 `min(qty, prior_qty)` 後**必須紅** | 這條是 BL2 的直接補償：證明改造後仍有鑑別力 |
@@ -267,8 +293,8 @@ def _tp_quantity_legacy(base_qty, my_position, opposite_position, position_limit
 | 指標 | 門檻 |
 |---|---|
 | `abs(delta)` | 上線後 14 天未較上線日下降，或任何時點 > 0.50 |
-| margin usage（`initialMargin / marginBalance`） | > 95% 連續 24h |
-| `-2019` 拒單 | 單日 > 20 筆（現行基線約 0） |
+| margin usage（`initialMargin / marginBalance`） | > 95%。⚠️ **觀測粒度為每日一點**（v2 NF4）：`state.margin_usage` 只經 `reporting.py:48` 進每日 Telegram 摘要，且生產 `telegram_risk_alert_enabled=false` ⇒ 即時告警路徑是關的。這是**人工/每日**判讀，不是自動守門 |
+| 下單失敗 | **log 出現「⛔ 下單斷路」警告**（`order_executor.py:113-116`，連續失敗 10 次觸發，同時發 Telegram）。⚠️ v2 原寫「`-2019` 單日 > 20 筆」**不可測**（v2 NF3）——`_register_order_failure` 逐筆**不 log**，只在 `n == ORDER_CIRCUIT_THRESHOLD` 才 warning 一次 ⇒ 那是操作層的假旋鈕。本條改用唯一實際可觀測的信號，代價是粒度粗（持續每日 5 筆的慢性拒單抓不到）；補 per-failure log 見 §8 |
 | 小側止盈 qty | 出現 0.04（= 新規則未生效或被覆寫） |
 
 ## 8. Backlog（本 spec 明確不做）
@@ -278,4 +304,7 @@ def _tp_quantity_legacy(base_qty, my_position, opposite_position, position_limit
   但與本次對沖主題無關，且需自己的驗收設計。
 - 其餘三個 symbol（ETHUSDC / SOLUSDC / BTCUSDC）目前 `enabled=false`。啟用任一個之前，
   須各自複核 `position_limit` 與預期倉位規模的關係（§4 向量 5）。
+- **`order_executor` 缺 per-failure log**（v2 NF3）：`_register_order_failure`（`:106-116`）逐筆失敗
+  不留痕，只在連續第 10 次才 warning 一次 ⇒ 慢性拒單（每日數筆但不連續 10 次）完全不可觀測。
+  補一行含 ccxt error code 的 log 即可，但屬獨立改動，不混進本 spec。
 - 索取清單：BNBUSDC depth/ADV 實測（解 §6 的滑價與容量兩項）。
