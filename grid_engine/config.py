@@ -78,6 +78,9 @@ class SymbolConfig:
 
     @classmethod
     def from_dict(cls, data: dict) -> 'SymbolConfig':
+        # shallow copy：本函式只改 top-level key，避免就地竄改呼叫端的 dict
+        # （leverage 遷移分支生產 config 四個 symbol 全都有 ⇒ 每次載入必觸發）。
+        data = dict(data)
         # 兼容舊配置
         if "position_threshold" in data and "threshold_multiplier" not in data:
             qty = data.get("initial_quantity", 3)

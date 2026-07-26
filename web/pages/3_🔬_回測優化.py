@@ -204,7 +204,7 @@ def render_backtest_params(sym_config: SymbolConfig):
             max_value=15,  # 與交易對管理頁面一致，限制 15x
             value=min(sym_config.assumed_leverage, 15),  # 防止舊配置超過 15
             step=1,
-            help="僅供回測計算保證金用，不推送交易所。實盤槓桿請在交易所端設定。"
+            help="必須填入交易所的實際槓桿。此值不推送交易所，但決定回測如何計算保證金與強平——填錯會使回測低估爆倉風險。"
         )
 
     # 更新配置

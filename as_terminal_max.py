@@ -859,7 +859,7 @@ class MainMenu:
         take_profit = FloatPrompt.ask("止盈間距 (%)", default=0.4) / 100
         grid_spacing = FloatPrompt.ask("補倉間距 (%)", default=0.6) / 100
         quantity = FloatPrompt.ask("每單數量", default=3.0)
-        assumed_leverage = IntPrompt.ask("回測假設槓桿（不推送交易所）", default=20)
+        assumed_leverage = IntPrompt.ask("交易所實際槓桿（不推送交易所，但決定回測保證金/強平計算）", default=20)
 
         console.print(f"\n[dim]持倉控制 (基於每單數量 {quantity} 自動計算)[/]")
         limit_mult = FloatPrompt.ask("加倍倍數 (幾單後止盈加倍)", default=5.0)
@@ -914,7 +914,7 @@ class MainMenu:
             default=cfg.initial_quantity
         )
         cfg.assumed_leverage = IntPrompt.ask(
-            f"回測假設槓桿（不推送交易所）[當前: {cfg.assumed_leverage}]",
+            f"交易所實際槓桿（不推送交易所，但決定回測保證金/強平計算）[當前: {cfg.assumed_leverage}]",
             default=cfg.assumed_leverage
         )
 

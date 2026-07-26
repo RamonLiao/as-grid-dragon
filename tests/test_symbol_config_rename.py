@@ -90,3 +90,31 @@ def test_property_internal_error_is_not_rewritten_as_rename_message():
         _ = cfg.coin_name
     assert "assumed_leverage" not in str(ei.value)
     assert "coin_name" in str(ei.value)
+
+
+def test_from_dict_does_not_mutate_caller_dict():
+    """from_dict 的舊 key 遷移分支不得竄改呼叫端的 dict。
+
+    這條路徑剛從死碼變成活碼：position_threshold/position_limit 的同型分支
+    在生產 config 裡從不觸發，而 leverage 四個 symbol 全都有 ⇒ 每次載入必走。
+    """
+    data = {"leverage": 5, "initial_quantity": 1,
+            "position_threshold": 40, "position_limit": 5}
+    snapshot = dict(data)
+    cfg = SymbolConfig.from_dict(data)
+    assert cfg.assumed_leverage == 5
+    assert data == snapshot, f"from_dict 竄改了呼叫端 dict: {data}"
+
+
+def test_getattr_with_default_bypasses_interception_known_limitation():
+    """現況揭露（非期望行為）：三參數 getattr 會靜默取到 default，繞過攔截。
+
+    __getattr__ 只能在查找失敗時 raise，而 getattr(obj, name, default)
+    會吞掉 AttributeError 回傳 default。同樣適用於 @property 內部出錯的情況。
+    ⇒ 專案規則禁止對 config 欄位使用帶 default 的 getattr（見 dev-rules）。
+    目前全 repo 無此類呼叫端；本測試釘死這個限制，避免下一個人誤以為攔截密不透風。
+    """
+    cfg = SymbolConfig()
+    assert getattr(cfg, "leverage", "SENTINEL") == "SENTINEL"
+    cfg.ccxt_symbol = 12345          # 讓 coin_name 內部炸
+    assert getattr(cfg, "coin_name", "SWALLOWED") == "SWALLOWED"
