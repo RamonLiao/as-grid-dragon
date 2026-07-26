@@ -123,3 +123,43 @@ def test_ensure_backup_once(tmp_path):
     config_io.merge_preserve_save(p, {"v": 3}, ensure_backup=True)
     bak = p.with_name(p.name + config_io.BACKUP_SUFFIX)
     assert json.loads(bak.read_text())["v"] == 1  # 備份只建一次，維持首版
+
+
+def test_drop_symbol_keys_removes_key():
+    raw = {"symbols": {"X/USDC:USDC": {"leverage": 20, "assumed_leverage": 20}}}
+    new = {"symbols": {"X/USDC:USDC": {"assumed_leverage": 20}}}
+    merged = config_io.merge_preserve(raw, new, drop_symbol_keys={"leverage"})
+    sym = merged["symbols"]["X/USDC:USDC"]
+    assert "leverage" not in sym
+    assert sym["assumed_leverage"] == 20
+
+
+def test_drop_symbol_keys_applies_when_new_has_no_symbols_key():
+    """drop 必須是獨立最終 pass：new 不含 symbols 時仍要生效。
+    若把 drop 寫進 symbol 分支內，本測試會紅。"""
+    raw = {"symbols": {"X/USDC:USDC": {"leverage": 20}}, "api_key": "old"}
+    new = {"api_key": "new"}
+    merged = config_io.merge_preserve(raw, new, drop_symbol_keys={"leverage"})
+    assert "leverage" not in merged["symbols"]["X/USDC:USDC"]
+    assert merged["api_key"] == "new"
+
+
+def test_drop_symbol_keys_wins_over_symbol_extras():
+    """drop 必須在 symbol_extras 之後：否則 extras 會把 key 塞回來。"""
+    raw = {"symbols": {"X/USDC:USDC": {"leverage": 20}}}
+    new = {"symbols": {"X/USDC:USDC": {"assumed_leverage": 20}}}
+    merged = config_io.merge_preserve(
+        raw, new,
+        symbol_extras={"X/USDC:USDC": {"leverage": 99, "trading_mode": "swing"}},
+        drop_symbol_keys={"leverage"})
+    sym = merged["symbols"]["X/USDC:USDC"]
+    assert "leverage" not in sym
+    assert sym["trading_mode"] == "swing"   # 其他 extras 不受影響
+
+
+def test_drop_symbol_keys_does_not_mutate_raw():
+    """純度：呼叫端的 raw 不得被改動（天真實作直接迭代 raw['symbols'] 會踩到）。"""
+    raw = {"symbols": {"X/USDC:USDC": {"leverage": 20}}}
+    new = {"symbols": {"X/USDC:USDC": {"assumed_leverage": 20}}}
+    config_io.merge_preserve(raw, new, drop_symbol_keys={"leverage"})
+    assert raw["symbols"]["X/USDC:USDC"]["leverage"] == 20

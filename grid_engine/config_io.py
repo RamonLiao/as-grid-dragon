@@ -40,7 +40,8 @@ def load_raw(path) -> dict:
 
 
 def merge_preserve(raw: dict, new: dict,
-                   symbol_extras: Optional[dict] = None) -> dict:
+                   symbol_extras: Optional[dict] = None,
+                   drop_symbol_keys: Optional[set] = None) -> dict:
     merged = dict(raw)  # raw 為底，保留未知 top-level key
     if "symbols" in merged:
         merged["symbols"] = {k: dict(v) for k, v in merged["symbols"].items()}
@@ -62,6 +63,13 @@ def merge_preserve(raw: dict, new: dict,
     for sym_key, extras in (symbol_extras or {}).items():
         if sym_key in merged.get("symbols", {}):
             merged["symbols"][sym_key].update(extras)
+    # 一次性遷移：舊 key 清除。獨立最終 pass —— 必須在 symbol_extras 之後
+    # （extras 會把刪掉的 key 塞回來），且不得寫進上面的 symbol 分支內
+    # （該分支只在 new 含 "symbols" 時執行）。drop 永遠勝出。
+    if drop_symbol_keys:
+        for sym_key, sym in merged.get("symbols", {}).items():
+            for k in drop_symbol_keys:
+                sym.pop(k, None)
     return merged
 
 
@@ -104,11 +112,12 @@ def _ensure_backup(path) -> None:
 
 def merge_preserve_save(path, new: dict,
                         symbol_extras: Optional[dict] = None,
-                        ensure_backup: bool = False) -> None:
+                        ensure_backup: bool = False,
+                        drop_symbol_keys: Optional[set] = None) -> None:
     """鎖內 RMW 主入口：flock → 讀 raw → merge → (backup) → 原子寫。"""
     p = Path(path)
     with _config_lock(p):
-        merged = merge_preserve(load_raw(p), new, symbol_extras)
+        merged = merge_preserve(load_raw(p), new, symbol_extras, drop_symbol_keys)
         if ensure_backup:
             _ensure_backup(p)
         _atomic_write_json(p, merged)
