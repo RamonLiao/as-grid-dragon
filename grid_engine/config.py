@@ -36,7 +36,7 @@ class SymbolConfig:
     take_profit_spacing: float = 0.004
     grid_spacing: float = 0.006
     initial_quantity: float = 3
-    leverage: int = 20
+    assumed_leverage: int = 20
 
     limit_multiplier: float = 5.0
     threshold_multiplier: float = 20.0
@@ -71,7 +71,7 @@ class SymbolConfig:
             "take_profit_spacing": self.take_profit_spacing,
             "grid_spacing": self.grid_spacing,
             "initial_quantity": self.initial_quantity,
-            "leverage": self.leverage,
+            "assumed_leverage": self.assumed_leverage,
             "limit_multiplier": self.limit_multiplier,
             "threshold_multiplier": self.threshold_multiplier,
         }
@@ -89,7 +89,36 @@ class SymbolConfig:
             if qty > 0:
                 data["limit_multiplier"] = data["position_limit"] / qty
             del data["position_limit"]
+        # 兼容舊 key：leverage → assumed_leverage（新 key 存在時新 key 勝）
+        if "leverage" in data:
+            if "assumed_leverage" not in data:
+                data["assumed_leverage"] = data["leverage"]
+            del data["leverage"]
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
+
+    _RENAMED = {
+        "leverage": "assumed_leverage 已取代 leverage。此值不推送交易所"
+                    "（實盤槓桿由交易所端設定），僅供回測使用。",
+    }
+
+    def __getattr__(self, name):
+        # 只在正常查找失敗後才被呼叫。注意 @property 內部拋 AttributeError
+        # 也會落到這裡，且原始例外會被完全丟棄（__context__ 為 None）——
+        # fallback 必須帶上真正的屬性名，否則 coin_name 出錯會被誤報成
+        # 「leverage 已改名」，把除錯導向完全錯誤的方向。
+        if name in SymbolConfig._RENAMED:
+            raise AttributeError(SymbolConfig._RENAMED[name])
+        raise AttributeError(
+            f"{type(self).__name__!r} object has no attribute {name!r}"
+            f"（若 {name!r} 是 @property，其內部的 AttributeError 原文已被本"
+            f" __getattr__ 遮蔽；用 type(obj).{name}.fget(obj) 直接呼叫可重現）")
+
+    def __setattr__(self, name, value):
+        # __getattr__ 只攔讀不攔寫；少了這個，cfg.leverage = 20 會靜默建立
+        # 實例屬性（讀得到、to_dict() 忽略）＝ 假旋鈕復刻。
+        if name in SymbolConfig._RENAMED:
+            raise AttributeError(SymbolConfig._RENAMED[name])
+        object.__setattr__(self, name, value)
 
 
 @dataclass

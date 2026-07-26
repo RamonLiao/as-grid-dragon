@@ -20,7 +20,7 @@ _FAKE_NOTES = "回測保真限制: (test fixture notes, 非真正 FIDELITY_NOTES
 SYM = SymbolConfig(
     symbol="XRPUSDC", ccxt_symbol="XRP/USDC:USDC", enabled=True,
     take_profit_spacing=0.004, grid_spacing=0.006,
-    initial_quantity=3.0, leverage=20,
+    initial_quantity=3.0, assumed_leverage=20,
     limit_multiplier=5.0, threshold_multiplier=20.0,
 )
 

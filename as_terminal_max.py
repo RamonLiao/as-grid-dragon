@@ -811,7 +811,7 @@ class MainMenu:
                         f"{cfg.take_profit_spacing*100:.2f}%",
                         f"{cfg.grid_spacing*100:.2f}%",
                         str(cfg.initial_quantity),
-                        f"{cfg.leverage}x",
+                        f"{cfg.assumed_leverage}x",
                         f"×{cfg.limit_multiplier:.0f} ({cfg.position_limit:.0f})",
                         f"×{cfg.threshold_multiplier:.0f} ({cfg.position_threshold:.0f})"
                     )
@@ -859,7 +859,7 @@ class MainMenu:
         take_profit = FloatPrompt.ask("止盈間距 (%)", default=0.4) / 100
         grid_spacing = FloatPrompt.ask("補倉間距 (%)", default=0.6) / 100
         quantity = FloatPrompt.ask("每單數量", default=3.0)
-        leverage = IntPrompt.ask("槓桿", default=20)
+        assumed_leverage = IntPrompt.ask("回測假設槓桿（不推送交易所）", default=20)
 
         console.print(f"\n[dim]持倉控制 (基於每單數量 {quantity} 自動計算)[/]")
         limit_mult = FloatPrompt.ask("加倍倍數 (幾單後止盈加倍)", default=5.0)
@@ -873,7 +873,7 @@ class MainMenu:
             take_profit_spacing=take_profit,
             grid_spacing=grid_spacing,
             initial_quantity=quantity,
-            leverage=leverage,
+            assumed_leverage=assumed_leverage,
             limit_multiplier=limit_mult,
             threshold_multiplier=threshold_mult
         )
@@ -913,9 +913,9 @@ class MainMenu:
             f"每單數量 [當前: {cfg.initial_quantity}]",
             default=cfg.initial_quantity
         )
-        cfg.leverage = IntPrompt.ask(
-            f"槓桿 [當前: {cfg.leverage}]",
-            default=cfg.leverage
+        cfg.assumed_leverage = IntPrompt.ask(
+            f"回測假設槓桿（不推送交易所）[當前: {cfg.assumed_leverage}]",
+            default=cfg.assumed_leverage
         )
 
         console.print(f"\n[dim]持倉控制 (基於每單數量 {cfg.initial_quantity} 自動計算)[/]")
@@ -1075,7 +1075,7 @@ class MainMenu:
                 take_profit_spacing=0.004,
                 grid_spacing=0.006,
                 initial_quantity=3.0,
-                leverage=20,
+                assumed_leverage=20,
             )
             added.append(raw)
 

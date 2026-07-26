@@ -61,7 +61,7 @@ def render_symbols_list():
 
             with col2:
                 st.write(f"**數量:** {cfg.initial_quantity}")
-                st.write(f"**槓桿:** {cfg.leverage}x")
+                st.write(f"**槓桿（回測假設）:** {cfg.assumed_leverage}x")
 
             with col3:
                 st.write(f"**加倍觸發:** {cfg.position_limit:.1f}")
@@ -130,8 +130,8 @@ def render_add_symbol():
                 help="每次開倉的數量（建議 3-10）"
             )
 
-            leverage = st.number_input(
-                "槓桿倍數",
+            assumed_leverage = st.number_input(
+                "回測假設槓桿（不推送交易所）",
                 min_value=1,
                 max_value=15,
                 value=10,
@@ -198,7 +198,7 @@ def render_add_symbol():
                 take_profit_spacing=take_profit / 100,
                 grid_spacing=grid_spacing / 100,
                 initial_quantity=quantity,
-                leverage=leverage,
+                assumed_leverage=assumed_leverage,
                 limit_multiplier=limit_mult,
                 threshold_multiplier=threshold_mult,
             )
@@ -253,11 +253,11 @@ def render_edit_symbol():
             )
 
         with col2:
-            leverage = st.number_input(
-                "槓桿倍數",
+            assumed_leverage = st.number_input(
+                "回測假設槓桿（不推送交易所）",
                 min_value=1,
                 max_value=15,
-                value=min(cfg.leverage, 15),  # 舊配置可能超過 15，需要限制
+                value=min(cfg.assumed_leverage, 15),  # 舊配置可能超過 15，需要限制
                 step=1,
                 help="建議 10x，最大 15x"
             )
@@ -303,7 +303,7 @@ def render_edit_symbol():
                 cfg.take_profit_spacing = take_profit / 100
                 cfg.grid_spacing = grid_spacing / 100
                 cfg.initial_quantity = quantity
-                cfg.leverage = leverage
+                cfg.assumed_leverage = assumed_leverage
                 cfg.limit_multiplier = limit_mult
                 cfg.threshold_multiplier = threshold_mult
                 save_config(symbol_extras={symbol: {"trading_mode": trading_mode}})

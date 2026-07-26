@@ -106,7 +106,7 @@ def render_symbol_config():
         st.write(f"- 止盈間距: {cfg.take_profit_spacing*100:.2f}%")
         st.write(f"- 補倉間距: {cfg.grid_spacing*100:.2f}%")
         st.write(f"- 每單數量: {cfg.initial_quantity}")
-        st.write(f"- 槓桿: {cfg.leverage}x")
+        st.write(f"- 槓桿（回測假設，非交易所實際）: {cfg.assumed_leverage}x")
     with col2:
         st.markdown("**倉位控制**")
         st.write(f"- 加倍止盈觸發: {cfg.position_limit:.1f}")

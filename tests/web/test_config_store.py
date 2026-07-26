@@ -58,11 +58,11 @@ def test_get_symbol_extra_reads_trading_mode(cfg_file):
 def test_save_preserves_unknown_fields(cfg_file):
     """核心保證：engine schema 沒有的欄位，存檔後原樣保留。"""
     config = config_store.load_config(path=cfg_file)
-    config.symbols["XRP/USDC:USDC"].leverage = 25  # 模擬頁2 編輯
+    config.symbols["XRP/USDC:USDC"].assumed_leverage = 25  # 模擬頁2 編輯
     config_store.save_config(config, path=cfg_file)
 
     raw = json.loads(cfg_file.read_text())
-    assert raw["symbols"]["XRP/USDC:USDC"]["leverage"] == 25          # 編輯生效
+    assert raw["symbols"]["XRP/USDC:USDC"]["assumed_leverage"] == 25   # 編輯生效
     assert raw["symbols"]["XRP/USDC:USDC"]["trading_mode"] == "swing"  # 未知欄位保留
     assert raw["exchange_type"] == "binance"                            # top-level 保留
     assert raw["testnet"] is False
@@ -105,7 +105,7 @@ def test_save_creates_one_time_backup(cfg_file):
     assert original["symbols"]["XRP/USDC:USDC"]["leverage"] == 20
 
     # 二次存檔改值，備份不變
-    config.symbols["XRP/USDC:USDC"].leverage = 30
+    config.symbols["XRP/USDC:USDC"].assumed_leverage = 30
     config_store.save_config(config, path=cfg_file)
     assert json.loads(bak.read_text())["symbols"]["XRP/USDC:USDC"]["leverage"] == 20
 
@@ -139,7 +139,7 @@ def test_roundtrip_real_config_no_field_loss():
 def test_save_atomic_write_no_tmp_residue(cfg_file):
     """驗證原子寫：存檔後同目錄沒有 .tmp 殘留檔、JSON 可正常 parse（replace 完成）。"""
     config = config_store.load_config(path=cfg_file)
-    config.symbols["XRP/USDC:USDC"].leverage = 40
+    config.symbols["XRP/USDC:USDC"].assumed_leverage = 40
     config_store.save_config(config, path=cfg_file)
 
     # 驗證無 .tmp 殘留（pid 唯一化後用 glob）
@@ -148,4 +148,4 @@ def test_save_atomic_write_no_tmp_residue(cfg_file):
 
     # 驗證主檔可正常 parse 且變更生效
     raw = json.loads(cfg_file.read_text())
-    assert raw["symbols"]["XRP/USDC:USDC"]["leverage"] == 40
+    assert raw["symbols"]["XRP/USDC:USDC"]["assumed_leverage"] == 40

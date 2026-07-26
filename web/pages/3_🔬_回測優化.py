@@ -198,11 +198,11 @@ def render_backtest_params(sym_config: SymbolConfig):
             help="每次開倉的數量"
         )
 
-        leverage = st.number_input(
-            "槓桿",
+        assumed_leverage = st.number_input(
+            "回測假設槓桿（不推送交易所）",
             min_value=1,
             max_value=15,  # 與交易對管理頁面一致，限制 15x
-            value=min(sym_config.leverage, 15),  # 防止舊配置超過 15
+            value=min(sym_config.assumed_leverage, 15),  # 防止舊配置超過 15
             step=1,
             help="建議 10x，最大 15x (降低爆倉風險)"
         )
@@ -211,7 +211,7 @@ def render_backtest_params(sym_config: SymbolConfig):
     sym_config.take_profit_spacing = take_profit / 100
     sym_config.grid_spacing = grid_spacing / 100
     sym_config.initial_quantity = quantity
-    sym_config.leverage = leverage
+    sym_config.assumed_leverage = assumed_leverage
 
     return sym_config
 
@@ -902,7 +902,7 @@ def run_monte_carlo(best_params: dict, df, sym_config, n_simulations, window_pct
     best_config = BacktestConfig(
         symbol=sym_config.symbol,
         initial_quantity=sym_config.initial_quantity,
-        leverage=sym_config.leverage,  # 槓桿使用原始設定
+        leverage=sym_config.assumed_leverage,  # 槓桿使用原始設定
         take_profit_spacing=best_params.get("take_profit_spacing", sym_config.take_profit_spacing),
         grid_spacing=best_params.get("grid_spacing", sym_config.grid_spacing),
         limit_multiplier=limit_mult,

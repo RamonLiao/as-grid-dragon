@@ -143,7 +143,7 @@ class BacktestManager:
             take_profit_spacing=config.take_profit_spacing,
             grid_spacing=config.grid_spacing,
             initial_quantity=config.initial_quantity,
-            leverage=config.leverage,
+            leverage=config.assumed_leverage,
             limit_multiplier=config.limit_multiplier,
             threshold_multiplier=config.threshold_multiplier,
             direction=getattr(config, "direction", "both"),
@@ -170,7 +170,7 @@ class BacktestManager:
                 take_profit_spacing=tp,
                 grid_spacing=gs,
                 initial_quantity=config.initial_quantity,
-                leverage=config.leverage
+                assumed_leverage=config.assumed_leverage
             )
 
             result = self.run_backtest(test_config, df)

@@ -36,7 +36,7 @@ def _make_config(**overrides):
         take_profit_spacing=0.004,
         grid_spacing=0.006,
         initial_quantity=3,
-        leverage=20,
+        assumed_leverage=20,
     )
     kwargs.update(overrides)
     return SymbolConfig(**kwargs)

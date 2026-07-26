@@ -21,11 +21,11 @@ def test_save_preserves_unknown_and_atomic(tmp_path, monkeypatch):
     monkeypatch.setattr("grid_engine.config.CONFIG_FILE", cfg)
 
     config = GlobalConfig.load()               # 讀 CONFIG_FILE(=tmp)
-    config.symbols["XRP/USDC:USDC"].leverage = 25
+    config.symbols["XRP/USDC:USDC"].assumed_leverage = 25
     config.save()
 
     raw = json.loads(cfg.read_text())
-    assert raw["symbols"]["XRP/USDC:USDC"]["leverage"] == 25           # 編輯生效
+    assert raw["symbols"]["XRP/USDC:USDC"]["assumed_leverage"] == 25   # 編輯生效
     assert raw["symbols"]["XRP/USDC:USDC"]["trading_mode"] == "swing"   # 未知欄位保留
     assert raw["exchange_type"] == "binance"                            # top-level 保留
     assert list(tmp_path.glob("trading_config_max.json.tmp*")) == []    # 無 tmp 殘留
