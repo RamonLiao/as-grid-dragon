@@ -1,9 +1,11 @@
 # Progress
 
 ## Current Task
-**TODO 4（`leverage` 假旋鈕修繕）進行中：brainstorming 完成、使用者核可 B+C 路線、spec v2 已寫、quant reviewer 重審中。**
-spec：`docs/superpowers/specs/2026-07-26-leverage-false-knob-design.md`（權威）+ `tasks/spec.md`（摘要）。
-TODO 1b 出場路線仍待使用者裁決。
+**TODO 4a 收官（2026-07-26）：`leverage` → `assumed_leverage` 改名 + 舊 key 清除。dual-review `Ship as-is`、verifier ACCEPT 8/8、546 passed。生產 config 已遷移成 `assumed_leverage: 5`。**
+剩 TODO 4b（讀交易所實測槓桿）開放；TODO 1b 出場路線仍待使用者裁決。
+
+⚠️ **引擎於 2026-07-26 停機做 config 遷移**。重啟時務必在 `feat/leverage-rename`（或已 merge 的 main）上——
+切回舊碼啟動會把 `leverage: 20` 寫回，變成新舊雙 key 並存（正是本次要消滅的狀態）。
 
 ### ⚠️ 生產現況已變（2026-07-26 read-only 實測，現價 571.23）——與 07-15 記錄有實質落差
 | | 07-15 記錄 | **07-26 實測** |
@@ -37,11 +39,24 @@ TODO 1b 出場路線仍待使用者裁決。
 1b. **【使用者裁決，最高優先的開放決策】-68 uPnL 出場路線**：(a) 接受凍結等價回 690 平多；(b) 定點認賠收斂；(c) 入金補中性後長期持有；(d) 深究 factor 0.8 regime（需新一輪預註冊驗證：完整 sensitivity curve + holdout 05-01~06-05 仍未開封可用，multiple-testing 代價高，不急）。裁決依據全在 `tasks/requote-experiment-results.md`。
 2. **入金 ~25 補滿 delta +0.24 → 完全中性**（使用者決定時機；5x 下補滿需錢包 ≥207；與 1b(c) 合流）
 3. **symbols-set 併發 race**（#10-A 衍生）：修法傾向砍終端 config 選單（單一 writer 根治）
-4. **【進行中】`config.leverage` 假旋鈕修繕**——走 **B+C**（B=讀交易所實測值校準；C=改名 `assumed_leverage`）。方案 A（set_leverage 寫入）使用者裁決不做。
-   - **實測關鍵事實**：ccxt 4.5.32 `fetch_positions` 預設走 V3 positionRisk，**不回 `leverage`**；須 `params={'useV2': True}` 才有（實測 5.0）。使用者裁決走**獨立低頻 V2 呼叫**，實盤 `_sync_positions` 路徑不動。
-   - **實測關鍵事實 2**：`config_io.merge_preserve:52-53` 只 update 不刪 key → 改名若不加 `drop_symbol_keys`，舊 `leverage` 會永久殘留成**第二個假旋鈕**。
-   - **衍生待辦（重要）**：#14 的 mult=40 上線決策，其回測槓桿假設不可考（主力 script 在 session scratchpad，repo 內不存在；同期 `cost_sensitivity.py:122` 預設 20x）。**mult=40 未經 5x 複核，而該決策核心正是保證金與裝死邊界。** 不得再宣稱它安全。requote 實驗則已核實用 5x（`calibration_gate.py:38`）乾淨。
-   - v1 spec 被 quant reviewer 判 Reject（2 blockers 我親自複驗全部成立）；v2 已修訂重審中。
+4a. ~~`leverage` → `assumed_leverage` 改名與舊 key 清除~~ **完成（2026-07-26，branch `feat/leverage-rename`，11 commits，546 passed / 1 skipped）**
+   - **spec/plan**：`docs/superpowers/specs/2026-07-26-leverage-rename-design.md` + `docs/superpowers/plans/2026-07-26-leverage-rename.md`
+   - **原合併 spec（B+C）連兩輪被 quant reviewer 判 Reject**，兩次 blocker 同形態——斷言接線存在而未查證（v1 交易所邊界、v2 行程邊界）。依 R4 拆為 4a（純改名）與 4b（讀實測值）。
+   - **生產 config 已遷移**（引擎停機窗口、走 `config_io` flock+原子寫）：四個 symbol 的 `leverage: 20` → `assumed_leverage: 5`（使用者裁決用交易所實測值）。遞迴比對零其他差異、憑證完整。備份 `config/trading_config_max.json.bak-pre-leverage-rename-20260726`。副產品：`requote_threshold_factor: 0.5` 由隱含預設變成明寫（行為不變）。
+   - **⚠️ 遷移的後果**：所有遷移前的回測結果**不可再與遷移後直接比較**——保證金與強平模型的輸入從 20x 變成 5x。
+   - **⚠️ 「行為零變更」只適用 rename 機制**，不適用整條 branch：另有兩處刻意變更——UI clamp `max_value` 15→125（舊值小於生產值 20，打開頁3 或從頁2 送出就把槓桿靜默降級成 15，是既有 bug）、以及上述生產值 20→5。
+   - **review 全程**：3 個 task review → whole-branch review（opus，Ready to merge + 2 必修）→ security-review（零 findings）→ dual-review Round 1 外部輪（Fix required 2 Important → 修 → **Ship as-is**）+ Round 2 專案規則 → verifier **ACCEPT 8/8**（含 Monkey Testing 專門回合）。
+   - **verifier 最有價值的發現**：13 條自選 mutation **存活 3 條**——三個映射點改成硬編碼常數，543 條測試全綠。根因是 `tests/web/test_backtest_service.py` fixture 用 `assumed_leverage=20` = dataclass 預設值 ⇒ 斷言是套套邏輯，**這條 branch 的核心主張自己沒有守衛**。已補守衛（測試值 7，同時 ≠ 預設 20 且 ≠ 生產值 5）。lesson 已記。
+4b. **【開放】讀交易所實測槓桿**（原 B 路線，範圍縮到引擎行程內）
+   - **實測事實**：ccxt 4.5.32 `fetch_positions` 預設走 V3 positionRisk，**不回 `leverage`**；須 `params={'useV2': True}` 才有（實測 5.0，marginMode=**cross**）。
+   - **範圍限制（v2 review 抓到）**：web 是獨立行程、只讀落地檔，**拿不到引擎記憶體的實測值** ⇒ web 端須明確承認無實測來源、一律 explicit。
+   - **注意**：`grid_engine/rest_gateway.py` 只有單 worker executor，**無重試、無斷路器**——別再假設它有。
+4c. **backlog（本次挖出，皆未做）**
+   - **`trading_mode` 是與 `leverage` 完全同構的假旋鈕**：生產 config 有、`grid_engine/` 零 reader、唯一實效是頁3 拿它當回測優化器 param-bounds 預設（`web/pages/3:1155` → `backtest/smart_optimizer.py:261`）。位置更誤導——它在頁2 與真旋鈕並列，help 說「不同模式適合不同的持倉週期」。
+   - **`assumed_leverage` 零值域驗證**：填 `-5` 回測會跑完 113 筆交易吐出 **+0.155% 正報酬**（保證金數學全錯但不報錯）；`0` 觸發 divide-by-zero warning 後靜默回 0 筆；`nan`/`inf` 會寫出非嚴格 JSON。既有問題，但 UI 上限 15→125 放寬後可及範圍變大。`grid_engine/config.py:17` 已有 `_norm_requote_factor` 先例可照抄。
+   - **`backtest/optimizer.py:55` 仍把 `leverage` 當可搜尋參數**（`[5,10,15,20,25,30]`）——與「槓桿不由 repo 決定」的原則直接衝突，且會系統性挑到高槓桿（收益放大、強平模型又用同一個假槓桿）。`backtest/smart_optimizer.py:228` 已寫死 20，兩處作法不一致。
+   - `grid_engine/config.py:166` `legacy_api_detected` 死欄位；`scripts/compare_backtest_engines.py:50` 仍 import 已刪的 `core.backtest`。
+   - **衍生待辦（重要，非本次範圍）**：#14 的 `mult=40` 上線決策，其回測槓桿假設**不可考**（主力 script 在 session scratchpad、repo 內不存在；同期 `cost_sensitivity.py:122` 預設 20x）。**mult=40 未經 5x 複核，而該決策核心正是保證金與裝死邊界。** 不得再宣稱它安全。requote 實驗則已核實用 5x（`calibration_gate.py:38`）乾淨。
 5. trading_mode 收編 engine schema（等 #4 驗收後）；頁3 clamp 寫回 session 全站排查
 6. GCE 部署三件套（VM/setup script/IP 白名單）——部署後 replay 驗收要在 GCE 重跑一次
 7. ~~file logger 修繕~~ **全部完成並 commit（`f64ae2f`，2026-07-12 20:05 重啟驗收過）**：新 log 每行帶時間戳、引擎雙側掛單正常；202MB 舊檔已歸檔為 `log/as_terminal_max.log.archive-20260712`（gitignored，含觀察期首日與歷史 -2019/斷路記錄）。main 已與 origin 同步。
