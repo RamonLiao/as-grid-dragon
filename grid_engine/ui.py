@@ -14,6 +14,21 @@ from .config import GlobalConfig
 from .state import GlobalState
 
 
+def position_status_labels(long_position, short_position, position_limit, position_threshold):
+    """面板狀態標籤。`×2` 的判定必須與 decision.tp_quantity 一致：
+    加倍只給淨曝險側（`my > opposite`，嚴格大於）。裝死判定只看自己這側。"""
+    labels = []
+    if long_position > position_threshold:
+        labels.append("[red bold]多裝死[/]")
+    elif long_position > position_limit and long_position > short_position:
+        labels.append("[yellow]多×2[/]")
+    if short_position > position_threshold:
+        labels.append("[red bold]空裝死[/]")
+    elif short_position > position_limit and short_position > long_position:
+        labels.append("[yellow]空×2[/]")
+    return labels
+
+
 class TerminalUI:
     def __init__(self, config: GlobalConfig, state: GlobalState, bot: 'MaxGridBot' = None):
         self.config = config
@@ -122,15 +137,10 @@ class TerminalUI:
             pnl_style = "green" if pnl >= 0 else "red"
             pnl_sign = "+" if pnl >= 0 else ""
 
-            status_parts = []
-            if sym_state.long_position > sym_config.position_threshold:
-                status_parts.append("[red bold]多裝死[/]")
-            elif sym_state.long_position > sym_config.position_limit:
-                status_parts.append("[yellow]多×2[/]")
-            if sym_state.short_position > sym_config.position_threshold:
-                status_parts.append("[red bold]空裝死[/]")
-            elif sym_state.short_position > sym_config.position_limit:
-                status_parts.append("[yellow]空×2[/]")
+            status_parts = position_status_labels(
+                sym_state.long_position, sym_state.short_position,
+                sym_config.position_limit, sym_config.position_threshold,
+            )
 
             if not status_parts:
                 long_pct = (sym_state.long_position / sym_config.position_limit * 100) if sym_config.position_limit > 0 else 0
