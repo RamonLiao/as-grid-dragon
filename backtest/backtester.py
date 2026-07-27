@@ -81,8 +81,7 @@ def _legacy_grid_decision(price, my_position, opposite_position, cfg, side, base
     回傳與舊 get_grid_decision 相容的 dict。此路徑僅 initial_quantity<=0 時觸發（deprecated）。
     注意：dead_mode 自訂 fallback 比例不在此重現（config 預設 1.05/0.95 與純層常數一致）。"""
     dead = getattr(cfg, 'dead_mode_enabled', True) and is_dead_mode(my_position, cfg.position_threshold)
-    tp_qty = tp_quantity(base_qty, my_position, opposite_position,
-                         cfg.position_limit, cfg.position_threshold)
+    tp_qty = tp_quantity(base_qty, my_position, opposite_position, cfg.position_limit)
     if dead:
         tp_price = dead_mode_price(price, my_position, opposite_position, side)
         return {"dead_mode": True, "tp_price": tp_price, "entry_price": None, "tp_qty": tp_qty}

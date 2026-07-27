@@ -23,10 +23,39 @@ def test_grid_prices_long_short():
     assert d.grid_prices(2.5, 0.004, 0.006, "short") == pytest.approx((2.49, 2.515))
 
 
-def test_tp_quantity_doubles_over_limit():
-    assert d.tp_quantity(3, 20, 0, 15, 60) == 6      # my>limit
-    assert d.tp_quantity(3, 10, 60, 15, 60) == 6     # opp>=threshold
-    assert d.tp_quantity(3, 10, 0, 15, 60) == 3      # 不加倍
+def test_tp_quantity_doubles_only_for_the_net_exposure_side():
+    """止盈量加倍只給「淨曝險方向」那側（spec §3.1）。
+
+    對沖側（較小側）維持 1×，否則 0.02進/0.04出 的不對稱會系統性拆掉人工建立的
+    對沖（2026-07-26 實盤 11 天實證：空頭 0.36→0.20）。
+    """
+    # my > limit 且 my > opposite → 加倍
+    assert d.tp_quantity(3, 20, 10, 15) == 6
+    assert d.tp_quantity(3, 20, 0, 15) == 6
+
+    # my > limit 但 my <= opposite（我是對沖側）→ 不加倍
+    assert d.tp_quantity(3, 20, 20, 15) == 3, "兩側相等時不得加倍（嚴格大於）"
+    assert d.tp_quantity(3, 20, 30, 15) == 3, "我是較小側 → 不得加倍（否則拆對沖）"
+
+    # my <= limit → 不加倍（無論對手側多大）
+    assert d.tp_quantity(3, 15, 0, 15) == 3, "position_limit 是嚴格大於"
+    assert d.tp_quantity(3, 10, 0, 15) == 3
+
+    # spec §4 向量 3：裝死側反而是較小側（對手更大）→ 新規則不加倍。
+    # 這是**刻意的行為變更**（裝死出清變慢）；舊規則會因 my>limit 而加倍。
+    assert d.tp_quantity(3, 61, 70, 15) == 3, (
+        "裝死側若同時是較小側，止盈量不再加倍——刻意的行為變更（spec §4 向量 3）"
+    )
+
+
+def test_tp_quantity_no_longer_doubles_on_large_opposite():
+    """已刪除 `or opposite_position >= position_threshold` 子條件（spec §1）。
+
+    該子條件唯一可達且有效的情形是「我不是淨曝險側時仍加倍我」= 最大化拆對沖；
+    全量 logs/decisions.jsonl（99,270 筆）實測 98,399 筆屬此類。
+    """
+    # 舊規則會因 opposite=60 >= threshold=60 而回 6；新規則不看對手側是否超門檻
+    assert d.tp_quantity(3, 10, 60, 15) == 3
 
 
 def test_glft_quantity_disabled_passthrough():

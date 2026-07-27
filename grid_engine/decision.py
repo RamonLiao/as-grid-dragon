@@ -94,8 +94,15 @@ def grid_prices(base_price, take_profit_spacing, grid_spacing, side):
     return base_price * (1 - take_profit_spacing), base_price * (1 + grid_spacing)
 
 
-def tp_quantity(base_qty, my_position, opposite_position, position_limit, position_threshold):
-    if my_position > position_limit or opposite_position >= position_threshold:
+def tp_quantity(base_qty, my_position, opposite_position, position_limit):
+    """止盈量加倍只給「淨曝險方向」那側。
+
+    對沖側（較小側）維持 1× ⇒ 進出對稱、消耗速度減半（不是免疫，見 spec §2）。
+    原 `or opposite_position >= position_threshold` 已**刻意刪除**：它唯一可達且有效
+    的情形是「我不是淨曝險側時仍加倍我」= 最大化拆對沖（2026-07-26 全量 log 實測
+    98,399 筆屬此類）。行為變更的完整 diff 分類見 spec §5.1。
+    """
+    if my_position > position_limit and my_position > opposite_position:
         return base_qty * 2
     return base_qty
 
@@ -132,7 +139,7 @@ def compute_quantity(inputs, side, is_take_profit):
     opp_pos = inputs.short_position if side == "long" else inputs.long_position
     q = inputs.initial_quantity
     if is_take_profit:
-        q = tp_quantity(q, my_pos, opp_pos, inputs.position_limit, inputs.position_threshold)
+        q = tp_quantity(q, my_pos, opp_pos, inputs.position_limit)
     else:
         q = glft_quantity(q, side, inputs.long_position, inputs.short_position,
                           inputs.glft_enabled, inputs.gamma)
