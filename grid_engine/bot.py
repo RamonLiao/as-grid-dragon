@@ -258,18 +258,10 @@ class MaxGridBot:
         max_cfg = self.config.max_enhancement
         base_qty = sym_config.initial_quantity
 
-        if is_take_profit:
-            if side == 'long':
-                if sym_state.long_position > sym_config.position_limit:
-                    base_qty *= 2
-                elif sym_state.short_position >= sym_config.position_threshold:
-                    base_qty *= 2
-            else:
-                if sym_state.short_position > sym_config.position_limit:
-                    base_qty *= 2
-                elif sym_state.long_position >= sym_config.position_threshold:
-                    base_qty *= 2
-
+        # 止盈量加倍已統一由 grid_engine.decision.tp_quantity() 負責（decide() 路徑）。
+        # 這裡原有一份同義拷貝，但兩個呼叫點（:401/:415）都傳 is_take_profit=False
+        # 且只在 position == 0 的開倉引導路徑 → 該分支是死碼，已刪。
+        # is_take_profit 參數保留：呼叫端仍顯式傳 False，且 GLFT 調整只作用於非止盈量。
         if not is_take_profit:
             base_qty = self.glft_controller.adjust_order_quantity(
                 base_qty, side,
