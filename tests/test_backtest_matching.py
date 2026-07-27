@@ -144,14 +144,19 @@ def test_long_entry_does_not_fill_when_low_never_reaches_limit():
 
 # ── 回歸：止盈不得平掉本根才剛開的倉（reduce_only 語意） ────────────────
 
-def _both_side_doubling_cfg(**kw):
-    """direction=both 讓對手側持倉可以累積；threshold_multiplier=1.0 讓
-    position_threshold == initial_quantity，一次進場成交即可觸發
-    grid_engine.decision.tp_quantity() 的止盈加倍（opposite_position >= threshold，
-    不看自己這一側持倉）。limit_multiplier 拉大到不可能觸發的量級，
-    確保加倍只由 opposite_position 這條路徑觸發，排除另一條 my_position>limit 路徑。"""
-    return _zero_cost_cfg(direction="both", threshold_multiplier=1.0,
-                          limit_multiplier=100.0, **kw)
+def _net_exposure_doubling_cfg(**kw):
+    """讓止盈加倍在「加倍只給淨曝險側」規則下仍然觸發，以便行使 reduce_only clamp。
+
+    _zero_cost_cfg 預設 direction="long" ⇒ short_position 恆為 0 ⇒ `my > opposite`
+    必然成立。limit_multiplier=0.5 給出 position_limit = 1.0*0.5 = 0.5 < 1.0，
+    所以一次進場成交（qty=1.0）後 `my > limit` 也成立 → tp qty = 2.0。
+    threshold_multiplier=100 讓 position_threshold=100，is_dead_mode(1.0, 100)=False，
+    裝死分支不介入。
+
+    注意：舊版 fixture 靠已刪除的 `opposite >= threshold` 子條件觸發加倍，改動後會
+    靜默變成永綠空殼（tp qty 1.0 使 clamp 成為 no-op，而斷言值恰好不變）。
+    """
+    return _zero_cost_cfg(limit_multiplier=0.5, threshold_multiplier=100.0, **kw)
 
 
 def test_tp_fill_cannot_close_more_than_the_position_that_existed_before_this_bars_entry():
@@ -162,40 +167,38 @@ def test_tp_fill_cannot_close_more_than_the_position_that_existed_before_this_ba
     這張倉在止盈單成交的當下根本還不存在，回測卻樂觀地把它記為獲利了結。
 
     構造：
-      bar1 close=100 → 掛 long entry@99.4(=100*0.994)、short entry@100.6(=100*1.006)，qty=1.0。
-      bar2 (low=99, high=101) 讓 long/short 的 entry 同時成交 → long_position=short_position=1.0，
-        觸及 position_threshold(=initial_quantity*1.0=1.0，opposite_position>=threshold 用 >=)，
-        於是 decide() 為兩側都掛出加倍止盈單：long tp@100.4(=100*1.004) qty=2.0、
-        short tp@99.6(=100*0.996) qty=2.0（連同新的 entry@99.4/100.6 qty=1.0 一併掛出）。
-      bar3 (low=99, high=101) 同時穿越四個掛單：long/short 的 entry 與 tp 全部觸及。
-        entry 先結算 → long/short 持倉各變成 2.0（bar2 那 1.0 + bar3 新開的 1.0）。
-        止盈量 2.0 > 「entry 結算前」的持倉 1.0（bar2 那筆）。
+      bar1 close=100 → 掛 long entry@99.4(=100*0.994)，qty=1.0（direction="long"，無 short 側）。
+      bar2 (low=99, high=101) → long entry 成交 @99.4，long_position=1.0。
+        重決策：m=1.0 > position_limit=0.5 且 m > opposite=0 → tp qty 加倍為 2.0 @100.4。
+      bar3 (low=99, high=101) 同時穿越 entry@99.4 與 tp@100.4。
+        entry 先結算 → long=2.0（bar2 那 1.0 + bar3 新開的 1.0）。
+        止盈量 2.0 > 「entry 結算前」的持倉 1.0（bar2 那筆）→ clamp 被行使。
 
     期望（clamp 到 prior_qty）：止盈只平掉 bar2 那筆（entry 結算前已存在的倉），
     bar3 新開的倉留著、算進 unrealized：
-      trades_count == 2（long 1 筆 + short 1 筆，各平 1.0）
-      realized_pnl == (100.4-99.4)*1.0 + (100.6-99.6)*1.0 == 2.0
-      unrealized_pnl == (100-99.4)*1.0 + (100.6-100)*1.0 == 1.2（final close=100，bar3 新倉各 1.0）
+      trades_count == 1（long 1 筆，平 1.0）
+      realized_pnl == (100.4 − 99.4) × 1.0 == 1.0
+      unrealized_pnl == 0.6（final close=100，剩 1 手 @99.4）
 
     修法前（bug）：止盈量 2.0 用 FIFO 吃光兩筆倉位（bar2 舊倉 + bar3 新倉），
-    trades_count == 4、realized_pnl == 4.0、unrealized_pnl == 0.0 —— 把還不存在的倉記成獲利。
+    trades_count == 2、realized_pnl == 2.0、unrealized_pnl == 0.0 —— 把還不存在的倉記成獲利。
     """
     df = _ohlc_df([
-        (100.0, 100.0, 100.0, 100.0),   # bar1: 建立初始掛單（entry@99.4 / 100.6）
-        (100.0, 101.0,  99.0, 100.0),   # bar2: entry 雙邊成交 → 觸發加倍止盈
-        (100.0, 101.0,  99.0, 100.0),   # bar3: entry 與 tp 同根雙觸發（本測試核心場景）
+        (100.0, 100.0, 100.0, 100.0),   # bar1: 建立初始掛單（entry@99.4）
+        (100.0, 101.0,  99.0, 100.0),   # bar2: entry 成交 → 觸發加倍止盈
+        (100.0, 101.0,  99.0, 100.0),   # bar3: entry 與 tp 同根同觸發（本測試核心場景）
     ])
-    res = GridBacktester(df, _both_side_doubling_cfg()).run()
+    res = GridBacktester(df, _net_exposure_doubling_cfg()).run()
 
-    assert res.trades_count == 2, (
-        f"trades_count={res.trades_count}：若為 4，代表止盈把 bar3 剛開的倉也平掉了"
+    assert res.trades_count == 1, (
+        f"trades_count={res.trades_count}：若為 2，代表止盈把 bar3 剛開的倉也平掉了"
         "（reduce_only 不可能平未來才存在的倉）"
     )
-    assert res.realized_pnl == pytest.approx(2.0, abs=1e-6), (
-        f"realized_pnl={res.realized_pnl}：若為 4.0，代表 bar3 新倉被錯誤地計入已實現獲利"
+    assert res.realized_pnl == pytest.approx(1.0, abs=1e-6), (
+        f"realized_pnl={res.realized_pnl}：若為 2.0，代表 bar3 新倉被錯誤地計入已實現獲利"
     )
-    assert res.unrealized_pnl == pytest.approx(1.2, abs=1e-6), (
-        f"unrealized_pnl={res.unrealized_pnl}：bar3 新開的 long/short 倉應仍持有中"
+    assert res.unrealized_pnl == pytest.approx(0.6, abs=1e-6), (
+        f"unrealized_pnl={res.unrealized_pnl}：若為 0.0，代表 bar3 新倉已被平掉"
     )
 
 
