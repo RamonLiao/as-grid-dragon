@@ -28,9 +28,16 @@ def test_below_limit_gets_no_label():
 
 
 def test_dead_mode_label_takes_precedence_and_ignores_opposite():
-    # 裝死是「我的持倉超過 threshold」，與對手側無關 → 不加淨曝險條件
-    assert position_status_labels(0.9, 0.7, LIMIT, THRESHOLD) == ["[red bold]多裝死[/]"]
-    assert position_status_labels(0.9, 0.7, LIMIT, THRESHOLD) != ["[yellow]多×2[/]"]
+    """裝死判定只看自己這側，與對手側大小無關。
+
+    long=0.9 是**較小**側（short=1.0 更大），但它 > threshold 0.8 ⇒ 仍須標裝死。
+    若有人錯誤地把裝死判定也加上淨曝險條件，多頭的標籤會消失 ⇒ 本測試會紅。
+    （註：以 LIMIT=0.1 / THRESHOLD=0.8 而言，「對手側較大但未裝死」數學上不可能——
+    short > long = 0.9 > 0.8 ⇒ short 必然也超過 threshold，故兩側皆裝死是正解。）
+    """
+    assert position_status_labels(0.9, 1.0, LIMIT, THRESHOLD) == [
+        "[red bold]多裝死[/]", "[red bold]空裝死[/]",
+    ]
 
 
 def test_both_sides_dead_mode():
