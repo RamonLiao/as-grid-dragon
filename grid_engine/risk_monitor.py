@@ -76,15 +76,26 @@ class RiskMonitor:
             return
 
         if sym_state.long_position >= local_threshold and sym_state.short_position >= local_threshold:
-            logger.info(f"[風控] {sym_config.symbol} 多空持倉均超過 {local_threshold}，開始雙向減倉")
+            # 大側多減 min(reduce_qty, gap)：讓「|delta| 永不增加、永不變號」成為
+            # 不變式而非案例分析（spec §3.2）。夾到 gap 也順帶消掉浮點相等比較——
+            # gap == 0 時 extra == 0，自動退回雙側等量減倉（= 舊行為）。
+            gap = abs(sym_state.long_position - sym_state.short_position)
+            extra = min(reduce_qty, gap)
+            long_qty = reduce_qty + (extra if sym_state.long_position > sym_state.short_position else 0.0)
+            short_qty = reduce_qty + (extra if sym_state.short_position > sym_state.long_position else 0.0)
+
+            logger.info(
+                f"[風控] {sym_config.symbol} 多空持倉均超過 {local_threshold}，開始雙向減倉"
+                f"（多 {long_qty} / 空 {short_qty}，gap={gap}）"
+            )
 
             if sym_state.long_position > 0:
-                await self.order_executor.place_order(ccxt_symbol, 'sell', 0, reduce_qty, True, 'long', 'market')
-                logger.info(f"[風控] {sym_config.symbol} 市價平多 {reduce_qty}")
+                await self.order_executor.place_order(ccxt_symbol, 'sell', 0, long_qty, True, 'long', 'market')
+                logger.info(f"[風控] {sym_config.symbol} 市價平多 {long_qty}")
 
             if sym_state.short_position > 0:
-                await self.order_executor.place_order(ccxt_symbol, 'buy', 0, reduce_qty, True, 'short', 'market')
-                logger.info(f"[風控] {sym_config.symbol} 市價平空 {reduce_qty}")
+                await self.order_executor.place_order(ccxt_symbol, 'buy', 0, short_qty, True, 'short', 'market')
+                logger.info(f"[風控] {sym_config.symbol} 市價平空 {short_qty}")
 
             self.state.last_reduce_time[ccxt_symbol] = time.time()
 
