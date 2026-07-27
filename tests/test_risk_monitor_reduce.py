@@ -1,8 +1,14 @@
 """雙向減倉的三條不變式（spec §3.2）。
 
 斷言不變式而非逐案例列舉——v2 的「大側固定 2×」在 gap < reduce_qty/2 時會把
-|delta| 推大（反例 0.66/0.64：0.02 → 0.06），而觸發後雙側都掉到門檻以下、
+|delta| 推大（反例 0.68/0.66：0.02 → 0.06），而觸發後雙側都掉到門檻以下、
 沒有下一輪可以修正。
+
+⚠️ 三條不變式成立於量化前；`place_order` 的 round/min_amount 之後，實際下單量的
+|delta| 最壞可差一個 amount tick。本檔不覆蓋量化路徑。
+
+⚠️ 本觸發路徑在現行資本下不可達（雙側同時 ≥0.64 所需保證金遠超可用餘額）⇒
+本檔是 regression guard，不是 live fix 的證據。
 """
 import asyncio
 
@@ -37,8 +43,8 @@ def _run(long_pos, short_pos):
     cfg = SymbolConfig(symbol="BNBUSDC", ccxt_symbol="BNB/USDC:USDC",
                        initial_quantity=0.02, threshold_multiplier=40.0)
     assert cfg.position_threshold == pytest.approx(0.8)
-    reduce_qty = cfg.position_threshold * 0.1          # 0.08
-    local_threshold = cfg.position_threshold * 0.8     # 0.64
+    reduce_qty = cfg.position_threshold * 0.1
+    local_threshold = cfg.position_threshold * 0.8
     assert long_pos >= local_threshold and short_pos >= local_threshold, "測試狀態必須能觸發"
 
     state = GlobalState()
@@ -87,6 +93,23 @@ def test_gross_strictly_decreases(long_pos, short_pos):
     assert cut_long + cut_short > 0
 
 
+@pytest.mark.parametrize("long_pos,short_pos", [
+    (0.68, 0.66), (0.72, 0.66), (0.82, 0.66), (0.66, 0.82),
+])
+def test_reduce_strictly_converges_when_gap_is_nonzero(long_pos, short_pos):
+    """gap > 0 時必須嚴格收斂——這是本改動的核心賣點，需要一條非套套邏輯的守衛。
+
+    test_gross_strictly_decreases 是把實作公式抄一遍，只能防回歸；本條用「收斂」
+    這個獨立敘述表達，能殺掉 extra=0（退回等量減倉）與 extra=gap/2（收斂不足）等所有 mutation。
+    """
+    cut_long, cut_short, _ = _run(long_pos, short_pos)
+    old_delta = long_pos - short_pos
+    new_delta = (long_pos - cut_long) - (short_pos - cut_short)
+    assert abs(new_delta) < abs(old_delta) - 1e-12, (
+        f"gap>0 卻沒有嚴格收斂：|{old_delta:+.6f}| → |{new_delta:+.6f}|"
+    )
+
+
 def test_equal_sides_fall_back_to_symmetric_reduction():
     cut_long, cut_short, reduce_qty = _run(0.66, 0.66)
     assert cut_long == pytest.approx(reduce_qty)
@@ -101,3 +124,40 @@ def test_no_order_when_below_local_threshold():
     rm = RiskMonitor(config=None, state=GlobalState(), order_executor=ex, notifier=None)
     asyncio.run(rm.check_and_reduce_positions(cfg, sym_state))
     assert ex.orders == [], "生產現況（0.60/0.20）不該觸發雙向減倉"
+
+
+def test_no_order_when_only_one_side_exceeds_threshold():
+    """觸發條件是 and 不是 or：單側過大不是「雙向對沖過大」，不得減倉。
+
+    若誤寫成 or，long=0.70/short=0.60 會觸發並送出一張 sell 2×reduce_qty 的市價單，
+    把單側倉位當成對沖來砍。
+    """
+    cfg = SymbolConfig(symbol="BNBUSDC", ccxt_symbol="BNB/USDC:USDC",
+                       initial_quantity=0.02, threshold_multiplier=40.0)
+    sym_state = SymbolState(symbol="BNBUSDC", long_position=0.70, short_position=0.60)
+    ex = _RecordingExecutor()
+    rm = RiskMonitor(config=None, state=GlobalState(), order_executor=ex, notifier=None)
+    asyncio.run(rm.check_and_reduce_positions(cfg, sym_state))
+    assert ex.orders == [], "單側超過門檻不得觸發雙向減倉（and 不是 or）"
+
+
+def test_reduce_records_cooldown_timestamp_and_second_call_is_throttled():
+    """last_reduce_time 是唯一的節流，而 bot.py 每個 ticker tick 都會呼叫。
+
+    少了它，60s 內的每一次 tick 都會再送兩張市價單——風險是 gross 被重複削減、
+    繞過節流（delta 不會失控：min(reduce_qty, gap) 的夾制保證收斂到 0 不會越過）。
+    """
+    cfg = SymbolConfig(symbol="BNBUSDC", ccxt_symbol="BNB/USDC:USDC",
+                       initial_quantity=0.02, threshold_multiplier=40.0)
+    state = GlobalState()
+    sym_state = SymbolState(symbol="BNBUSDC", long_position=0.82, short_position=0.66)
+    ex = _RecordingExecutor()
+    rm = RiskMonitor(config=None, state=state, order_executor=ex, notifier=None)
+
+    asyncio.run(rm.check_and_reduce_positions(cfg, sym_state))
+    assert len(ex.orders) == 2, "首次觸發應送出兩張單"
+    assert state.last_reduce_time.get(cfg.ccxt_symbol), "必須寫回 last_reduce_time，否則沒有節流"
+
+    # 立即第二次呼叫：cooldown 內不得再下單（倉位刻意維持在觸發條件之上）
+    asyncio.run(rm.check_and_reduce_positions(cfg, sym_state))
+    assert len(ex.orders) == 2, "cooldown 內不得重複下單"
