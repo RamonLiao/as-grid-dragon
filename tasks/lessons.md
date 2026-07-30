@@ -35,6 +35,8 @@
 - **凡斷言「現況 == 期望」的測試（characterization、contract、keyset、golden file）都不知道現況對不對**：liquidated 從 view dict 漏掉，contract test 反而把缺陷寫成規格；裝死死鎖被 characterization test 忠實搬進新實作。重構落地後要逐條問每個斷言「這行為為什麼是對的」，名字含 `does_nothing`/`no_cancel`/`returns_empty` 的是待質疑訊號。
 - 不變式最好讓它**無法被繞過**（過濾/拋例外/唯一入口），次佳才是「每處記得寫 + 補測試」；罕見觸發的不變式必須有刻意構造觸發條件的測試，否則全綠證明不了任何事。
 - **判準只套在自己剛寫的東西上，是最容易的自我豁免。**每條測試判準都要同時掃既有測試——既有測試不會因為它一直是綠的就變成對的。
+- **測 loop 時，終止條件不得掛在被測行為上——否則 mutation 會 hang 而不是 fail**（2026-07-30 實際踩到）：測 `keep_alive_loop` 失敗後是否重建 listenKey，第一版把 `stop.set()` 放進 mock 的 `acquire_listen_key`；移除重建的 mutation 讓迴圈永遠不終止，測試**卡住兩分鐘被 timeout 殺掉**，而不是紅。更糟的是 kill 掉整個 shell script ⇒ **mutate-and-restore 的 restore 那一步沒執行**，檔案停在 mutated 狀態（通則：`$(mktemp -d)` 備份救了它，但下一次要在 restore 前就假設腳本會被中斷）。
+  - Rule：終止條件掛在**每輪必經、且與被測行為無關**的點（迴圈裡的 `sleep`、輪次計數器），不是掛在「這次要驗的那件事」上。**hang 在 CI 上是 timeout 不是 red，鑑別力等於零**——而且它偽裝成「測試很慢」，比紅燈更難發現。
 
 ## 通則 4：spec 強動詞會在翻譯中磨損成弱動詞，磨損不被測試抓到
 - 「否決/禁止/絕不」經 dispatch prompt 到 code 會退化成「扣分/排序/提醒」，兩份文件各自看都沒錯，損耗在邊界。派工前對照 spec 原文的**動詞**。

@@ -41,17 +41,45 @@ delta 軌跡：`07-26 +0.40` →（重啟）→ `07-28 21:35 +0.52`（下跌段�
 ① 目標 = **delta 主動收斂**（非僅保住對沖）；② 對沖側止盈**減半不加倍**（最小改動，接受下跌段仍外擴）；
 ③ 範圍**含 `risk_monitor`** 雙向減倉改只減大側；④ 上線門檻 = 單測 + replay 結構化 diff + tick_sim 新舊對照。
 
-### 下一步（依 plan Task 8 Step 6，**不要自行 merge**）
-1. `security-review` skill（改真錢下單行為，命中 Red Team Protocol）
-2. `dual-review` Round 1 外部輪（fresh-context，**不給 spec 與任何自述**）+ Round 2 專案規則
-3. fresh-context `verifier`（read-back + 實跑 + 獨立 mutation + Monkey Testing 專門回合）
-4. ⚠️ 上述任一輪若判定該回滾，**回滾等於重啟生產**，不是單純不 merge
+### review 三件套：全部完成（2026-07-30）
+1. **`security-review`：零 findings**。兩個特別點名的風險逐一排除——`tp_quantity` 簽名改動後只有
+   兩個 caller 且都已更新（少參數會直接 `TypeError`，不存在靜默傳錯值）；不對稱減倉的量恆在
+   `[reduce_qty, 2×reduce_qty]`，負值/零/NaN 不可達，兩筆都保留 `reduce_only=True`。
+   附帶非安全備註：**大側最壞單次市價單量由 1× 變 2×reduce_qty**（設計如此，但滑價面變大）。
+2. **`dual-review` Round 1 外部輪：`Needs discussion`（零 Critical / 零 Important）**，13/13 mutation 全被殺。
+   它獨立拿 99,560 筆實盤 inputs 逐筆重算：**淨曝險側（多）一筆都沒變，改動 100% 落在對沖側（空）**
+   ——與 A4 從不同角度對上。整合修復見 commit `7f209f7`（非正 threshold 守衛 + 七處誤導文案 + 兩處 docstring）。
+   **外部輪抓到、內部輪沒抓到的**：`ui.py` 那次只修了一處標籤，web 頁1/2/3 與終端還有六處仍宣稱
+   「止盈加倍閾值 = position_limit」（現在只是必要條件）。
+3. **Round 2 專案規則輪**：抓到 **W1(28 筆) / W3(15 筆) 的 round_trips 低於 quant rules 的 30 次門檻**，
+   而 §5.3 裡 gate 失敗的三格全部落在這兩個窗口 ⇒ 雙向失效，A6 的實質證據力集中在 W2 與 full。已入 spec §6。
+4. **`verifier`：ACCEPT 8/9**。唯一 REJECT 是它自己挖到的 M10b——`backtester.py:84` 的
+   `_legacy_grid_decision` 對 `tp_quantity` 的引數傳遞**零測試覆蓋**（把 `opposite_position` 換成
+   `my_position`，571 條測試零反應）。**已補**（commit `9aa13cc`，三條 mutation 各紅一次）。
+   ⚠️ 補完後**未再派 verifier 複驗**，是我自己跑它給的 mutation 驗證的。
+5. **使用者裁決（2026-07-30）**：接受「gross 實質上限 = 保證金耗盡」，讓現有倉位順著新規則慢慢收斂到 hedge。
+   依據與綁定條件（日後入金接近 146 USDC 時 risk_monitor 會變成活的生產碼）已入 spec §6。
 
-### 🔴 新增缺陷（與 1c 無關，獨立待辦）
-**`listenKey` keepalive 每 30 分鐘失敗一次**：`更新 listenKey 失敗: binance {"code":-1125,
-"msg":"This listenKey does not exist."}`，從 **2026-07-25 21:18** 起持續至今（07-30 08:57 仍在報），
-**跨兩次重啟未消失** ⇒ 既有缺陷，非新 code 引入。倉位仍正常變動 ⇒ 成交推送沒全斷（推測是重連拿了新
-key 但 keepalive 仍打舊 key，**未驗證**），目前靠 10s REST sync 兜底。
+**現況：579 passed / 1 skipped。1c 的 code 與驗收全部完成，未 merge。**
+
+### 🔴 已修（等重啟生效）：`listenKey` 導致 user data stream 至少 18 天完全沒工作
+commit `6a264d6`。**這是獨立缺陷，非 1c 引入**，但與 1c 共用同一個重啟窗口。
+
+**根因**（`grid_engine/ws_client.py`）：`acquire_listen_key()` 只在啟動時呼叫一次，`run()` 重連時沿用舊值。
+WS 斷線後伺服器廢棄該 key，而 **Binance 對無效 stream name 靜默接受**（SUBSCRIBE 不回錯、只是永遠
+收不到資料）⇒ userData 永久失效，唯一線索是 keepalive 每 30 分鐘的 `-1125`（從 07-25 21:18 起，跨兩次重啟）。
+
+**硬證據：`log/as_terminal_max.log`（07-12 20:05 起）零筆 `[userData]` 事件**，而同期倉位由
+`0.58/0.34` 走到 `0.42/0.18`、成交上百筆。`bot.py:593` 的 handler 在任何 FILLED 都會 log 一行 ⇒
+**ORDER_TRADE_UPDATE 全程沒被處理**。
+- ⚠️ **`sym_state.total_trades` / `state.total_profit` 恆 0** ⇒ 面板成交次數與 **Telegram 每日摘要的
+  「累計已實現」是假的**（使用者會看到的數字）
+- `bandit` / `leading_indicator` / `dgt` 的 `record_trade` 從未被呼叫（三者皆已關閉，本次無實害）
+- 成交後的即時反應全靠 `sync_service` 的 10s REST 輪詢
+
+**修法**：run() 每次連上後、訂閱前重新 acquire（失敗只降級不連坐 bookTicker）；keep_alive_loop 的
+except 裡立刻重建 key。**已知限制**：重建只讓下次重連生效，當前連線仍訂在舊 key（run() 阻塞在 recv）。
+**未做**：自動重啟、指數退避、userData 靜默失效偵測（範圍控制，等這兩條上線觀察後再說）。
 
 ### 🔴 最高優先（新 session 開場必讀）
 
