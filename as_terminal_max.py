@@ -862,9 +862,9 @@ class MainMenu:
         assumed_leverage = IntPrompt.ask("交易所實際槓桿（不推送交易所，但決定回測保證金/強平計算）", default=5)
 
         console.print(f"\n[dim]持倉控制 (基於每單數量 {quantity} 自動計算)[/]")
-        limit_mult = FloatPrompt.ask("加倍倍數 (幾單後止盈加倍)", default=5.0)
+        limit_mult = FloatPrompt.ask("加倍倍數 (幾單後止盈加倍；另需為淨曝險側)", default=5.0)
         threshold_mult = FloatPrompt.ask("裝死倍數 (幾單後停止補倉)", default=20.0)
-        console.print(f"[dim]→ 止盈加倍閾值: {quantity * limit_mult:.1f}, 裝死閾值: {quantity * threshold_mult:.1f}[/]")
+        console.print(f"[dim]→ 止盈加倍門檻: {quantity * limit_mult:.1f}（另需為淨曝險側）, 裝死閾值: {quantity * threshold_mult:.1f}[/]")
 
         self.config.symbols[raw] = SymbolConfig(
             symbol=raw,
@@ -920,14 +920,14 @@ class MainMenu:
 
         console.print(f"\n[dim]持倉控制 (基於每單數量 {cfg.initial_quantity} 自動計算)[/]")
         cfg.limit_multiplier = FloatPrompt.ask(
-            f"加倍倍數 (幾單後止盈加倍) [當前: {cfg.limit_multiplier}]",
+            f"加倍倍數 (幾單後止盈加倍；另需為淨曝險側) [當前: {cfg.limit_multiplier}]",
             default=cfg.limit_multiplier
         )
         cfg.threshold_multiplier = FloatPrompt.ask(
             f"裝死倍數 (幾單後停止補倉) [當前: {cfg.threshold_multiplier}]",
             default=cfg.threshold_multiplier
         )
-        console.print(f"[dim]→ 止盈加倍閾值: {cfg.position_limit:.1f}, 裝死閾值: {cfg.position_threshold:.1f}[/]")
+        console.print(f"[dim]→ 止盈加倍門檻: {cfg.position_limit:.1f}（另需為淨曝險側）, 裝死閾值: {cfg.position_threshold:.1f}[/]")
 
         self.config.save()
         console.print("[green]已更新[/]")

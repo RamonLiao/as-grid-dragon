@@ -64,7 +64,7 @@ def render_symbols_list():
                 st.write(f"**槓桿（回測假設）:** {cfg.assumed_leverage}x")
 
             with col3:
-                st.write(f"**加倍觸發:** {cfg.position_limit:.1f}")
+                st.write(f"**止盈加倍門檻:** {cfg.position_limit:.1f}（另需為淨曝險側）")
                 st.write(f"**裝死觸發:** {cfg.position_threshold:.1f}")
 
             with col4:
@@ -294,7 +294,7 @@ def render_edit_symbol():
         )
 
         # 顯示計算值
-        st.caption(f"position_limit = {quantity * limit_mult:.1f}")
+        st.caption(f"position_limit = {quantity * limit_mult:.1f}（止盈加倍門檻，另需為淨曝險側）")
         st.caption(f"position_threshold = {quantity * threshold_mult:.1f}")
 
         c1, c2 = st.columns(2)

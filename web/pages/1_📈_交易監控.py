@@ -109,7 +109,7 @@ def render_symbol_config():
         st.write(f"- 槓桿（回測假設，非交易所實際）: {cfg.assumed_leverage}x")
     with col2:
         st.markdown("**倉位控制**")
-        st.write(f"- 加倍止盈觸發: {cfg.position_limit:.1f}")
+        st.write(f"- 止盈加倍門檻: {cfg.position_limit:.1f}（另需為淨曝險側）")
         st.write(f"- 裝死模式觸發: {cfg.position_threshold:.1f}")
         st.write(f"- 加倍倍數: {cfg.limit_multiplier}x")
         st.write(f"- 裝死倍數: {cfg.threshold_multiplier}x")

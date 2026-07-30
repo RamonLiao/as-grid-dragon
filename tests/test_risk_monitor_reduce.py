@@ -161,3 +161,26 @@ def test_reduce_records_cooldown_timestamp_and_second_call_is_throttled():
     # 立即第二次呼叫：cooldown 內不得再下單（倉位刻意維持在觸發條件之上）
     asyncio.run(rm.check_and_reduce_positions(cfg, sym_state))
     assert len(ex.orders) == 2, "cooldown 內不得重複下單"
+
+
+def test_no_order_when_threshold_is_non_positive():
+    """`position_threshold <= 0` 時一張單都不能送（dual-review 外部輪 Nit）。
+
+    threshold 為 0 或負時 local_threshold <= 0 ⇒ 任何非負持倉都滿足觸發條件，
+    而 reduce_qty <= 0 會讓 place_order 收到 0 或負的量——`order_executor` 的
+    precision fallback 是 `min_amount: 1`，等於送出 1 顆 BNB 的市價單（≈570 USDC）。
+    不對稱減倉還會把負值的量放大成 2×，所以守衛必須擋在計算之後、下單之前。
+    """
+    for initial_quantity, threshold_multiplier in ((0.0, 40.0), (0.02, 0.0), (0.02, -40.0)):
+        cfg = SymbolConfig(symbol="BNBUSDC", ccxt_symbol="BNB/USDC:USDC",
+                           initial_quantity=initial_quantity,
+                           threshold_multiplier=threshold_multiplier)
+        assert cfg.position_threshold <= 0, f"前置條件：{initial_quantity}×{threshold_multiplier}"
+
+        # 持倉刻意取非零正值：threshold <= 0 時它必然「超過」門檻，是最容易誤觸的狀態
+        sym_state = SymbolState(symbol="BNBUSDC", long_position=0.42, short_position=0.18)
+        ex = _RecordingExecutor()
+        rm = RiskMonitor(config=None, state=GlobalState(), order_executor=ex, notifier=None)
+        asyncio.run(rm.check_and_reduce_positions(cfg, sym_state))
+        assert ex.orders == [], (
+            f"position_threshold={cfg.position_threshold} 不得送出任何減倉單，實際 {ex.orders}")

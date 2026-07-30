@@ -71,6 +71,13 @@ class RiskMonitor:
         local_threshold = sym_config.position_threshold * 0.8
         reduce_qty = sym_config.position_threshold * 0.1
 
+        # position_threshold <= 0（initial_quantity 或 threshold_multiplier 被設成 0/負）時：
+        # local_threshold <= 0 使任何非負持倉都滿足觸發條件，而 reduce_qty <= 0 會讓
+        # place_order 收到 0 或負的量——它的 min_amount fallback 是 1，等於送出 1 顆的市價單。
+        # 這是既有缺陷，但不對稱減倉把負值的量放大成 2×，所以在這裡擋掉。
+        if reduce_qty <= 0:
+            return
+
         last_reduce = self.state.last_reduce_time.get(ccxt_symbol, 0)
         if time.time() - last_reduce < REDUCE_COOLDOWN:
             return

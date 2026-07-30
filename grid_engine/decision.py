@@ -101,6 +101,11 @@ def tp_quantity(base_qty, my_position, opposite_position, position_limit):
     原 `or opposite_position >= position_threshold` 已**刻意刪除**：它唯一可達且有效
     的情形是「我不是淨曝險側時仍加倍我」= 最大化拆對沖（2026-07-26 全量 log 實測
     98,399 筆屬此類）。行為變更的完整 diff 分類見 spec §5.1。
+
+    ⚠️ `my_position > opposite_position` 是**嚴格大於**，而兩側持倉都是 `initial_quantity`
+    的整數倍 ⇒ `long == short` 在實盤是會實際發生的離散狀態（不是浮點意義的測度零）。
+    平手那一刻兩側皆 1×，下一筆成交就會打破平手自我解除。**這是規格不是 bug**——
+    看到 log 裡「兩側都沒加倍」不要把 `>` 改成 `>=`，那會讓兩側同時 2× = 部分退回拆對沖。
     """
     if my_position > position_limit and my_position > opposite_position:
         return base_qty * 2
