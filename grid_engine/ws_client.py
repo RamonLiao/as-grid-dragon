@@ -40,6 +40,18 @@ class WsClient:
                 async with websockets.connect(self.config.websocket_url, ssl=ssl_context) as ws:
                     self.state.connected = True
 
+                    # listenKey 在 WS 斷線後會被伺服器廢棄 ⇒ 每次（重）連都必須重新取得。
+                    # 舊碼只在啟動時 acquire 一次，重連時沿用死 key，而 Binance 對無效的
+                    # stream name **靜默接受**（SUBSCRIBE 不回錯、只是永遠收不到資料）
+                    # ⇒ userData 永久失效，唯一線索是 keepalive 每 30 分鐘的 -1125。
+                    # 2026-07-25~30 實測：整份 log 零筆 [userData] 事件，而同期成交上百筆。
+                    try:
+                        await self.acquire_listen_key()
+                    except Exception as e:
+                        # 取不到就沿用舊 key 降級運行：**不要讓 userData 的失敗連坐 bookTicker**，
+                        # 後者是 decide() 的觸發來源，斷了整個引擎就停擺。
+                        logger.warning(f"[WebSocket] 重連時取得 listenKey 失敗，沿用舊值: {e}")
+
                     streams = []
                     for cfg in self.config.symbols.values():
                         if cfg.enabled:
@@ -82,3 +94,13 @@ class WsClient:
                 break
             except Exception as e:
                 logger.error(f"更新 listenKey 失敗: {e}")
+                # PUT 失敗（實測恆為 -1125 "This listenKey does not exist"）代表伺服器端
+                # 已經沒有這把 key。舊碼只 log 就繼續，self.listen_key 因此停在死值直到
+                # 人工重啟——實測空轉了 5 天。這裡立刻重建。
+                # ⚠️ 重建只讓**下次重連**訂到活的 key；當前這條連線仍訂在舊 key 上，
+                #    本迴圈無法主動觸發重連（run() 阻塞在 ws.recv()）。
+                try:
+                    await self.acquire_listen_key()
+                    logger.info("[WebSocket] 已重新取得 listenKey（下次重連生效）")
+                except Exception as e2:
+                    logger.error(f"重新取得 listenKey 也失敗: {e2}")
