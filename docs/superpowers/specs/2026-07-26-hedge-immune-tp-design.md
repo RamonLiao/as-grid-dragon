@@ -207,7 +207,7 @@ K 線與 v1 相同三根。預期值改為單側版本：
 | A3 | `bot.py` 加倍死分支刪除 | grep 證明兩個呼叫點都傳 `False` |
 | A4 | replay 全量 `logs/decisions.jsonl` | 見 §5.1。**A4 是實作 guard，不是策略證據**（§6） |
 | A5 | risk_monitor **斷言 §3.2 的三條不變式**（不是列舉案例）：(1) `abs(new_delta) <= abs(old_delta)` 且不變號；(2) gross 嚴格下降；(3) `gap == 0` 時退回雙側等量。測試狀態至少含 `gap < reduce_qty/2`（**v2 的 overshoot 反例 `0.66/0.64`，必測**）、`gap > reduce_qty`（`0.80/0.64`）、`gap == 0`、`short > long`、以及浮點雜訊 `0.6400000000000001/0.64` | mutation 兩條各須紅一次：(a) 改回一律等量 → 不變式 1 在 `0.80/0.64` 紅；(b) 改回 v2 的固定 2×（`extra = reduce_qty`）→ 不變式 1 在 **`0.66/0.64`** 紅 |
-| A6 | tick_sim A/B（§5.2 shim）× 場景 A/B × W1/W2/W3/full、fee=0/slip=0 | 逐窗回報 `max abs(delta)`、`final abs(delta)`、`final_equity`、`max_drawdown`、`liquidated`、`round_trips`、`rejected_entries`。**Gate**：(i) `max abs(delta)` 與 `final abs(delta)` 每窗 ≤ 舊規則；(ii) 零強平；(iii) `final_equity` 劣化 ≤ **1.0 USDC**；(iv) `max_drawdown` 劣化 ≤ **2 個百分點**；(v) `rejected_entries` 增幅 ≤ **50%**；**基準為 0 時改判「新規則 > 5 筆即超標」**（避免 0 基準下任何拒單都算超標）。任一項超標 → **停下報告，不自行放行** |
+| A6 | tick_sim A/B（§5.2 shim）× 場景 A/B × W1/W2/W3/full、fee=0/slip=0 | 逐窗回報 `max abs(delta)`、`final abs(delta)`、`final_equity`、`max_drawdown`、`liquidated`、`round_trips`、`rejected_entries`。**Gate**：(i) `max abs(delta)` 與 `final abs(delta)` 每窗 ≤ 舊規則；(ii) 零強平；(iii) `final_equity` 劣化 ≤ **1.0 USDC**；(iv) `max_drawdown` 劣化 ≤ **2 個百分點**；(v) `rejected_entries` 增幅 ≤ **50%**；**基準為 0 時改判「新規則 > 5 筆即超標」**（避免 0 基準下任何拒單都算超標）。任一項超標 → **停下報告，不自行放行**。⚠️ **(i) 與 (iii) 已於 2026-07-30 事後修訂，見 §5.3——判定以 §5.3 為準** |
 | A7 | 全套測試綠 | 基線 546 passed / 1 skipped（須在 `as-grid-dragon` 子目錄跑） |
 | A8 | §3.5 改造後的 clamp 測試，在拿掉 `min(qty, prior_qty)` 後**必須紅** | 這條是 BL2 的直接補償：證明改造後仍有鑑別力 |
 | A9 | 保留對沖後的保證金試算（照健檢 §8 的算法）：報「新規則終態的 initialMargin 與剩餘可用層數」 | 若可用層數 < 3 → 在上線報告中明確標示「氧氣不足」，不得沉默 |
@@ -228,6 +228,16 @@ diff 恰有兩類，**兩類都可達，且非互斥**（判定必須用「或�
 
 實測分佈（99,270 筆）：類2-only **81,957**、類1∩類2 **16,442**、類1-only **870**，
 全部發生在 short 側，long 側零差異。threshold 分佈：`(0.1, 0.4)` 98,399 筆、`(0.1, 0.8)` 871 筆。
+
+> **⚠️ 2026-07-30 Task 6 實跑更正**：上列 reviewer 數字**兩欄對不上**。實測（99,552 筆、
+> 排除 `60917cc` 前的舊 code 窗口後 43,164 筆）為類1-only **870**（與上列**完全吻合**）、
+> 類2-only **285**、類1∩類2 **5,022**，有 diff 者共 6,177 筆。
+> 差異已查明成因，非缺陷：(a) 07-12 前 long 長期 dead mode、**根本沒有止盈單** ⇒ 該段（占
+> 檔案絕大多數）不產生 diff；(b) 類 2 需 `o >= position_threshold`，07-12 改 `mult=40`
+> 後 threshold = 0.8 而實際持倉最大 0.66 ⇒ **07-12 之後類 2 永不成立**，只有 threshold = 0.4
+> 的早期紀錄命中，而那批又正好被 dead mode 擋掉止盈單。
+> reviewer 那兩欄合計 ≈ 99,269 ≈ 當時總筆數，形態上像是把「總紀錄數」當成了「分類命中數」；
+> `類1-only 870` 分毫不差則顯示他確實跑過。**Task 6 的判定以實跑數字為準。**
 
 斷言（三項全成立才 PASS）：
 1. diff 只出現在 `SideDecision.orders` 中 `reduce_only=True` 那張的 `quantity`；
@@ -256,6 +266,52 @@ def _tp_quantity_legacy(base_qty, my_position, opposite_position, position_limit
 **腳本內必須 `assert` cfg 的 `threshold_multiplier`/`limit_multiplier` 等於預期值**——
 `tick_sim.TickSimConfig` 的預設恰為 `40.0`/`5.0`，忘記設也看不出來（v1 N1）。
 （`fee=0`/`slip=0` 反而**不是**預設值 `0.0002`/`0.0001`，這兩項忘設會露出來。）
+
+### 5.3 A6 gate (i)/(iii) 的事後修訂（2026-07-30）
+
+> ⚠️ **這是看過實測結果之後才改的判準——回測裡最經典的自欺形式。**
+> 保留原文於 §5 表格供對照，本節說明改了什麼、為什麼、以及修訂前後的判定差異。
+> 使用者已在 2026-07-30 明示核可本次修訂。
+
+**觸發**：Task 7 首次跑出 A6 五項超標——`(iii) final_equity` 在 A/W1、B/W1 各劣化
+−7.221 / −2.906；`(i) final abs(delta)` 在 A/W2（0.080→0.160）、B/W2（0.060→0.220）、
+B/W3（0.060→0.100）劣化。依 spec 停下並診斷（`<scratchpad>/diag_delta_result.txt`）。
+
+**診斷結論（三項，皆有逐筆軌跡佐證）**：
+
+1. **A/W2 的 FAIL 是判準缺陷，不是行為退化。** 帶號 delta 逐日軌跡 NEW **每一天**都低於
+   OLD（06-17 +0.46 vs +0.60 … 06-28 +0.04 vs +0.16），末端穿越 0 後繼續走到 −0.16，
+   `abs()` 因此反而變大。**單點標量比不了軌跡**：v1 用帶號值被 reviewer 判為「把帶號下降
+   當收斂」（BL3），改用 `abs` 之後，在穿越 0 的路徑上又反向誤判。兩個方向都會錯。
+2. **B/W2、B/W3 的 `abs` 劣化為真，但 OLD 的「低 delta」是把兩側都拆光換來的。**
+   窗口末雙邊持倉——B/W2：OLD `L0.08 / S0.14`（min **0.08**）vs NEW `L0.28 / S0.50`
+   （min **0.28**）；B/W3：OLD min **0.40** vs NEW min **0.46**；A/W2：OLD min **0.08**
+   vs NEW min **0.14**。**三項超標全部伴隨對沖存量提高** ⇒ 測到的是設計意圖本身。
+   「淨曝險低是因為幾乎沒有倉位」不是本 spec 要的安全。
+3. **`full` 窗口 `finΔ = 0.000`（四個 cell 全零）有真實機制**，非 artifact：末筆 fill
+   `07-13 17:36`（long entry 0.02 + short tp）恰好讓兩側相等（A `0.06/0.06`、B `0.14/0.14`），
+   末段兩側均被網格壓向同一平衡點。
+
+**修訂後的 gate (i)**（取代單點 `final abs(delta)` 比較，整體**更嚴**——新增逐日軌跡要求）：
+- (i-a) `max abs(delta)` 每窗 NEW ≤ OLD —— 實測 **8/8 PASS**
+- (i-b) **帶號** delta 的逐日軌跡，NEW 不得在任一天高於 OLD —— 實測 **8/8 PASS**
+- (i-c) `final abs(delta)` 若劣化，必須伴隨窗口末 `min(long, short)`（對沖存量）改善
+  —— 三項劣化全部滿足
+
+**修訂後的 gate (iii)**：取消單窗 `≤1.0 USDC` 容差，改判 **`full` 窗口 `final_equity` 不劣化**。
+理由：W1 上漲段少賺（−7.2 / −2.9）與 W2 下跌段多賺（+7.0 / +11.2）是同一枚硬幣——
+保住空頭對沖必然在漲段付方向性代價，這在 §2 目標與 §6「equity 只看方向」已載明接受。
+以單窗容差卡它，等於要求「既保對沖又不付對沖成本」，與本 spec 的目的自相矛盾。
+實測 `full`：A **+0.826**、B **+2.919** ⇒ PASS。
+
+**修訂後全項 PASS。** 附帶：`max_drawdown` 幾乎全面改善（B/W2 **−10.59pp**、B/full −2.80pp、
+B/W1 −2.39pp），零強平、零拒單（兩規則 × 8 窗）。完整對照表 `<scratchpad>/a6_ab_result.txt`。
+
+**未修訂、仍然成立的限制**：gate (ii)/(iv)/(v) 原文不動；§6 的所有已知限制（in-sample 窗口、
+FIFO vs netted 分歧、fee=0 非永久）一併適用於本次結果。
+
+**本次順帶發現、未處理**：OLD 規則在 A/full 的 06-14、06-17 出現 `short = -0.00`。
+可能只是浮點殘差的顯示，也可能 `PositionBook` 允許持倉穿透到負值。**未查證**，列入 §8 backlog。
 
 ## 6. 已知限制（誠實記錄）
 
@@ -308,3 +364,7 @@ def _tp_quantity_legacy(base_qty, my_position, opposite_position, position_limit
   不留痕，只在連續第 10 次才 warning 一次 ⇒ 慢性拒單（每日數筆但不連續 10 次）完全不可觀測。
   補一行含 ccxt error code 的 log 即可，但屬獨立改動，不混進本 spec。
 - 索取清單：BNBUSDC depth/ADV 實測（解 §6 的滑價與容量兩項）。
+- **`PositionBook` 是否允許持倉穿透到負值**（2026-07-30 Task 7 診斷順帶發現）：舊規則在
+  A/full 的 06-14、06-17 出現 `short = -0.00`。可能只是浮點殘差的顯示（`-1e-17`），
+  也可能帳本缺 `max(0, ...)` 守衛。**未查證**，兩規則皆受影響 ⇒ 不影響本次 A/B 對照的
+  相對結論，但若為真是獨立缺陷。

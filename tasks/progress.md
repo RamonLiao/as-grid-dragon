@@ -1,12 +1,57 @@
 # Progress
 
 ## Current Task
-**TODO 1c 進行中：對沖免疫的止盈量加倍。**
-- 健檢完成 → brainstorming 完成（使用者裁決見下）→ **spec 已落檔並 commit `7805742`**
-  `docs/superpowers/specs/2026-07-26-hedge-immune-tp-design.md`
-- **現在等 quant spec reviewer（opus、唯讀）回 verdict**。依 quant rules 硬觸發，verdict 前不得開工。
-- 使用者的三個裁決：① 目標 = **delta 主動收斂**（非僅保住對沖）；② 對沖側止盈**減半不加倍**（最小改動，接受下跌段仍外擴）；③ 範圍**含 `risk_monitor`** 雙向減倉改只減大側；④ 上線門檻 = 單測 + replay 結構化 diff + tick_sim 新舊對照。
-- 未上線前**不要重啟引擎**（重啟才生效，但 code 還沒寫）。
+**TODO 1c：對沖免疫的止盈量加倍 —— code + A4/A6/A7/A9 驗收完成，等 security-review + dual-review + verifier。**
+branch `feat/net-exposure-tp`（7 commits `f2f6bbe`..`27be2d4`，未 merge）。
+spec `docs/superpowers/specs/2026-07-26-hedge-immune-tp-design.md`（v3 + 2026-07-30 §5.3 事後修訂）、
+plan `docs/superpowers/plans/2026-07-26-hedge-immune-tp.md`（8 tasks，全部執行完）。
+
+### 🔴 這份改動已經在真錢上跑了（流程倒序，必須知道）
+**引擎 2026-07-27 19:04 重啟，跑的就是 `27be2d4`**（08:57 commit，工作區 clean）。
+也就是說 Task 1-5 的 code 先上線、Task 6/7/8 的驗收 3 天後（2026-07-30）才補跑。
+**這是流程倒序，不是正常路徑**——驗收若當時 FAIL，要付的代價是回滾生產而不是不上線。
+（實際結果：修訂判準後全項 PASS，見下。）dual-review / security-review / verifier **仍未跑**。
+
+### 驗收數字（2026-07-30 實跑，全部落檔在 session scratchpad）
+- **A7 全套測試：570 passed / 1 skipped**（基線 546 → +24 新測試）。py_compile 六檔 OK；
+  `grep tp_quantity` 零 5 引數殘留；`bot.py` 加倍分支已刪只剩註解；`ui.py` 標籤與 decision 一致。
+- **A4 replay 全量**（`a4_replay_result*.txt`）：99,552 筆中 12,349 筆有 diff、9 筆違規 → 全部
+  ≤`07-09 19:12`，形態一致（`long.cancel_side` replay=True/logged=False + long orders 空），
+  是 `60917cc` 修掉的**舊 code 產物**，與 1c 無關。**排除該窗口後 43,164 筆、6,177 diff、違規 0 → PASS**。
+  分類 cls1-only 870 / cls2-only 285 / both 5,022。**spec §5.1 記的 reviewer 分佈有兩欄對不上，已在
+  spec 內更正並附成因**（07-12 前 long dead mode 無止盈單、07-12 後 threshold=0.8 使類 2 永不成立）。
+  切換點乾淨：diff 末筆 `07-27 10:37`，`10:37→19:02` 停機空檔，重啟後 3 天**零 diff**。
+- **A6 tick_sim A/B**（`a6_ab_result.txt`，2.83M events / 38 天 / 2 規則 × 場景 AB × W1W2W3full）：
+  首跑**五項超標**（W1 上漲段 eq −7.221/−2.906；A W2、B W2、B W3 的 `final abs(delta)`）→ 依 spec 停下診斷
+  （`diag_delta_result.txt`）→ **判準修訂後全項 PASS**，修訂內容與「這是事後改判準」的誠實標註見 **spec §5.3**。
+  - `max abs(delta)` **8/8 改善**（B W2 0.76→0.46、A W1 0.48→0.38、A W3 0.36→0.24）
+  - 帶號 delta 逐日軌跡 **8/8 每一天都 ≤ 舊規則**（新增的更嚴判準）
+  - 三項 `abs(finΔ)` 劣化**全部伴隨窗口末 `min(L,S)` 提高**（B W2：OLD min 0.08 vs NEW **0.28**）
+    ⇒ 舊規則的「低 delta」是把兩側都拆光換來的，不是對沖有效
+  - `full` 窗口 eq：A **+0.826** / B **+2.919**；maxDD 幾乎全面改善（B W2 **−10.59pp**）；零強平、零拒單
+- **A9 保證金**：每層 2.283，可用 17.955 → **只夠再加 7 層**（未低於 3 層門檻，但不寬裕）。
+
+### 生產實測（2026-07-30 09:13，新規則已生效 3 天）
+`L 0.42 / S 0.18`、止盈單 **long 0.04（加倍）/ short 0.02（不加倍）** ⇒ spec §7 的活體驗收 **PASS**。
+delta 軌跡：`07-26 +0.40` →（重啟）→ `07-28 21:35 +0.52`（下跌段外擴，= 使用者裁決 ② 已接受的取捨，
+**實盤印證這個缺口是真的會發生**）→ `07-30 03:42 **+0.24**`。36h 內 L −0.20 / S +0.08，**空頭會自己長回來**，
+不再是舊機制下的單調被拆。
+
+### 使用者的三個裁決（不變）
+① 目標 = **delta 主動收斂**（非僅保住對沖）；② 對沖側止盈**減半不加倍**（最小改動，接受下跌段仍外擴）；
+③ 範圍**含 `risk_monitor`** 雙向減倉改只減大側；④ 上線門檻 = 單測 + replay 結構化 diff + tick_sim 新舊對照。
+
+### 下一步（依 plan Task 8 Step 6，**不要自行 merge**）
+1. `security-review` skill（改真錢下單行為，命中 Red Team Protocol）
+2. `dual-review` Round 1 外部輪（fresh-context，**不給 spec 與任何自述**）+ Round 2 專案規則
+3. fresh-context `verifier`（read-back + 實跑 + 獨立 mutation + Monkey Testing 專門回合）
+4. ⚠️ 上述任一輪若判定該回滾，**回滾等於重啟生產**，不是單純不 merge
+
+### 🔴 新增缺陷（與 1c 無關，獨立待辦）
+**`listenKey` keepalive 每 30 分鐘失敗一次**：`更新 listenKey 失敗: binance {"code":-1125,
+"msg":"This listenKey does not exist."}`，從 **2026-07-25 21:18** 起持續至今（07-30 08:57 仍在報），
+**跨兩次重啟未消失** ⇒ 既有缺陷，非新 code 引入。倉位仍正常變動 ⇒ 成交推送沒全斷（推測是重連拿了新
+key 但 keepalive 仍打舊 key，**未驗證**），目前靠 10s REST sync 兜底。
 
 ### 🔴 最高優先（新 session 開場必讀）
 
