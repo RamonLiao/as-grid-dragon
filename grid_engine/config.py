@@ -26,6 +26,33 @@ def _norm_requote_factor(v) -> float:
     return f
 
 
+def _norm_assumed_leverage(v) -> int:
+    """正規化回測假設槓桿，非整數/超出 1~125 → fallback 5（交易所實測值）。
+
+    此值只餵回測的保證金/強平計算，垃圾值不會報錯而是靜默算錯風險：
+    實測 -5 會跑完 113 筆交易吐出 +0.155% 正報酬，0 則 divide-by-zero
+    後靜默回 0 筆。UI clamp 1~125 擋不住直接編輯 JSON、腳本賦值與
+    未來新增的寫入點，所以守衛掛在 `SymbolConfig.__setattr__`
+    ——dataclass `__init__` 也走 setattr ⇒ 那是唯一涵蓋全部路徑的咽喉點。
+
+    交易所槓桿是整數，非整數值一律**拒絕**而非截斷（截斷會讓 20.9 悄悄
+    變 20，使用者以為填對了）。
+    """
+    if isinstance(v, bool):  # bool 是 int 子類，float(True)==1.0 會矇混成 1x
+        f = float("nan")
+    else:
+        try:
+            f = float(v)
+        except Exception:
+            # 不只 TypeError/ValueError：自訂 __float__ 可以拋任何東西，
+            # 讓它炸穿等於把「配置有垃圾值」變成無關的 crash。
+            f = float("nan")
+    if not math.isfinite(f) or not f.is_integer() or not (1 <= f <= 125):
+        console.print(f"[yellow]assumed_leverage={v!r} 非法，回退 5[/]")
+        return 5
+    return int(f)
+
+
 @dataclass
 class SymbolConfig:
     """單一交易對配置"""
@@ -98,6 +125,9 @@ class SymbolConfig:
             if "assumed_leverage" not in data:
                 data["assumed_leverage"] = data["leverage"]
             del data["leverage"]
+        # assumed_leverage 的值域守衛不在這裡：它掛在 __setattr__，
+        # dataclass __init__ 也走 setattr ⇒ 這條路徑一樣會被檢查，
+        # 且舊 key 遷移過來的非法值同樣擋得住。
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     _RENAMED = {
@@ -122,6 +152,10 @@ class SymbolConfig:
         # 實例屬性（讀得到、to_dict() 忽略）＝ 假旋鈕復刻。
         if name in SymbolConfig._RENAMED:
             raise AttributeError(SymbolConfig._RENAMED[name])
+        if name == "assumed_leverage":
+            # 唯一咽喉點：from_dict、TUI IntPrompt、web 三個寫入點、
+            # 直接建構 dataclass、REPL 賦值全部經過這裡。
+            value = _norm_assumed_leverage(value)
         object.__setattr__(self, name, value)
 
 
