@@ -1,5 +1,43 @@
 # Notes
 
+## 2026-08-14 userData stream 死因調查（決定性實驗，why 留檔）
+
+**結論先講**：`ws_client.py:64` 的「`SUBSCRIBE [listenKey]` vs 直接連 `/ws/<listenKey>`」
+這個假設**已被否決**，不要改它。
+
+**為什麼要做這個實驗**：07-30 修好 `-1125` 後，log 仍零筆 `[userData]`。原本最合理的懷疑是
+Binance 對無效 stream name 靜默接受（`ws_client.py:44-47` 的註解就是這個形態），而
+SUBSCRIBE 一把 listenKey 也許正是「被靜默接受但不推」。
+
+**實驗設計**：兩條連線同時掛同一把新取的 listenKey，一條走 A（SUBSCRIBE）一條走 B（path URL），
+再加對照組（同連線同時訂 bookTicker + listenKey）。純被動，不下單。
+
+**結果**：A 零事件、B 零事件、對照組 bookTicker 2360 筆/5 分鐘而 userData 0。
+REST `allOrders` 證明同時窗確實有 8 筆 CANCELED/NEW。⇒ socket 健康、key 有效、事件存在，就是不推。
+
+**方法論教訓（值得記住）**：第一輪實驗**無效**，因為腳本沒做 listenKey keepalive，
+60 分鐘後 key 就死了，跑了 6.6 小時的「零事件」證明不了任何事。
+證據是重取時拿到的是新的一把 key（`hC98…` ≠ 原本的 `AaTj…`）。
+**任何用 listenKey 做的長時間觀察，都必須自帶 25 分鐘 PUT keepalive，否則結論全廢。**
+
+**已排除**：Portfolio Margin（`enablePortfolioMarginTrading: false`）、multi-assets（false）、
+API 權限（`enableReading`/`enableFutures` 皆 true）、socket 健康度。
+**未排除（下一步）**：`ipRestrict: true` + 家用浮動 IP。實驗期間 request ip 從
+`36.225.15.37` 變成 `118.150.131.186`，log 裡累計出現過 6 個不同 IP。
+若 Binance 推送時也校驗來源 IP，症狀會恰好是靜默不推——這條若成立，GCE 固定 IP 會一併解掉。
+
+## 2026-08-14 `assumed_leverage` 守衛：為什麼掛在 `__setattr__` 而不是 `from_dict`
+
+第一版掛在 `from_dict`，verifier 抓到 web 有三個寫入點（`2_⚙️_交易對管理.py:194,306`、
+`3_🔬_回測優化.py:214`）直接建構 dataclass 或直接賦值，完全繞過守衛，只靠 Streamlit
+widget 的 client 端範圍限制撐著。改掛 `SymbolConfig.__setattr__` 後，因為 dataclass
+`__init__` 也走 setattr，一次涵蓋 from_dict / TUI / web 三點 / REPL，`from_dict` 那行守衛
+連同 `as_terminal_max.py` 的兩處包裝都可以拿掉（少三個要記得維護的地方）。
+
+同時記下 verifier 的另一個發現：原測試用 `5.7` 驗「非整數要拒絕」是**假守衛**——
+`int(5.7)==5` 恰好等於 fallback 值，靜默截斷與正確拒絕在結果上無法區分，
+所以「拿掉 `is_integer()`」這條 mutation 存活。改用 `7.3`/`20.9`（截斷值 ≠ fallback）才抓得到。
+
 ## 2026-07-03 架構審查結論（quant 視角）
 
 ### 全貌

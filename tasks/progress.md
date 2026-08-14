@@ -1,7 +1,63 @@
 # Progress
 
-## Current Task
-**無進行中任務。TODO 1c 全線完成並 merge + push（2026-07-30）。**
+## Current Task（2026-08-14 更新）
+
+### 🔴🔴 userData stream 到現在**還是死的**，而且原本的修復方向被實驗否決
+2026-07-30 的 listenKey 修復（`6094f4c`）確實解掉了 `-1125`（最後一筆 08-06 19:10，之後 8 天零筆），
+**但 `[userData]` 從 07-12 至今仍是 0 筆**。08-14 實驗證據鏈：
+
+| 實驗 | 條件 | 結果 |
+|---|---|---|
+| A 路 | `wss://.../ws` + `SUBSCRIBE [listenKey]`（引擎現行作法） | **零事件** |
+| B 路 | `wss://.../ws/<listenKey>`（Binance 文件作法） | **零事件** |
+| 對照組 | 同一條連線同時訂 `bnbusdc@bookTicker` + listenKey | bookTicker **2360 筆**/5 分鐘，userData **0** |
+| 交叉驗證 | REST `allOrders` 查同一時窗 | 22:36:50-51 有 **8 筆** CANCELED/NEW 真實存在 |
+
+listenKey 是 22:32:34 新取的（<60 分鐘未過期，且腳本每 25 分鐘 PUT keepalive），
+兩條連線 22:32:35 起全程連著，22:36:50 的 8 筆訂單事件**一筆都沒推過來**。
+⇒ **socket 健康、key 有效、事件真實存在，就是不推。**
+
+**因此：不要去改 `ws_client.py:64` 的訂閱方式**——「SUBSCRIBE vs path URL」這個假設已被 B 路實驗直接否決。
+（腳本留在 session scratchpad：`ws_userdata_ab.py`、`ws_control.py`。round1 那份無效，
+原因是我漏了 listenKey keepalive，60 分鐘後 key 就死了——重跑時務必帶 keepalive。）
+
+**下一個候選假設（未驗證，標明為推測）**：API key `ipRestrict: true`，而家用浮動 IP 一直在換
+（log 出現過 6 個不同 IP），實驗當下 22:32→22:40 之間 request ip 就從 `36.225.15.37` 變成 `118.150.131.186`。
+若 Binance 在推送時也校驗來源 IP，症狀會**恰好**是這種靜默不推。已排除的：
+Portfolio Margin（`enablePortfolioMarginTrading: false`）、multi-assets（`false`）、
+權限（`enableReading`/`enableFutures` 皆 true）、socket 健康度（對照組已證）。
+
+### 🔴 生產問題：`-2015 Invalid API-key, IP` 反覆發作（TODO 6 的真正代價）
+出現過的 request ip 共 6 個：`223.140.219.162`(1739 筆, 07-18)、`111.241.136.139`(132, 08-10)、
+`61.216.73.207`(104)、`36.225.34.156`(15)、`118.166.239.83`(12)、`36.225.15.37`(10, 08-14)。
+被擋時撤單/下單/同步全掛，且 `POST listenKey` 失敗 → 引擎「沿用舊值」→ 舊 key 早被廢棄。
+**⇒ TODO 6（GCE 固定 IP）優先度應升到僅次於 1b。** 待使用者裁決：關白名單 / 忍到 GCE / 手動補 IP。
+
+### ⚠️ 另一個未解形態
+`2026-08-14 21:21:10` log 出現 `[MAX] 初始化完成` + `Task was destroyed but it is pending!`，
+但行程 pid 75367 從 08-12 一路活著沒重啟。**行程沒重啟卻跑了一次策略初始化**，形態不對，未查。
+
+### ✅ 本次完成：`assumed_leverage` 值域守衛（TODO 4c 的一項，未 commit）
+`grid_engine/config.py` 新增 `_norm_assumed_leverage`，掛在 **`SymbolConfig.__setattr__`**
+（不是 `from_dict`）——dataclass `__init__` 也走 setattr ⇒ 那是唯一涵蓋 from_dict / TUI IntPrompt /
+web 三個直接賦值點（`2_⚙️:194,306`、`3_🔬:214`）/ REPL 的咽喉點。非整數**拒絕不截斷**（20.9 不會變 20）。
+**590 passed / 1 skipped**（基線 579，+11 新測試）。
+
+**verifier 兩輪**：
+- 第一輪 ACCEPT WITH FINDINGS：2 條存活 mutation（非整數截斷、legacy key 順序）+ 3 個 UI 繞過點。
+  → 全修：守衛改掛 `__setattr__` 一次解掉 UI 繞過；非整數測資從 `5.7` 改成 `7.3`/`20.9`
+  （`int(5.7)==5` 恰好等於 fallback ⇒ 原測試是**假守衛**）；補 legacy `leverage` 帶垃圾值。
+- 第二輪 ACCEPT WITH FINDINGS：7 條 mutation 殺 6 存 1（`except Exception` 收窄回
+  `except (TypeError, ValueError)` 全綠通過 = 防禦碼沒被測到）→ 已補 `__float__` 拋 `KeyError`
+  的測試，該 mutation 現在會紅（實測 `1 failed, 10 passed`）。回歸面第二輪查過：roundtrip、
+  型別依賴、`__init__` 順序、生產 config 載入後仍 int 5，全 PASS。
+
+工作區：` M .gitignore`（既有）、` M grid_engine/config.py`、`?? tests/test_assumed_leverage_config.py`。**未 commit。**
+
+---
+
+## 先前狀態
+**TODO 1c 全線完成並 merge + push（2026-07-30）。**
 `main == origin/main`（`b7fd7de`，本次推 20 commits）。三條舊 branch 已刪（本地 + 遠端，全部 `--merged main` 確認過）。
 工作區只剩 ` M .gitignore`（既有，與近期任務無關，使用者未指示處理）。
 
@@ -21,13 +77,13 @@
 **建議先觀察 1-2 週讓新規則自己收斂，再決定要不要動 1b。**使用者 2026-07-30 的裁決正是
 「先讓目前的倉位這樣慢慢調整，直到 hedge」。
 
-### 🔴 開工前必做的一行驗證（listenKey 修復的最後一哩）
+### ~~🔴 開工前必做的一行驗證（listenKey 修復的最後一哩）~~ **2026-08-14 已執行，結論見最上方**
 ```bash
-grep -c "\[userData\]" log/as_terminal_max.log      # > 0 = 成交推送真的回來了
-grep -c "1125" log/as_terminal_max.log              # 應該不再增長
+grep -c "\[userData\]" log/as_terminal_max.log      # 實測 0 —— 修復並未生效
+grep -c "1125" log/as_terminal_max.log              # 149，但最後一筆停在 08-06，確實不再增長
 ```
-理由見下面「掛帳」段：修復當下沒有成交，所以端到端還沒驗到。
-出現 `[userData]` 之後，面板成交次數與 Telegram 日報的「累計已實現」才會是真的。
+⇒ `-1125` 修好了，**userData 仍然全死**。面板成交次數與 Telegram 日報的「累計已實現」
+到現在都還不是真的。詳細實驗與已否決的假設見本檔最上方。
 
 ---
 
