@@ -9,6 +9,11 @@ from . import clock
 from .utils import logger
 
 TRADE_STATS_INTERVAL = 60.0     # 與 sync_interval(10s) 解耦，省 API 權重
+# 分頁游標往回退的安全邊際：REST 端偶有到達延遲/時鐘誤差，
+# 純用「上次看到的最大 timestamp」當下次 since 會有漏抓風險；退幾秒換一點重覆讀取
+# （靠 tid dedup 擋掉重複計數，成本可忽略），換到不會漏。5s 是主觀但有理由的取值：
+# 遠大於 REST 正常延遲（通常 < 1s），又遠小於「累計成交數已破千」時重拉全部歷史的成本。
+TRADE_STATS_SINCE_MARGIN_MS = 5_000
 
 
 class SyncService:
@@ -28,6 +33,7 @@ class SyncService:
         # 成交統計：口徑為「本次引擎啟動以來」，與 userData 時代的語意一致
         self.start_time_ms = start_time_ms
         self._last_trade_id: dict = {}
+        self._last_trade_since: dict = {}   # 每 symbol 的分頁游標，跨輪持續推進（見 Critical-1 修復）
         self._last_trade_stats_at = 0.0
 
     async def sync_all(self):
@@ -171,8 +177,12 @@ class SyncService:
         不取 symbol lock：total_trades/total_profit 是本方法唯一 writer（handler 已停寫），
         沒有 write-write race；讀者（面板/Telegram）只讀這兩個獨立純量欄位，不像
         long/short/upnl 三個欄位要求同一快照的原子性，單一賦值在 CPython 下不會有 torn
-        read。若在這個 await 密集的分頁迴圈裡取鎖，還違反本檔案「鎖內無其他 await」的既有
-        不變式，需要額外緩衝重寫，換不到實質好處。
+        read。（symbol lock 是否值得加，留給 whole-branch review 的 Minor 清單裁決。）
+
+        累加/游標套用時機：整段分頁迴圈先把新增筆數/盈虧/max_id 緩衝在區域變數，
+        只有這個 symbol 的分頁**完整成功**（沒有拋例外）才一次套用到 st 並推進
+        `_last_trade_id` / `_last_trade_since`。分頁中途失敗絕不能半套用——半套用會讓
+        下一輪從舊游標重新拉到這批已經算過的成交，造成重複計數（見 review Critical-2）。
         """
         if clock.now() - self._last_trade_stats_at < TRADE_STATS_INTERVAL:
             return
@@ -185,8 +195,15 @@ class SyncService:
             if not st:
                 continue
 
-            max_id = self._last_trade_id.get(symbol, 0)
-            since = self.start_time_ms
+            base_max_id = self._last_trade_id.get(symbol, 0)
+            page_max_id = base_max_id
+            # 分頁游標跨輪持續推進（不是每輪重設回 start_time_ms）：否則第 2 輪起第一頁
+            # 必然整頁被 tid dedup 掉，會誤觸「同毫秒卡死」的終止分支，計數永久凍結
+            # （見 review Critical-1；成交數一旦超過單頁上限 1000 就會發生）。
+            since = self._last_trade_since.get(symbol, self.start_time_ms)
+            pending_n = 0
+            pending_pnl = 0.0
+            last_seen_ts = None
             try:
                 while True:
                     trades = await self.gateway.call(
@@ -194,41 +211,53 @@ class SyncService:
                         symbol=symbol, since=since, limit=1000)
                     if not trades:
                         break
-                    progressed = False
                     for t in trades:
                         try:
                             tid = int(t.get('id'))
                         except (TypeError, ValueError):
                             continue
-                        if tid <= max_id:
+                        if tid <= page_max_id:
                             continue
-                        max_id = max(max_id, tid)
-                        progressed = True
-                        st.total_trades += 1
-                        st.total_profit += float(
+                        page_max_id = max(page_max_id, tid)
+                        pending_n += 1
+                        pending_pnl += float(
                             t.get('info', {}).get('realizedPnl', 0) or 0)
+                    last_ts = trades[-1].get('timestamp')
+                    if last_ts:
+                        last_seen_ts = int(last_ts)
                     if len(trades) < 1000:
                         break
-                    last_ts = trades[-1].get('timestamp')
-                    if not last_ts or not progressed:
-                        # 整頁滿額卻沒有任何新 id：同一毫秒的成交量撞到單頁上限，
-                        # 再往前推只會拿到一樣的頁面（無限迴圈風險）。停手，下個節流
-                        # 週期用同一個 since 重試——不會漏，因為 max_id 還沒推進。
-                        if not progressed:
-                            logger.error(
-                                f"{symbol} 成交分頁在 ts={last_ts} 卡死"
-                                f"（同毫秒成交量超過單頁上限），本輪停止推進")
+                    if not last_ts:
                         break
                     # 分頁：Binance 單次上限 1000。用最後一筆的 timestamp（不 +1）當下一頁
                     # since —— 若最後一筆與頁尾之後還有同毫秒的成交，+1 會把它們永久跳過；
                     # 這裡改成 inclusive，重疊部分靠上面的 tid dedup 擋掉重複計數。
-                    since = int(last_ts)
+                    # 終止條件是「since 推不動」而非「這頁沒有新 id」：後者在游標持續推進
+                    # 的情況下，「這頁全是舊資料」是分頁過程中的正常過渡態（例如追上真正
+                    # 邊界前的最後一次重疊頁），不代表卡死，錯把它當卡死會漏抓後面的新資料。
+                    nxt = int(last_ts)
+                    if nxt == since:
+                        logger.error(
+                            f"{symbol} 成交分頁在 ts={nxt} 卡死"
+                            f"（同毫秒成交量超過單頁上限），本輪停止推進")
+                        break
+                    since = nxt
             except Exception as e:
-                # 失敗保留既有數值。把失敗當成 0 筆寫回去會讓面板數字倒退。
+                # 失敗：緩衝區整個丟棄，不套用到 st、不推進游標，保留既有數值。
+                # 把失敗當成 0 筆寫回去、或把已算的部分半套用，都會讓數字錯（倒退或翻倍）。
                 logger.error(f"同步 {symbol} 成交統計失敗: {e}")
                 continue
 
-            self._last_trade_id[symbol] = max_id
+            # 分頁完整成功才套用：累加與游標一起原子推進，避免下一輪重算同一批。
+            st.total_trades += pending_n
+            st.total_profit += pending_pnl
+            self._last_trade_id[symbol] = page_max_id
+            if last_seen_ts is not None:
+                # 游標不是直接等於「看到的最大 timestamp」，而是往回退一段安全邊際
+                # （見上方 TRADE_STATS_SINCE_MARGIN_MS 說明），且只單調前進不倒退。
+                floor = self._last_trade_since.get(symbol, self.start_time_ms)
+                self._last_trade_since[symbol] = max(
+                    floor, last_seen_ts - TRADE_STATS_SINCE_MARGIN_MS)
 
         self.state.total_trades = sum(s.total_trades for s in self.state.symbols.values())
         self.state.total_profit = sum(s.total_profit for s in self.state.symbols.values())

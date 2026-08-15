@@ -156,6 +156,103 @@ def test_pagination_same_millisecond_boundary_no_loss(frozen_clock):
     assert st.total_trades == 1001, "id=1001 落在頁尾之後、同毫秒，不能被 since+1 跳過"
 
 
+class FlakyPagedExchange:
+    """依 since 過濾 + 模擬分頁上限，並可指定在第幾次呼叫時炸一次（只炸一次）。
+    用來重現「分頁中途失敗」造成重複計數的 bug（review Critical-2）。"""
+
+    def __init__(self, all_trades, page_limit=1000, fail_at_call=None):
+        self.all_trades = all_trades
+        self.page_limit = page_limit
+        self.fail_at_call = fail_at_call
+        self.calls = 0
+        self._failed_once = False
+
+    def fetch_my_trades(self, symbol=None, since=None, limit=None):
+        self.calls += 1
+        if self.fail_at_call == self.calls and not self._failed_once:
+            self._failed_once = True
+            raise RuntimeError("REST down mid-pagination")
+        page = [t for t in self.all_trades if t["timestamp"] >= since]
+        return page[:self.page_limit]
+
+
+def test_mid_pagination_failure_does_not_double_count(frozen_clock):
+    """分頁中途失敗：第 1 頁成功、第 2 頁失敗，整輪必須整批丟棄，不能半套用。
+    重試成功後，總數必須等於真值，不能把第 1 頁重複算一次。
+    """
+    # 1004 筆：第 1 頁吃滿 1000，第 2 頁剩 4 筆
+    all_trades = [trade(i, "0.01", ts=1_700_000_000_000 + i) for i in range(1, 1005)]
+    ex = FlakyPagedExchange(all_trades, page_limit=1000, fail_at_call=2)
+
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[], start_time_ms=1_700_000_000_000)
+
+    asyncio.run(svc._sync_trade_stats())     # 第 2 頁炸掉，整輪應該整批丟棄
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 0, "分頁中途失敗不能半套用第 1 頁已算的部分"
+
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    asyncio.run(svc._sync_trade_stats())     # 重試：這次全部成功
+    assert st.total_trades == 1004, "重試成功後總數必須等於真值，不能把第 1 頁算兩次"
+    assert st.total_profit == pytest.approx(10.04)
+
+
+def test_full_page_same_millisecond_terminates_without_infinite_loop(frozen_clock):
+    """整頁 1000 筆全部卡在同一毫秒（真正無法用 timestamp 分頁的情況）：
+    必須有限步內終止（靠 since 推不動判斷），不能無限迴圈；且不漏套用已抓到的部分。
+    """
+    same_ts = 1_700_000_000_000
+    all_trades = [trade(i, "0.01", ts=same_ts) for i in range(1, 1001)]
+    ex = SinceFilterExchange(all_trades, page_limit=1000)
+
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[], start_time_ms=same_ts - 1)
+
+    asyncio.run(svc._sync_trade_stats())     # 若卡在無限迴圈，這行會 hang，測試逾時失敗
+
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 1000, "已抓到的整頁仍要套用，不因終止而丟棄"
+    # 第 1 次 fetch 拿到滿頁（since 從 start 推進到 same_ts），第 2 次 fetch 發現
+    # since 推不動（still same_ts）才終止 —— 剛好 2 次呼叫，證明不是無限迴圈。
+    assert len(ex.since_calls) == 2
+
+
+def test_steady_state_after_exceeding_page_limit_does_not_freeze(frozen_clock):
+    """成交數一旦破千觸發分頁，之後每輪的新成交必須持續被算到，不能被
+    「同毫秒卡死」防線誤擋而永久凍結在破千那個數字上（review Critical-1）。
+    """
+    all_trades = [trade(i, "0.01", ts=1_700_000_000_000 + i) for i in range(1, 1201)]
+    ex = SinceFilterExchange(all_trades, page_limit=1000)
+
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[], start_time_ms=1_700_000_000_000)
+
+    asyncio.run(svc._sync_trade_stats())
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 1200
+
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    for i in range(1201, 1206):
+        all_trades.append(trade(i, "0.01", ts=1_700_000_000_000 + i))
+    asyncio.run(svc._sync_trade_stats())
+    assert st.total_trades == 1205, "破千後的新成交（+5）不能被凍結防線誤擋"
+
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    for i in range(1206, 1216):
+        all_trades.append(trade(i, "0.01", ts=1_700_000_000_000 + i))
+    asyncio.run(svc._sync_trade_stats())
+    assert st.total_trades == 1215, "連續多輪新成交（再 +10）持續正確累加"
+
+
 def test_userdata_handler_no_longer_writes_counters():
     """單一 writer 守衛：handler 原始碼不得再累加這兩個計數器。"""
     src = open("grid_engine/bot.py", encoding="utf-8").read()
