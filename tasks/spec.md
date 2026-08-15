@@ -1,51 +1,32 @@
-# 當前任務 Spec：TODO 4a —— `leverage` → `assumed_leverage` 改名與舊 key 清除
+# 當前任務 Spec：userData 靜默失效偵測與復原（watchdog）
 
-完整設計：`docs/superpowers/specs/2026-07-26-leverage-rename-design.md`（權威出處）
+完整設計：`docs/superpowers/specs/2026-08-15-userdata-watchdog-design.md`（權威出處）
 
-**任務已拆分**：原合併 spec（`2026-07-26-leverage-false-knob-design.md` v1/v2）連兩輪被 quant
-reviewer 判 Reject，兩次 blocker 同形態——**斷言接線存在而未查證**（v1 斷在交易所邊界、
-v2 斷在行程邊界）。依 judgment-rubrics R4「同一錯誤第二次 → 換路徑」，經使用者同意拆為：
-- **4a（本 spec）**：純改名 + 舊 key 清除。零交易所互動、零新狀態、零併發。
-- **4b（另立）**：讀交易所實測槓桿。範圍縮到引擎行程內（web 端明確承認無實測來源）。
+**前提**：userData stream 自 2026-07-12 靜默死亡至今。2026-08-14/15 的實驗已否決
+訂閱方式、stream name 被丟棄、listenKey 過期、listenKey 卡壞狀態、socket 健康度、
+Portfolio Margin、multi-assets、API 權限；IP 白名單大幅弱化。**根因仍未確定，
+且可能在 Binance 端** ⇒ 本任務不假設根因可修。
 
 ## Goals
-1. 欄位改名 `assumed_leverage`，名字自述「假設值，非控制項」。
-2. **不留下第二個假旋鈕**：config 檔內舊 `leverage` key 必須實際移除，不得並存。
-3. 任何遺漏的舊名存取（讀或寫）在測試期爆炸，不靜默降級。
+1. **偵測**：靜默失效在 10 分鐘量級內判定並告警（log + Telegram）。
+2. **復原**：有限次數（3 次，退避 5/15/45 分鐘）強制重連自救，失敗後進 `given_up` 終態。
+3. **補數字**：面板與 Telegram 的成交次數／累計已實現改由 REST 取得，不再依賴 userData。
 
 ## Non-goals
-**不改任何行為**（回測仍收到同樣數值）；不修「回測 20x vs 實盤 5x」保真度缺陷（屬 4b）；
-不讀交易所、不呼叫 `set_leverage`；不改 `backtest/config.py:Config.leverage`（真旋鈕）；
-不改 `backtest/`、`scripts/` 純離線路徑；不改下單/決策/風控邏輯。
+不修根因；不改交易決策/下單/風控邏輯；不新增自動重啟行程；不改 `rest_gateway`；
+不做全期累計統計（口徑維持「本次引擎啟動以來」）。
 
-## Security constraints
-零交易所互動。**會寫 `config/`**（僅舊 key 清除，走既有 flock + 原子寫，不需停機）；
-不寫 `logs/`、`log/`；不下單、不重啟引擎；測試限 `$(mktemp -d)` 或 `tests/`。
+## Security / Safety constraints
+- watchdog 不得具備下單/撤單/改倉能力；唯一副作用是「請求 WS 重連」與「發通知」。
+- 重連次數硬上限 3，達上限進終態——強制重連會連帶中斷 `bookTicker`（`decide()` 的觸發來源）。
+- 重連採「設旗標 + 內層迴圈自行 break」，**不得**對 `run()` 拋例外借用既有的
+  「例外冒泡 = 重連」不變式（`ws_client.py` 開頭 characterization 註解鎖定）。
+- `total_trades` / `total_profit` 維持**單一 writer**（REST），userData handler 停寫該兩欄。
 
-## 可判定驗收（詳見 spec §6；(M) = 須附 mutation）
-A1 `from_dict` 舊 key 相容、並存時新 key 勝、`to_dict` 不含舊 key
-A2 (M) 讀 `cfg.leverage` 拋 AttributeError
-A3 (M) 寫 `cfg.leverage = x` 拋 AttributeError（須先在「只有 `__getattr__`」版本下紅過）
-A4 `SymbolConfig(leverage=5)` 拋 TypeError；`assumed_leverage=5` 正常
-A5 其他屬性名維持原生行為；`asdict`/`deepcopy` 不拋非 AttributeError
-A6 (M) `drop_symbol_keys` 後檔案不含舊 key
-A7 (M) `new` 不含 `symbols` key 時 drop 仍生效
-A8 (M) `symbol_extras` 含同名 key 時 drop 勝出
-A9 **兩個** save 路徑各驗一次 A6
-A10 未傳 `drop_symbol_keys` 時行為與改動前完全相同
-A11 改動前後回測 result dict bit-identical（「純語意修繕」的直接證據）
-A12 全套測試綠（報數量）
-A13 `grep leverage` 逐行人工裁決 + 白名單（grep **不是**自動判準，見 spec §7.4）
-
-**停止條件**：dual-review 產出 `Ship as-is` 前不得標記完成。
-
-## 狀態
-- 2026-07-26：brainstorming 完成；使用者核可 B+C 與拆分；4a spec 已寫；
-  fresh-context quant reviewer 審查中（quant.md 硬觸發，未回 verdict 前不開工）。
-
----
-
-## 存檔：前一任務 spec（追價語意驗證，已收官 2026-07-15）
-設計：`docs/superpowers/specs/2026-07-13-requote-semantics-design.md`；
-結果：`tasks/requote-experiment-results.md`（§6 判準 3 FAIL，數據否決 factor=1.0；
-holdout 05-01~06-05 保持未開封）。
+## 可判定驗收準則
+1. 六條指定 mutation 各自先紅一次（判準 `and`→`or`、`K`→0、退避改固定、`given_up` 後仍重連、
+   `record_event` 不重置、增量拉取不去重）。
+2. 全套測試全綠，基線 590 passed / 1 skipped，新增數量明列。
+3. 活體驗收：重啟後 10 分鐘 + 4 張單內出現判死 log 與 Telegram 告警；面板成交次數 60 秒內
+   從 0 變成 REST 實測值；三次重連無效後進 `given_up` 且不再重連。
+4. 回歸：`decide()` 觸發頻率（`[MAX]` log 間隔）不因強制重連顯著劣化。
