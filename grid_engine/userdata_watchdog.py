@@ -15,6 +15,7 @@ CHECK_INTERVAL = 60.0
 DEFAULT_ORDER_THRESHOLD = 4        # 引擎 requote 一次即 4 張
 DEFAULT_SILENCE_SECONDS = 600.0
 BACKOFF_SECONDS = (300.0, 900.0, 2700.0)
+GIVEN_UP_REMINDER_SECONDS = 3600.0  # given_up 終態下多久重複提醒一次（節流，不洗版）
 
 
 class UserDataWatchdog:
@@ -34,6 +35,7 @@ class UserDataWatchdog:
         self.attempts = 0
         self.next_attempt_at = 0.0
         self._alerted = False
+        self._last_given_up_log_at = 0.0
 
     # ---- 輸入 ----
     def record_order_action(self):
@@ -62,6 +64,16 @@ class UserDataWatchdog:
 
     def check(self):
         if self.state == "given_up":
+            # spec §5.2：終態後只 log 不動作。但終態正是最需要持續提醒的狀態
+            # （目前只有進終態當下那一封 Telegram），故每隔一段時間節流提醒一次，
+            # 不是每 60s 都打（會洗版）。
+            now = clock.now()
+            if now - self._last_given_up_log_at >= GIVEN_UP_REMINDER_SECONDS:
+                self._last_given_up_log_at = now
+                logger.warning(
+                    "[watchdog] userData stream 仍處於 given_up：自動復原已放棄，"
+                    "事件驅動路徑持續失效中，需人工介入（成交統計仍由 REST 維持）。"
+                )
             return
         if not self._is_dead():
             return
@@ -72,6 +84,7 @@ class UserDataWatchdog:
 
         if self.attempts >= len(BACKOFF_SECONDS):
             self.state = "given_up"
+            self._last_given_up_log_at = now
             msg = (f"⛔ userData stream 自動復原失敗：已重連 {self.attempts} 次仍無事件推送，"
                    f"停止自動復原。成交統計改由 REST 維持，但事件驅動路徑失效中，需人工介入。")
             logger.error(msg)

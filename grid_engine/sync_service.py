@@ -191,6 +191,10 @@ class SyncService:
         只有這個 symbol 的分頁**完整成功**（沒有拋例外）才一次套用到 st 並推進
         `_last_trade_id` / `_last_trade_since`。分頁中途失敗絕不能半套用——半套用會讓
         下一輪從舊游標重新拉到這批已經算過的成交，造成重複計數（見 review Critical-2）。
+
+        口徑注意：舊路徑（userData ORDER_TRADE_UPDATE）數的是「FILLED 事件」，每張單一次；
+        這裡數的是 `fetch_my_trades` 回傳的成交紀錄，部分成交會拆成多筆，口徑因此略有偏高。
+        非嚴格等價，但實務影響小（BNBUSDC 常見單量 0.02，很少發生部分成交拆單）。
         """
         if clock.now() - self._last_trade_stats_at < TRADE_STATS_INTERVAL:
             return
@@ -236,6 +240,13 @@ class SyncService:
                     if len(trades) < 1000:
                         break
                     if not last_ts:
+                        # 理論上 Binance 不會回 falsy timestamp（未觀測過），但這條分支
+                        # 與上面 Critical-1 同構：若真的發生，_last_trade_since 不推進，
+                        # 下一輪同一個 since 撈回同一頁、全被 tid dedup、又走這條 break
+                        # ⇒ 永久凍結。留一行 log 避免它變成靜默凍結。
+                        logger.warning(
+                            f"{symbol} 成交分頁最後一筆缺 timestamp，本輪停止推進"
+                            f"（since={since} 未推進，若持續發生請檢查交易所回傳格式）")
                         break
                     # 分頁：Binance 單次上限 1000。用最後一筆的 timestamp（不 +1）當下一頁
                     # since —— 若最後一筆與頁尾之後還有同毫秒的成交，+1 會把它們永久跳過；

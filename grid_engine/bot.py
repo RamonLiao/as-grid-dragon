@@ -539,9 +539,15 @@ class MaxGridBot:
         await self.sync_service.maybe_sync()
 
     async def _handle_account_update(self, data: dict):
-        """處理 ACCOUNT_UPDATE 事件"""
+        """處理 ACCOUNT_UPDATE 事件
+
+        注意：刻意不呼叫 watchdog.record_event()。ACCOUNT_UPDATE 包含資金費結算
+        （m="FUNDING_FEE"，每 8 小時一次）等與訂單無關的事件；watchdog 計數的前提是
+        「下/撤單必觸發 ORDER_TRADE_UPDATE」（見 order_executor.py 註解），若這裡也重置，
+        資金費事件會在 ORDER_TRADE_UPDATE 單邊死亡時每 8 小時把狀態機拉回 healthy，
+        讓「3 次強制重連後放棄」的硬上限被無限續杯繞過。
+        """
         try:
-            self.userdata_watchdog.record_event()
             account_data = data.get('a', {})
 
             balances = account_data.get('B', [])

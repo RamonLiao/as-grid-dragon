@@ -4,11 +4,15 @@
 的話，userData 一旦復活數字就會翻倍。
 """
 import asyncio
+from pathlib import Path
+
 import pytest
 
 from grid_engine import clock
 from grid_engine.state import GlobalState, SymbolState
 from grid_engine.sync_service import SyncService, TRADE_STATS_INTERVAL, TRADE_STATS_SINCE_MARGIN_MS
+
+BOT_PY = Path(__file__).resolve().parents[1] / "grid_engine" / "bot.py"
 
 
 class FakeGateway:
@@ -336,7 +340,7 @@ def test_since_floor_does_not_regress(frozen_clock):
 
 def test_userdata_handler_no_longer_writes_counters():
     """單一 writer 守衛：handler 原始碼不得再累加這兩個計數器。"""
-    src = open("grid_engine/bot.py", encoding="utf-8").read()
+    src = BOT_PY.read_text(encoding="utf-8")
     start = src.index("async def _handle_order_update")
     end = src.index("async def run(self)", start)
     body = src[start:end]

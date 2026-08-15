@@ -10,7 +10,7 @@ import pytest
 from grid_engine import clock
 from grid_engine.userdata_watchdog import (
     UserDataWatchdog, BACKOFF_SECONDS, DEFAULT_ORDER_THRESHOLD,
-    DEFAULT_SILENCE_SECONDS,
+    DEFAULT_SILENCE_SECONDS, CHECK_INTERVAL,
 )
 
 
@@ -166,11 +166,50 @@ def test_event_leaves_given_up_state(frozen_clock):
     assert wd.state == "healthy"
 
 
+def test_given_up_periodically_reminds(frozen_clock, caplog):
+    """finding 3：given_up 不該完全靜默。節流提醒（每 GIVEN_UP_REMINDER_SECONDS）
+    要在間隔內不重複，間隔到了要再打一次。"""
+    from grid_engine.userdata_watchdog import GIVEN_UP_REMINDER_SECONDS
+
+    wd, ws, _ = make_wd()
+    for _ in range(DEFAULT_ORDER_THRESHOLD):
+        wd.record_order_action()
+    frozen_clock["t"] += DEFAULT_SILENCE_SECONDS + 1
+    wd.check()
+    for wait in BACKOFF_SECONDS:
+        frozen_clock["t"] += wait
+        wd.check()
+    assert wd.state == "given_up"
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        # 間隔內連續 check 多次 -> 不得重複提醒
+        for _ in range(5):
+            frozen_clock["t"] += 60
+            wd.check()
+        reminders = [r for r in caplog.records if "given_up" in r.message]
+        assert len(reminders) == 0
+
+        frozen_clock["t"] += GIVEN_UP_REMINDER_SECONDS
+        wd.check()
+        reminders = [r for r in caplog.records if "given_up" in r.message]
+        assert len(reminders) == 1
+
+
 def test_backoff_seconds_values_are_pinned():
     """BACKOFF_SECONDS 的實際數值是規格常數，不是任意遞增序列。
     test_backoff_sequence_then_give_up 是從模組本身讀 BACKOFF_SECONDS 來驅動時間推進，
     改動這個常數的值不會讓它轉紅（自洽），必須另外硬編碼釘住。"""
     assert BACKOFF_SECONDS == (300.0, 900.0, 2700.0)
+
+
+def test_watchdog_constants_are_pinned():
+    """K / N / CHECK_INTERVAL 是規格常數（判準：orders_since_event>=4 且
+    silence>=600s，每 60s 檢查一次）。上面所有測試都從模組本身 import 這幾個
+    值來驅動輸入，改常數值全套照綠（自洽），必須另外硬編碼釘住字面值。"""
+    assert DEFAULT_ORDER_THRESHOLD == 4
+    assert DEFAULT_SILENCE_SECONDS == 600.0
+    assert CHECK_INTERVAL == 60.0
 
 
 def test_watchdog_has_no_trading_surface():
