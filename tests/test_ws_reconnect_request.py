@@ -137,3 +137,77 @@ def test_run_break_reconnects_without_touching_exception_path(monkeypatch):
     assert 5 not in sleep_calls
     # connected 的完整軌跡：連上 → watchdog 觸發斷線切 False → 重連再切回 True。
     assert state.history == [True, False, True]
+
+
+class _QuietWs:
+    """不設任何旗標；跨連線共用一個「總收訊次數」計數器，收滿第 2 則訊息才收尾。
+
+    收尾條件綁**訊息數**而不是連線數，兩種實作才會走出不同的連線次數：
+    - 修好：一條連線收 2 則訊息就收尾 ⇒ connect 1 次。
+    - 陳舊旗標存活：第 1 則訊息之後立刻 break 重連，第 2 則在新連線上收到
+      ⇒ connect 2 次。
+    """
+
+    def __init__(self, stop_event, counter):
+        self._stop_event = stop_event
+        self._counter = counter
+
+    async def recv(self):
+        self._counter["n"] += 1
+        if self._counter["n"] >= 2:
+            self._stop_event.set()
+        return json.dumps({"e": "unknown"})
+
+    async def send(self, msg):
+        pass
+
+    async def ping(self):
+        pass
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+def test_stale_reconnect_flag_is_cleared_on_new_connection(monkeypatch):
+    """dual-review C3：重連旗標在**連線之外**被設起時（上一條連線已因例外斷開、
+    或 watchdog 在重連空窗期呼叫 request_reconnect()），旗標會存活到新連線，
+    在第一則訊息之後立刻再斷一次 —— 一次請求換兩次重連，多出一次 decide() 盲窗。
+    新連線本身已經滿足了「請先重連」這個請求，陳舊旗標必須在建立新連線時清掉。
+
+    mutation：拿掉 run() 內 `self._reconnect_requested = False` 那行
+    ⇒ 紅在 `assert connect_calls["n"] == 1`（會變成 2：第一條連線收到陳舊旗標
+    立刻斷掉，第二條才收尾）。
+    """
+    state = _FakeState()
+    stop_event = asyncio.Event()
+    client = WsClient(gateway=None, ctx=None, config=_FakeConfig(), state=state,
+                      stop_event=stop_event, handlers={})
+
+    # 連線建立之前旗標就已經是 True（模擬空窗期的 watchdog 請求）
+    client.request_reconnect()
+    assert client._reconnect_requested is True
+
+    connect_calls = {"n": 0}
+    recv_counter = {"n": 0}
+
+    def fake_connect(url, ssl=None):
+        connect_calls["n"] += 1
+        return _QuietWs(stop_event, recv_counter)
+
+    monkeypatch.setattr(ws_client_module.websockets, "connect", fake_connect)
+
+    sleep_calls = []
+
+    async def fake_sleep(secs):
+        sleep_calls.append(secs)
+
+    monkeypatch.setattr(ws_client_module.asyncio, "sleep", fake_sleep)
+
+    asyncio.run(client.run())
+
+    assert connect_calls["n"] == 1, \
+        "新連線已滿足重連請求，陳舊旗標不得再換一次多餘的重連"
+    assert client._reconnect_requested is False

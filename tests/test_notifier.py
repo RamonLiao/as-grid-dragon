@@ -73,6 +73,26 @@ class TestTelegramNotifier:
         assert "崩潰" in msg
 
     @pytest.mark.asyncio
+    async def test_notify_crash_redacts_bot_token(self):
+        """dual-review C5：notify_crash(error) 把原始例外字串塞進**要送出去的訊息
+        本體**，卻沒過 _redact —— redaction 原本只掛在 send() 的 except 分支。
+        aiohttp 例外字串化會帶出含 token 的完整 request URL，等於直接把 token
+        發到 Telegram 頻道（比印進 log 更糟：訊息可被轉發）。
+
+        mutation：把 `safe_error = self._redact(error)` 改回直接用 `error`
+        ⇒ 紅在 `assert token not in msg`。
+        """
+        token = "123456789:AAExampleSecretTokenValue"
+        notifier = TelegramNotifier(bot_token=token, chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_crash(
+            f"ClientConnectorError: [https://api.telegram.org/bot{token}/sendMessage]"
+        )
+        msg = notifier.send.call_args[0][0]
+        assert token not in msg, "bot token 明文被發到 Telegram 訊息裡"
+        assert "***" in msg, "遮蔽後的佔位符必須還在（證明真的走了 redact）"
+
+    @pytest.mark.asyncio
     async def test_notify_restart(self):
         notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
         notifier.send = AsyncMock(return_value=True)

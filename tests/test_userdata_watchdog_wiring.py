@@ -90,7 +90,14 @@ def _handler_body(src: str, name: str) -> str:
 
 def test_order_handler_calls_record_event():
     """ORDER_TRADE_UPDATE 是 watchdog 唯一的復原訊號來源
-    （order_executor.py 保證下/撤單必觸發它）。缺了 record_event() 就永遠不會恢復。"""
+    （order_executor.py 保證下/撤單必觸發它）。缺了 record_event() 就永遠不會恢復。
+
+    ⚠️ 這條**不是**行為守衛：`in body` 只掃字面字串。外部 reviewer 實跑的 mutation
+    `if data.get('__never__'): self.userdata_watchdog.record_event()` —— 字串還在、
+    行為死掉（watchdog 從此永遠不會恢復、必然走到 given_up），102 條測試全綠。
+    真正的守衛是下面的 test_order_update_resets_watchdog_behaviourally；
+    這條留著當便宜的第二道防線（掃到整行被刪掉的情況）。
+    """
     src = BOT_PY.read_text(encoding="utf-8")
     body = _handler_body(src, "_handle_order_update")
     assert "self.userdata_watchdog.record_event()" in body
@@ -107,6 +114,99 @@ def test_account_handler_does_not_call_record_event():
 def test_watchdog_run_is_scheduled():
     src = BOT_PY.read_text(encoding="utf-8")
     assert "self.userdata_watchdog.run()" in src
+
+
+def test_order_update_resets_watchdog_behaviourally():
+    """dual-review A2：ORDER_TRADE_UPDATE 必須**真的**把 watchdog 從 degraded
+    拉回 healthy。這是正方向的守衛（test_account_update_alone_does_not_reset_watchdog
+    只守反方向）。
+
+    mutation（外部 reviewer 實跑）：把 handler 裡那行改成
+        if data.get('__never__'): self.userdata_watchdog.record_event()
+    字面字串還在、行為死掉 ⇒ watchdog 永遠不會恢復、必然燒完三次重連走到
+    given_up 並發出「需人工介入」的 ⛔ 告警。
+    這條測試在該 mutation 下紅在 `assert wd.state == "healthy"`（會停在 "degraded"）。
+    """
+    from grid_engine import clock
+    from grid_engine.bot import MaxGridBot
+    from grid_engine.config import GlobalConfig, SymbolConfig
+    from grid_engine.userdata_watchdog import (
+        DEFAULT_ORDER_THRESHOLD, DEFAULT_SILENCE_SECONDS,
+    )
+
+    holder = {"t": 1_000_000.0}
+    clock.set_clock(lambda: holder["t"])
+    try:
+        cfg = GlobalConfig()
+        cfg.symbols = {"BNBUSDC": SymbolConfig(symbol="BNBUSDC",
+                                               ccxt_symbol="BNB/USDC:USDC")}
+        bot = MaxGridBot(cfg)
+
+        async def _noop_adjust(symbol):
+            return None
+
+        bot.adjust_grid = _noop_adjust
+        bot._maybe_persist_bandit_state = lambda: None
+
+        wd = bot.userdata_watchdog
+        for _ in range(DEFAULT_ORDER_THRESHOLD):
+            wd.record_order_action()
+        holder["t"] += DEFAULT_SILENCE_SECONDS + 1
+        wd.check()
+        assert wd.state == "degraded"
+        assert wd.attempts == 1
+
+        sym_state = bot.state.symbols["BNB/USDC:USDC"]
+        sym_state.buy_long_orders = 5.0
+        asyncio.run(bot._handle_order_update({
+            "e": "ORDER_TRADE_UPDATE",
+            "o": {"s": "BNBUSDC", "X": "FILLED", "S": "BUY", "ps": "LONG",
+                  "rp": "1.5", "p": "600.0", "q": "0.02"},
+        }))
+
+        assert sym_state.buy_long_orders == 0, \
+            "FILLED 分支沒被走到，這條測試就沒有守到任何東西"
+        assert wd.state == "healthy", \
+            "ORDER_TRADE_UPDATE 必須真的把 watchdog 拉回 healthy（唯一的復原入口）"
+        assert wd.attempts == 0, "復原時 attempts 必須歸零，退避重新起算"
+        assert wd.orders_since_event == 0
+        assert wd.last_event_at == holder["t"], "靜默計時必須被推進到事件當下"
+    finally:
+        clock.reset_clock()
+
+
+def test_order_update_resets_watchdog_even_on_unknown_symbol():
+    """record_event() 必須排在 handler 最前面：事件屬於未配置的 symbol 時
+    handler 會 early-return，但「stream 活著」這個事實與 symbol 無關，
+    仍然必須算成復原訊號（否則只交易 A、收到 B 的事件時 watchdog 照樣判死）。"""
+    from grid_engine import clock
+    from grid_engine.bot import MaxGridBot
+    from grid_engine.config import GlobalConfig, SymbolConfig
+    from grid_engine.userdata_watchdog import (
+        DEFAULT_ORDER_THRESHOLD, DEFAULT_SILENCE_SECONDS,
+    )
+
+    holder = {"t": 1_000_000.0}
+    clock.set_clock(lambda: holder["t"])
+    try:
+        cfg = GlobalConfig()
+        cfg.symbols = {"BNBUSDC": SymbolConfig(symbol="BNBUSDC",
+                                               ccxt_symbol="BNB/USDC:USDC")}
+        bot = MaxGridBot(cfg)
+        wd = bot.userdata_watchdog
+        for _ in range(DEFAULT_ORDER_THRESHOLD):
+            wd.record_order_action()
+        holder["t"] += DEFAULT_SILENCE_SECONDS + 1
+        wd.check()
+        assert wd.state == "degraded"
+
+        asyncio.run(bot._handle_order_update({
+            "e": "ORDER_TRADE_UPDATE",
+            "o": {"s": "NOTCONFIGURED", "X": "FILLED", "S": "BUY", "ps": "LONG"},
+        }))
+        assert wd.state == "healthy"
+    finally:
+        clock.reset_clock()
 
 
 def test_account_update_alone_does_not_reset_watchdog():
@@ -135,10 +235,13 @@ def test_account_update_alone_does_not_reset_watchdog():
         assert wd.state == "degraded"
         assert wd.attempts == 1
 
+        # 強制重連時證據已被重取（dual-review B2），所以先補一張新單，
+        # 才能檢查 ACCOUNT_UPDATE 有沒有把「新累積的證據」清掉。
+        wd.record_order_action()
         asyncio.run(bot._handle_account_update({"a": {"B": [], "P": []}}))
 
         assert wd.state == "degraded", "ACCOUNT_UPDATE 不得把 watchdog 拉回 healthy"
         assert wd.attempts == 1, "ACCOUNT_UPDATE 不得歸零 attempts"
-        assert wd.orders_since_event == DEFAULT_ORDER_THRESHOLD
+        assert wd.orders_since_event == 1, "ACCOUNT_UPDATE 不得清掉累積中的張數證據"
     finally:
         clock.reset_clock()

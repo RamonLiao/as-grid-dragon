@@ -45,8 +45,8 @@ class TelegramNotifier:
             logger.warning(f"Telegram 發送異常: {self._redact(e)}")
             return False
 
-    def _redact(self, e: Exception) -> str:
-        """把例外字串化結果裡可能出現的 bot token 遮蔽掉。
+    def _redact(self, e) -> str:
+        """把例外/錯誤字串裡可能出現的 bot token 遮蔽掉。
 
         aiohttp 的 ClientResponseError/InvalidURL 等帶 request_info 的例外，字串化
         會帶出完整 request URL（含 token），一路印進 log 檔（log/as_terminal_max.log
@@ -58,12 +58,19 @@ class TelegramNotifier:
         return msg
 
     async def notify_crash(self, error: str):
-        """Bot 崩潰通知"""
+        """Bot 崩潰通知。
+
+        error 是原始例外字串化的結果，同樣可能挾帶 bot token（aiohttp 例外會帶出
+        含 token 的 request URL）。send() 的 except 分支有 redact，但這裡是把字串
+        **塞進要送出去的訊息本體**，不過 redact 等於直接把 token 發到 Telegram
+        頻道（見 dual-review C5）。
+        """
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        safe_error = self._redact(error)
         msg = (
             f"🚨 <b>AS Grid Bot 崩潰</b>\n"
             f"時間: {now}\n"
-            f"錯誤: <code>{error[:500]}</code>\n"
+            f"錯誤: <code>{safe_error[:500]}</code>\n"
             f"\n請 docker attach 檢查並重新啟動交易"
         )
         await self.send(msg)

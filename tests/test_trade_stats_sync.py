@@ -573,7 +573,10 @@ def test_page_cap_stops_and_resumes_across_rounds(frozen_clock, caplog):
     caplog.set_level(logging.WARNING, logger="as_grid_max")
 
     start = 1_700_000_000_000
-    total_ids = 1000 * (TRADE_STATS_MAX_PAGES_PER_SYNC + 3)
+    # ⚠️ 測資與下面的斷言都用寫死的字面值，不從 TRADE_STATS_MAX_PAGES_PER_SYNC 推導
+    # （dual-review A3）：舊版 `1000 * (MAX + 3)` 是從被測常數本身推導測資 ⇒ 常數
+    # 改錯它只會跟著放大、照樣綠（自洽測試）。
+    total_ids = 13_000            # = 1000 × (10 頁上限 + 3)
     all_trades = [trade(i, "0.01", ts=start + i) for i in range(1, total_ids + 1)]
     ex = SinceFilterExchange(all_trades, page_limit=1000)
 
@@ -587,8 +590,8 @@ def test_page_cap_stops_and_resumes_across_rounds(frozen_clock, caplog):
     st = state.symbols["BNB/USDC:USDC"]
 
     # 修復前：沒有頁數上限，第一輪就會一路撈到 total_ids，下面兩個斷言都會紅。
-    assert len(ex.since_calls) == TRADE_STATS_MAX_PAGES_PER_SYNC, (
-        "單輪分頁次數必須被硬上限擋住，不能無限跑下去"
+    assert len(ex.since_calls) == 10, (
+        "單輪分頁次數必須被硬上限（10 頁，字面值）擋住，不能無限跑下去"
     )
     assert st.total_trades < total_ids, "頁數上限應該讓第一輪撈不完，留給下一輪續拉"
     assert any("達單輪上限" in r.message for r in caplog.records), "超限必須記 warning"
@@ -632,11 +635,230 @@ def test_malformed_trade_id_warns_once_per_round_not_per_trade(frozen_clock, cap
     )
 
 
+def test_trade_stats_constants_are_pinned():
+    """dual-review A3：這三個常數是規格值，不是任意數字。上面所有測試都從模組本身
+    import 它們來驅動輸入/推進時間（自洽），改常數值全套照綠 —— 外部 reviewer 實跑
+    的 mutation：TRADE_STATS_INTERVAL 60.0 → 5.0，102 條相關測試全綠。
+    watchdog 那邊已有 test_watchdog_constants_are_pinned 的先例，同一份洞見這裡補上。
+
+    - 60s：與 sync_interval(10s) 解耦省 API 權重（改小 = 靜默放大 API 權重）。
+    - 10 頁：單輪分頁硬上限，跑在 WS recv 迴圈內（改大 = ping/watchdog/recv 被卡住）。
+    - 5000ms：分頁游標回退的安全邊際（改小 = 到達延遲的成交被漏抓）。
+    """
+    assert TRADE_STATS_INTERVAL == 60.0
+    assert TRADE_STATS_MAX_PAGES_PER_SYNC == 10
+    assert TRADE_STATS_SINCE_MARGIN_MS == 5_000
+
+
+class _TrapSymbolState:
+    """讀取 total_trades 時刪掉自己 —— 在 sum() 真正迭代 dict.values() 期間觸發
+    真正的 `RuntimeError: dictionary changed size during iteration`，用來讓
+    `_sync_trade_stats_body()` 在最終彙總處拋例外（不是 mock 出來的假例外）。"""
+
+    def __init__(self, container, key):
+        self.container = container
+        self.key = key
+        self.total_profit = 0.0
+
+    @property
+    def total_trades(self):
+        del self.container[self.key]
+        return 0
+
+
+def test_body_exception_does_not_disable_throttle(frozen_clock):
+    """dual-review B1：`_last_trade_stats_at` 原本是 `_sync_trade_stats_body()` 的
+    最後一行 ⇒ body 拋例外（正是外層保險要接的那種）時時間戳永不推進，之後每一次
+    sync_all()（每 10s）都重打 fetch_my_trades —— 靜默變成 6 倍 API 權重，且每輪
+    重做同一批 pending 計算。修法：時間戳移進 finally。
+
+    mutation：把 `self._last_trade_stats_at = clock.now()` 移回 body 末尾
+    ⇒ 紅在最後的 `assert ex.calls == 1`（實際會是 3）。
+    """
+    svc, state, ex = make_service([[trade(1, "0.5")]])
+    trap_key = "TRAP/USDC:USDC"
+    state.symbols[trap_key] = _TrapSymbolState(state.symbols, trap_key)
+
+    asyncio.run(svc._sync_trade_stats())      # body 在最終彙總處拋例外，被外層保險接住
+    assert ex.calls == 1
+    assert trap_key not in state.symbols, "trap 必須真的被迭代到，證明 body 確實拋了例外"
+
+    # 模擬時間只走 2 秒（遠小於 60s 節流窗）：sync_all() 每 10s 一次的真實節奏
+    frozen_clock["t"] += 2.0
+    asyncio.run(svc._sync_trade_stats())
+    frozen_clock["t"] += 2.0
+    asyncio.run(svc._sync_trade_stats())
+
+    assert ex.calls == 1, (
+        "body 拋例外後 60s 節流仍須生效；時間戳留在 body 最後一行會讓它永久失效，"
+        f"每 10s 重打一次 fetch_my_trades（實際打了 {ex.calls} 次）"
+    )
+
+
+class BoomFundingManager:
+    def update_funding_rate(self, symbol):
+        raise RuntimeError("funding REST down")
+
+
+def test_funding_rate_exception_does_not_propagate_out_of_sync_all(frozen_clock, caplog):
+    """dual-review C1：`_sync_funding_rates` 原本完全沒有 try/except，而它在
+    sync_all() 裡排在 `_sync_trade_stats` **之前** —— security-fix Medium-1 想擋的
+    「例外冒泡 → 每 5 秒重連的永久迴圈」從這個兄弟方法仍然暢通
+    （外層保險的註解宣稱兄弟方法都不拋例外，那句話當時是假的）。
+
+    mutation：拿掉 `_sync_funding_rates` 的 try/except
+    ⇒ RuntimeError 從 `asyncio.run(svc.sync_all())` 那行直接冒出來，測試紅在該行。
+    """
+    import logging
+    svc, state, ex = make_service([[trade(1, "0.5")]])
+    svc.ctx.funding_manager = BoomFundingManager()
+    caplog.set_level(logging.ERROR, logger="as_grid_max")
+
+    asyncio.run(svc.sync_all())
+
+    assert any("funding rate 失敗" in r.message for r in caplog.records), \
+        "失敗必須留 log，不得靜默吞掉"
+    assert state.symbols["BNB/USDC:USDC"].total_trades == 1, \
+        "funding 失敗不得連坐排在它後面的 _sync_trade_stats"
+
+
+class OutOfOrderPageExchange:
+    """滿頁回應，但頁尾那筆的 timestamp 比該頁最大 ts 小（list 順序與 ts 不同步）。
+    用來逼出 `nxt < since` —— 只比 `nxt == since` 的舊判定擋不住的那一半。"""
+
+    BASE = 1_700_000_000_000
+
+    def __init__(self):
+        self.since_calls = []
+
+    def fetch_my_trades(self, symbol=None, since=None, limit=None):
+        self.since_calls.append(since)
+        page = [trade(i, "0.01", ts=self.BASE + 10_000 + i) for i in range(1, 1000)]
+        page.append(trade(1000, "0.01", ts=self.BASE))   # 頁尾 ts 比 since 起點還小
+        return page
+
+
+def test_cursor_never_regresses_when_last_trade_is_not_page_max_ts(frozen_clock):
+    """dual-review C4：卡死判定只比 `nxt == since`，`nxt < since` 會讓 since **倒退**
+    （頁尾 `trades[-1]` 不是該頁最大 ts 時）。`==` 只守住「完全不動」這一個點，
+    不是完整的單調性守衛。修法：改成 `nxt <= since`。
+
+    mutation：把 `if nxt <= since` 改回 `if nxt == since`
+    ⇒ 紅在 `assert ex.since_calls == [start]`（會變成 [start, BASE]，游標倒退了）。
+    """
+    ex = OutOfOrderPageExchange()
+    start = OutOfOrderPageExchange.BASE + 5_000
+
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[], start_time_ms=start)
+
+    asyncio.run(svc._sync_trade_stats())
+
+    assert ex.since_calls == [start], \
+        "頁尾 ts 小於 since 時游標不得倒退（倒退會讓下一頁重撈已掃過的區間）"
+    assert state.symbols["BNB/USDC:USDC"].total_trades == 1000, \
+        "已抓到的整頁仍要套用"
+
+
 def test_userdata_handler_no_longer_writes_counters():
-    """單一 writer 守衛：handler 原始碼不得再累加這兩個計數器。"""
+    """單一 writer 守衛（第二道防線：原始碼掃描）。
+
+    ⚠️ 這條**不是**行為守衛：子字串掃描換個寫法就繞得過去（外部 reviewer 實跑的
+    mutation：把 `+= 1` 寫成 `x = x + 1`，102 條相關測試全綠、雙寫全面復活）。
+    真正的守衛是下面的 test_order_update_does_not_write_trade_counters。
+    這條留著當便宜的第二道防線（掃到明顯的原樣復原），不當作唯一依據。
+    """
     src = BOT_PY.read_text(encoding="utf-8")
     start = src.index("async def _handle_order_update")
     end = src.index("async def run(self)", start)
     body = src[start:end]
     assert "total_trades += 1" not in body
     assert "total_profit += realized_pnl" not in body
+
+
+FILLED_EVENT = {
+    "e": "ORDER_TRADE_UPDATE",
+    "o": {"s": "BNBUSDC", "X": "FILLED", "S": "BUY", "ps": "LONG",
+          "rp": "1.5", "p": "600.0", "q": "0.02"},
+}
+
+
+def make_bot():
+    """建構真實 MaxGridBot（單一 symbol），並把會碰外部世界的兩處換成 no-op。
+
+    參照 tests/test_userdata_watchdog_wiring.py 的
+    test_account_update_alone_does_not_reset_watchdog 的作法。
+    """
+    from grid_engine.bot import MaxGridBot
+    from grid_engine.config import GlobalConfig, SymbolConfig
+
+    cfg = GlobalConfig()
+    cfg.symbols = {"BNBUSDC": SymbolConfig(symbol="BNBUSDC",
+                                           ccxt_symbol="BNB/USDC:USDC")}
+    bot = MaxGridBot(cfg)
+
+    async def _noop_adjust(symbol):
+        return None
+
+    bot.adjust_grid = _noop_adjust                 # 不下單、不碰交易所
+    bot._maybe_persist_bandit_state = lambda: None  # 不寫檔
+    return bot
+
+
+def test_order_update_does_not_write_trade_counters():
+    """單一 writer 的**行為**守衛（dual-review A1）。
+
+    userData handler 與 REST 同時寫 total_trades/total_profit 的話，userData 一旦
+    復活，使用者看到的成交數與已實現盈虧會直接翻倍。上面的原始碼掃描擋不住換寫法
+    （外部 reviewer 的 mutation：
+        sym_state.total_trades = sym_state.total_trades + 1
+        self.state.total_trades = self.state.total_trades + 1
+        sym_state.total_profit = sym_state.total_profit + realized_pnl
+    加回 FILLED 分支 ⇒ 雙寫全面復活、102 條測試全綠）。
+
+    這裡直接餵一筆真的 FILLED 事件進真的 bot，斷言四個計數器全部沒有被動到。
+    mutation 下會紅在 `assert sym_state.total_trades == 0`（會是 1）。
+    """
+    bot = make_bot()
+    sym_state = bot.state.symbols["BNB/USDC:USDC"]
+    sym_state.buy_long_orders = 5.0     # 用來證明 FILLED 分支真的被走到
+
+    asyncio.run(bot._handle_order_update(FILLED_EVENT))
+
+    assert sym_state.buy_long_orders == 0, \
+        "FILLED 分支沒被走到，這條測試就沒有守到任何東西"
+    assert sym_state.total_trades == 0, \
+        "handler 不得再寫 total_trades（單一 writer 是 sync_service）"
+    assert sym_state.total_profit == 0, \
+        "handler 不得再寫 total_profit（單一 writer 是 sync_service）"
+    assert bot.state.total_trades == 0, "全域計數器同樣不得被 handler 寫"
+    assert bot.state.total_profit == 0, "全域計數器同樣不得被 handler 寫"
+
+
+def test_rest_sync_is_the_only_counter_writer_end_to_end():
+    """雙寫翻倍的完整情境：同一筆成交先被 REST 同步算過，再走一次 userData handler
+    （userData 復活時就是這個順序）。總數必須維持 1 筆，不能變 2。"""
+    bot = make_bot()
+    st = bot.state.symbols["BNB/USDC:USDC"]
+
+    ex = FakeExchange([[trade(1, "1.5")]])
+    bot.sync_service.ctx = FakeCtx(ex)
+    bot.sync_service.gateway = FakeGateway()
+    bot.sync_service.start_time_ms = 1_699_000_000_000
+
+    holder = {"t": 1_000_000.0}
+    clock.set_clock(lambda: holder["t"])
+    try:
+        asyncio.run(bot.sync_service._sync_trade_stats())
+        assert st.total_trades == 1
+        assert st.total_profit == pytest.approx(1.5)
+
+        asyncio.run(bot._handle_order_update(FILLED_EVENT))
+
+        assert st.total_trades == 1, "同一筆成交被 REST + userData 各算一次 = 翻倍"
+        assert st.total_profit == pytest.approx(1.5), "已實現盈虧同樣不得翻倍"
+    finally:
+        clock.reset_clock()

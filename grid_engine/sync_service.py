@@ -78,16 +78,28 @@ class SyncService:
             self.last_sync_time = _time()
 
     async def _sync_funding_rates(self):
-        """同步所有交易對的 funding rate"""
+        """同步所有交易對的 funding rate。
+
+        逐 symbol try/except（與 _sync_orders 同構）：這個方法排在 sync_all() 裡
+        `_sync_trade_stats` **之前**，例外冒泡走的是同一條致命路徑
+        （_handle_ticker → ws_client outer except = 強制重連 ⇒ 失敗持續發生時
+        變成每 5 秒重連一次的永久迴圈，decide() 停擺）。原本它完全沒有 try/except，
+        而 _sync_trade_stats 的外層保險註解卻宣稱「兄弟方法每一個都保證不拋例外」
+        ——那句話當時是假的（見 dual-review C1）。
+        """
         if not self.ctx.funding_manager:
             return
 
         for sym_config in self.config.symbols.values():
-            if sym_config.enabled:
+            if not sym_config.enabled:
+                continue
+            try:
                 rate = await self.gateway.call(self.ctx.funding_manager.update_funding_rate, sym_config.ccxt_symbol)
                 sym_state = self.state.symbols.get(sym_config.ccxt_symbol)
                 if sym_state:
                     sym_state.current_funding_rate = rate
+            except Exception as e:
+                logger.error(f"同步 {sym_config.ccxt_symbol} funding rate 失敗: {e}")
 
     async def _sync_positions(self):
         try:
@@ -220,13 +232,21 @@ class SyncService:
             await self._sync_trade_stats_body()
         except Exception as e:
             # 兄弟方法（_sync_positions/_sync_orders/_sync_account/_sync_funding_rates）
-            # 每一個都保證不拋例外（spec §6）；這是這組方法裡唯一沒有整段包住的一個。
-            # 例外冒泡的路徑：_handle_ticker → ws_client.py 的 outer except（檔頭
-            # characterization 註解鎖定的語意：handler 例外=強制重連）⇒ 若失敗持續發生，
-            # 變成每 5 秒重連一次的永久迴圈，decide() 停擺，手上還有實倉與掛單
-            # （見 security-fix Medium-1）。內層分頁 try/except 已經處理絕大多數失敗，
-            # 這層是最後一道保險，不改變內層「整批丟棄/單筆跳過」的既有語意。
+            # 各自都有整段/逐 symbol 的 try/except（_sync_funding_rates 的那道是
+            # dual-review C1 才補上的——在那之前這句註解是假的，例外從那個兄弟方法
+            # 仍然暢通）。例外冒泡的路徑：_handle_ticker → ws_client.py 的 outer
+            # except（檔頭 characterization 註解鎖定的語意：handler 例外=強制重連）
+            # ⇒ 若失敗持續發生，變成每 5 秒重連一次的永久迴圈，decide() 停擺，
+            # 手上還有實倉與掛單（見 security-fix Medium-1）。內層分頁 try/except
+            # 已經處理絕大多數失敗，這層是最後一道保險，不改變內層「整批丟棄/
+            # 單筆跳過」的既有語意。
             logger.error(f"同步成交統計失敗（外層保險，不應常態觸發）: {e}")
+        finally:
+            # 節流時間戳必須在 finally 推進：放在 body 最後一行時，body 拋例外
+            # （正是這層保險要接的那種）會讓時間戳永不前進 ⇒ 之後每一次 sync_all()
+            # （每 10s）都重打 fetch_my_trades，靜默變成 6 倍 API 權重，且每輪重做
+            # 同一批 pending 計算（見 dual-review B1）。
+            self._last_trade_stats_at = clock.now()
 
     async def _sync_trade_stats_body(self):
         for sym_config in self.config.symbols.values():
@@ -335,10 +355,14 @@ class SyncService:
                     # 的情況下，「這頁全是舊資料」是分頁過程中的正常過渡態（例如追上真正
                     # 邊界前的最後一次重疊頁），不代表卡死，錯把它當卡死會漏抓後面的新資料。
                     nxt = last_ts
-                    if nxt == since:
+                    # 判定用 `<=` 而非 `==`（見 dual-review C4）：`trades[-1]` 不保證
+                    # 是該頁 timestamp 最大的一筆，`nxt < since` 時原本的 `==` 擋不住，
+                    # since 會往回退 ⇒ 下一頁重撈已掃過的區間。`==` 只守住「完全不動」
+                    # 這一個點，不是完整的單調性守衛。
+                    if nxt <= since:
                         logger.error(
-                            f"{symbol} 成交分頁在 ts={nxt} 卡死"
-                            f"（同毫秒成交量超過單頁上限），本輪停止推進")
+                            f"{symbol} 成交分頁游標無法前進（ts={nxt} <= since={since}，"
+                            f"同毫秒成交量超過單頁上限或頁尾非最大 ts），本輪停止推進")
                         break
                     since = nxt
                     if page_count >= TRADE_STATS_MAX_PAGES_PER_SYNC:
@@ -370,4 +394,3 @@ class SyncService:
 
         self.state.total_trades = sum(s.total_trades for s in self.state.symbols.values())
         self.state.total_profit = sum(s.total_profit for s in self.state.symbols.values())
-        self._last_trade_stats_at = clock.now()

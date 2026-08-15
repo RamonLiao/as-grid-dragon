@@ -54,6 +54,11 @@ class WsClient:
         while not self._stop_event.is_set():
             try:
                 async with websockets.connect(self.config.websocket_url, ssl=ssl_context) as ws:
+                    # 陳舊旗標清零（見 dual-review C3）：旗標若在「連線之外」被設起
+                    # （例如上一條連線已因例外斷開、或 watchdog 在重連空窗期呼叫），
+                    # 它會存活到新連線，在第一則訊息之後立刻再斷一次 ⇒ 一次請求換
+                    # 兩次重連（多一次 decide() 盲窗）。新連線讓先前的重連請求失去意義。
+                    self._reconnect_requested = False
                     self.state.connected = True
 
                     # listenKey 在 WS 斷線後會被伺服器廢棄 ⇒ 每次（重）連都必須重新取得。

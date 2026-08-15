@@ -62,7 +62,29 @@ class UserDataWatchdog:
         return (self.orders_since_event >= self.order_threshold
                 and clock.now() - self.last_event_at >= self.silence_seconds)
 
+    def _reanchor_if_clock_rewound(self, now: float):
+        """時鐘倒退防呆（spec §8.1 已認列的風險；不是 monotonic 時鐘的完整解）。
+
+        clock.now() 是 wall clock：NTP 校正/容器時間同步/人工改時間都可能讓它倒退。
+        倒退之後 last_event_at 與 next_attempt_at 會停在「永遠到不了的未來」，狀態機
+        從此不再判死也不再重連——「userData 靜默失效而沒有儀器」這件事原地在
+        watchdog 自己身上重演。偵測到倒退就把時間基準重新錨到 now，最壞停滯上限
+        收斂成一個退避週期，而不是永久卡死。
+        """
+        max_backoff = max(BACKOFF_SECONDS)
+        if (now >= self.last_event_at
+                and now >= self.next_attempt_at - max_backoff
+                and now >= self._last_given_up_log_at):
+            return
+        logger.warning(
+            f"[watchdog] 偵測到時鐘倒退（now={now:.0f} < 既有時間基準），重新錨定，"
+            f"避免退避時點卡在永遠到不了的未來")
+        self.last_event_at = min(self.last_event_at, now)
+        self.next_attempt_at = min(self.next_attempt_at, now + max_backoff)
+        self._last_given_up_log_at = min(self._last_given_up_log_at, now)
+
     def check(self):
+        self._reanchor_if_clock_rewound(clock.now())
         if self.state == "given_up":
             # spec §5.2：終態後只 log 不動作。但終態正是最需要持續提醒的狀態
             # （目前只有進終態當下那一封 Telegram），故每隔一段時間節流提醒一次，
@@ -115,6 +137,18 @@ class UserDataWatchdog:
                 f"將嘗試自動重連最多 {len(BACKOFF_SECONDS)} 次。"
             )
 
+        # 證據重取（見 dual-review B2）：重連之後必須用**新的**證據重新判定。
+        # 不重置的話，orders_since_event / last_event_at 只有 record_event() 會清，
+        # 於是「重連成功修好了 stream，但市場安靜沒有新單」（實盤成交率曾低到
+        # ~1 筆/天，加上裝死模式不 requote）時，同一批陳舊證據會在 300/900/2700 秒
+        # 後再判死兩次，65 分鐘內燒完三次強制重連並發出「需人工介入」的 ⛔ 告警
+        # ——而 stream 其實是好的。每次假重連都會把 state.connected 切 False、
+        # 中斷 bookTicker，等於在有實倉時製造 decide() 盲窗。
+        # 代價：真的壞掉時，下一次判死要等新的 K 張單 + N 秒靜默重新累積；
+        # 這正是「用新證據判定」的定義，也是本元件判準綁事件計數的初衷。
+        self.orders_since_event = 0
+        self.last_event_at = now
+
         self.ws_client.request_reconnect()
 
     # ---- 迴圈 ----
@@ -136,11 +170,13 @@ class UserDataWatchdog:
             return
         try:
             asyncio.get_running_loop()
+            # 存引用防止 task 在執行前被 GC；完成後自移除避免長跑累積
+            task = asyncio.create_task(self.notifier.send(message))
+            self.tasks.append(task)
+            task.add_done_callback(lambda t: t in self.tasks and self.tasks.remove(t))
         except RuntimeError:
-            # 無 running loop（同步測試環境）：沒有迴圈可掛 fire-and-forget task，
-            # 直接同步跑完這個 coroutine，行為對呼叫端等價（訊息仍會送出）。
-            asyncio.run(self.notifier.send(message))
-            return
-        task = asyncio.create_task(self.notifier.send(message))
-        self.tasks.append(task)
-        task.add_done_callback(lambda t: t in self.tasks and self.tasks.remove(t))
+            # 無 event loop 時只留 log——對齊 order_executor.py 的既有 pattern
+            # （dual-review D）。原本這裡退回 asyncio.run(...)，那是純粹為了讓
+            # 同步測試能跑而存在的生產程式碼路徑：生產上 watchdog 永遠在 loop 裡跑，
+            # 這條分支只會在測試中被走到，卻是兩個 pattern 混用（專案規則 9）。
+            logger.warning(f"[watchdog] 無 event loop，通知未送出: {message}")
