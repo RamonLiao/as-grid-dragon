@@ -96,6 +96,7 @@ class WsClient:
 
                         if self._consume_reconnect_request():
                             logger.warning("[WebSocket] 收到重連請求，主動斷開重連")
+                            self.state.connected = False
                             break
             except Exception as e:
                 self.state.connected = False
