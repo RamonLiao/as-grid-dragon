@@ -109,6 +109,7 @@ class MaxGridBot:
             gateway=self.gateway, ctx=self.ctx, config=self.config,
             state=self.state, locks=self.locks, notifier=self.notifier,
             risk_monitor=self.risk_monitor, tasks=self.tasks,
+            start_time_ms=int(time.time() * 1000),
         )
         # WS 純傳輸組件（handlers 引用 bot bound method，callback 不包 try——
         # ticker 例外必須冒泡到 WsClient 重連迴圈）
@@ -612,8 +613,8 @@ class MaxGridBot:
             sym_state = self.state.symbols[ccxt_symbol]
 
             if order_status == 'FILLED':
-                sym_state.total_trades += 1
-                self.state.total_trades += 1
+                # total_trades / total_profit 的 writer 已改為 sync_service._sync_trade_stats()
+                # （REST）。這裡再寫一次會在 userData 復活時造成計數翻倍。
 
                 exec_price = float(order_data.get('p', 0) or order_data.get('ap', 0) or 0)
                 exec_qty = float(order_data.get('q', 0) or 0)
@@ -622,8 +623,6 @@ class MaxGridBot:
                     self.leading_indicator.record_trade(ccxt_symbol, exec_price, exec_qty, trade_side_for_ofi)
 
                 if realized_pnl != 0:
-                    sym_state.total_profit += realized_pnl
-                    self.state.total_profit += realized_pnl
                     pnl_sign = "+" if realized_pnl > 0 else ""
                     logger.info(f"[userData] {symbol_raw} 成交! {side} {position_side}, "
                                f"盈虧: {pnl_sign}{realized_pnl:.4f}")
