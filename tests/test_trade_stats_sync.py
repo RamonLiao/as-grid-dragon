@@ -4,6 +4,7 @@
 的話，userData 一旦復活數字就會翻倍。
 """
 import asyncio
+import math
 from pathlib import Path
 
 import pytest
@@ -372,7 +373,7 @@ def test_sync_all_actually_calls_sync_trade_stats(frozen_clock, monkeypatch):
 def test_default_start_time_ms_uses_now_not_epoch(monkeypatch):
     """verifier-fix finding 4：不傳 start_time_ms 時，口徑要是「本次啟動以來」
     （= 建構當下的 now），不能靜默退化成 epoch(0) 等於拉全部歷史。"""
-    monkeypatch.setattr("grid_engine.sync_service.time.time", lambda: 1_700_000_000.0)
+    monkeypatch.setattr("grid_engine.sync_service._time", lambda: 1_700_000_000.0)
     ex = FakeExchange([[]])
     state = GlobalState()
     state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
@@ -436,6 +437,98 @@ def test_malformed_last_timestamp_does_not_lose_page(frozen_clock):
     st = state.symbols["BNB/USDC:USDC"]
     assert st.total_trades == 2, "頁尾 timestamp 畸形不能讓已算好的整頁被丟棄"
     assert st.total_profit == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("bad_pnl", ["nan", "inf", "-inf"])
+def test_malformed_realized_pnl_nan_inf_does_not_poison_total(frozen_clock, bad_pnl):
+    """verifier finding Important-1：realizedPnl 為 'nan'/'inf'/'-inf' 時 float() 不拋
+    例外，逐筆 try/except 接不到；total_profit 用 += 累加、無重置點，一旦混入
+    NaN/inf 會永久污染並印上 Telegram 日報。修法：用 math.isfinite() 擋掉，跳過此筆、
+    其餘正常計入，total_profit 必須保持有限值。
+    """
+    bad = trade(1, bad_pnl)
+    good = trade(2, "1.0")
+
+    svc, state, ex = make_service([[bad, good]])
+    asyncio.run(svc._sync_trade_stats())
+
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 1, "非有限值那筆必須被跳過，不計入 total_trades"
+    assert math.isfinite(st.total_profit), \
+        "total_profit 不得被 NaN/inf 污染（修復前這裡會是 nan/inf）"
+    assert st.total_profit == pytest.approx(1.0), "正常那筆要照樣被計入"
+    assert math.isfinite(state.total_profit), "全域彙總也不得被污染"
+
+    # 游標必須推進過這筆的 id，且下一輪一筆正常成交要能救回來（不永久卡死）。
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    ex.pages.append([bad, good, trade(3, "1.0")])
+    asyncio.run(svc._sync_trade_stats())
+    assert st.total_trades == 2, "下一輪只有新增的 id=3 該被算"
+    assert st.total_profit == pytest.approx(2.0), \
+        "修復前：一旦污染成 nan，這裡即使之後有正常筆 +1.0 也救不回來"
+
+
+def test_malformed_trade_cursor_advances_only_once_per_bad_trade(frozen_clock, caplog):
+    """verifier finding Minor-2：tid dedup 游標推進必須在欄位解析**之前**（程式碼中的
+    註解宣稱如此），否則同一筆畸形資料會每輪重複被掃到、重複打 warning log（實測
+    mutant：把推進順序移到解析之後，43 條測試仍全綠 ⇒ 是「會執行的註解」）。
+    這裡直接鎖住「連續多輪下，同一筆畸形資料只產生一次 warning」這個可觀察行為。
+    """
+    # 只有一筆畸形資料、沒有更高 id 的正常筆同批出現：若混入更高 id 的正常筆，
+    # 那筆本身就會把 page_max_id 推過畸形筆的 id，掩蓋掉「畸形筆本身有沒有推進
+    # 游標」這件事——之前一版測試就是這樣被 mutant 騙過去的（43 條全綠）。
+    bad = trade(1, "0.5")
+    bad["info"]["realizedPnl"] = "abc"   # float() 拋 ValueError，走畸形分支
+
+    svc, state, ex = make_service([[bad]])
+
+    import logging
+    caplog.set_level(logging.WARNING, logger="as_grid_max")
+
+    asyncio.run(svc._sync_trade_stats())
+    warn_count_round1 = sum(1 for r in caplog.records if "id=1" in r.message)
+    assert warn_count_round1 == 1, "第一輪應該只對畸形那筆 warning 一次"
+
+    # 下一輪同一頁重打（含同一筆壞資料）：若游標推進順序被移到解析之後，
+    # tid=1 會因為畸形而 continue 在 page_max_id 推進之前，導致 page_max_id 沒被
+    # 推進到 1，下一輪同一筆壞資料會再次通過 `tid <= page_max_id` 檢查、重新解析、
+    # 重新記警告。
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    ex.pages.append([bad])
+    asyncio.run(svc._sync_trade_stats())
+
+    total_warn_for_bad_id = sum(1 for r in caplog.records if "id=1" in r.message)
+    assert total_warn_for_bad_id == 1, (
+        "同一筆畸形資料在多輪下只該被記警告一次——游標必須先於欄位解析推進，"
+        "否則每輪都會重新掃到同一筆壞資料、重複記警告（mutant 行為：warnings=[6] "
+        "而非 [1]）"
+    )
+
+
+def test_narrow_time_monkeypatch_does_not_leak_to_global_time_module(monkeypatch):
+    """verifier finding Minor-4：舊測試 monkeypatch
+    `grid_engine.sync_service.time.time` 解析到的是全域 `time` 模組物件，等於把
+    `time.time` 全程序換掉。這裡驗證改用 `from time import time as _time` 之後，
+    monkeypatch `grid_engine.sync_service._time` 只影響 sync_service 模組命名空間
+    裡的引用，不會外溢到真正的 stdlib `time.time`。
+    """
+    import time as real_time_module
+    original = real_time_module.time
+
+    monkeypatch.setattr("grid_engine.sync_service._time", lambda: 1_700_000_000.0)
+
+    ex = FakeExchange([[]])
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[])
+    assert svc.start_time_ms == 1_700_000_000_000
+
+    assert real_time_module.time is original, (
+        "monkeypatch 不得外溢到真正的 stdlib time.time"
+        "（修復前：patch grid_engine.sync_service.time.time 等於整程序都被換掉）"
+    )
 
 
 def test_userdata_handler_no_longer_writes_counters():

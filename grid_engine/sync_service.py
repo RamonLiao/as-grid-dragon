@@ -3,7 +3,9 @@
 鎖序不變式：_sync_lock（本 service 持有）→ symbol lock（共享 SymbolLocks），單向。
 """
 import asyncio
-import time
+import math
+from time import time as _time
+from typing import Optional
 
 from . import clock
 from .utils import logger
@@ -31,7 +33,7 @@ TRADE_STATS_SINCE_MARGIN_MS = 5_000
 
 class SyncService:
     def __init__(self, gateway, ctx, config, state, locks, notifier, risk_monitor, tasks,
-                 start_time_ms: int = None):
+                 start_time_ms: Optional[int] = None):
         self.gateway = gateway
         self.ctx = ctx
         self.config = config
@@ -47,7 +49,7 @@ class SyncService:
         # 預設值不可是 0（epoch）：少傳這個 kwarg 會讓口徑從「本次啟動以來」靜默
         # 變成「全期累計」（見 whole-branch review Minor-3）。
         if start_time_ms is None:
-            start_time_ms = int(time.time() * 1000)
+            start_time_ms = int(_time() * 1000)
         self.start_time_ms = start_time_ms
         self._last_trade_id: dict = {}
         self._last_trade_since: dict = {}   # 每 symbol 的分頁游標，跨輪持續推進（見 Critical-1 修復）
@@ -65,9 +67,9 @@ class SyncService:
 
     async def maybe_sync(self):
         """ticker 高頻路徑的節流同步（原 _handle_ticker 尾端 gating 收編）"""
-        if time.time() - self.last_sync_time > self.config.sync_interval:
+        if _time() - self.last_sync_time > self.config.sync_interval:
             await self.sync_all()
-            self.last_sync_time = time.time()
+            self.last_sync_time = _time()
 
     async def _sync_funding_rates(self):
         """同步所有交易對的 funding rate"""
@@ -243,6 +245,10 @@ class SyncService:
                         # 畸形而被下面 continue 跳過，dedup 游標仍然前進，同一筆壞資料
                         # 不會下一輪又撞到、重複記警告、卡住整批（見 whole-branch review
                         # Important-3——這正是本分支要根除的「數字靜默停住」換個形式回來）。
+                        # 取捨：這筆的 id 從此永久燒進游標——即使交易所後續回傳這筆的
+                        # 正確資料，也不會再被重抓（`tid <= page_max_id` 會直接濾掉）。
+                        # 用「這筆的統計值永久漏記」換「不會每輪重複卡在同一筆壞資料上」，
+                        # 是本分支的刻意選擇（見 verifier-fix Minor-3）。
                         page_max_id = max(page_max_id, tid)
                         try:
                             # 用 .get('info', {}) 而非 `t.get('info') or {}`：缺 info
@@ -250,6 +256,13 @@ class SyncService:
                             # 才是畸形（.get() on None 拋 AttributeError，被下面接住跳過）。
                             info = t.get('info', {})
                             pnl = float(info.get('realizedPnl', 0) or 0)
+                            if not math.isfinite(pnl):
+                                # float('nan')/float('inf') 不拋例外，逐筆 try/except
+                                # 接不到——但 total_profit 用 += 累加、沒有重置點，一旦
+                                # 混入 NaN/inf 就永久污染，且會直接印上 Telegram 日報
+                                # （見 verifier-fix Important-1）。比照畸形欄位處理：
+                                # 跳過此筆，不進累加。
+                                raise ValueError(f"realizedPnl 非有限值: {pnl}")
                         except (TypeError, ValueError, AttributeError) as e:
                             # 單筆隔離，不比照 id 的 continue 之外再毒死整個 symbol
                             # 那一輪（硬化不對稱是 review 指出的問題本身）。
