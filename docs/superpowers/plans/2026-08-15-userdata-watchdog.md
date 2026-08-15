@@ -12,8 +12,8 @@
 
 ## Global Constraints
 
-- 全套測試必須在 `as-grid-dragon` 子目錄跑：monorepo 根目錄會被 `as-grid-auto/test_position_mode.py` 的 collection-time `sys.exit(1)` 打斷。
-- 測試基線：**590 passed / 1 skipped**。每個 Task 結束時全套必須全綠，且新增測試數量要報出來。
+- **工作目錄是 worktree**：`/Users/ramonliao/Documents/理財/加密貨幣/量化交易/LouisLab/as-grid-dragon-wt-userdata`（branch `feat/userdata-watchdog`）。全套測試必須在該目錄跑：monorepo 根目錄會被 `as-grid-auto/test_position_mode.py` 的 collection-time `sys.exit(1)` 打斷。`data/` 是指向本體 checkout 的 symlink。
+- 測試基線（**worktree 內實測**）：**589 passed / 2 skipped**。兩條 skip 是 `test_backtest_matching_realdata.py`（K 線資料已變動）與 `tests/web/test_config_store.py:117`（worktree 無 gitignored 的 `config/`，這是刻意不 symlink——真錢引擎正在讀那個檔）。每個 Task 結束時全套必須維持此基線 + 新增測試全綠，數量要報出來。
 - 只 `git add <file>...` 明確列出的檔案，禁止 `git add -A` / `git add .`。
 - watchdog 不得具備下單、撤單、改倉能力；唯一副作用是「請求 WS 重連」與「發通知」。
 - 重連硬上限 **3 次**，退避 **300 / 900 / 2700 秒**，之後進 `given_up` 終態。
