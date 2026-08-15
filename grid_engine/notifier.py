@@ -42,8 +42,20 @@ class TelegramNotifier:
                         logger.warning(f"Telegram 發送失敗 [{resp.status}]: {body}")
                         return False
         except Exception as e:
-            logger.warning(f"Telegram 發送異常: {e}")
+            logger.warning(f"Telegram 發送異常: {self._redact(e)}")
             return False
+
+    def _redact(self, e: Exception) -> str:
+        """把例外字串化結果裡可能出現的 bot token 遮蔽掉。
+
+        aiohttp 的 ClientResponseError/InvalidURL 等帶 request_info 的例外，字串化
+        會帶出完整 request URL（含 token），一路印進 log 檔（log/as_terminal_max.log
+        會被人工貼出、也在 repo 目錄下）⇒ token 外洩（見 security-fix Low-4）。
+        """
+        msg = str(e)
+        if self.bot_token:
+            msg = msg.replace(self.bot_token, "***")
+        return msg
 
     async def notify_crash(self, error: str):
         """Bot 崩潰通知"""

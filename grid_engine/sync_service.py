@@ -29,6 +29,12 @@ TRADE_STATS_INTERVAL = 60.0     # 與 sync_interval(10s) 解耦，省 API 權重
 # 永久漏抓——同一個 dedup 判準，方向相反的盲點。未處理：同上，trade id 實務上
 # 不會亂跳，機率極低。
 TRADE_STATS_SINCE_MARGIN_MS = 5_000
+# 單一 symbol、單輪 _sync_trade_stats 允許跑的最大分頁頁數。無上限時，這段迴圈跑在
+# ws_client.py 的 recv 迴圈內（handler 例外冒泡=重連是這條路徑唯一的失敗語意，見
+# ws_client.py 檔頭 characterization 註解），停滯期間 ping/watchdog/recv 全部被卡住。
+# 10 頁 = 1 萬筆成交，遠超單輪同步週期(TRADE_STATS_INTERVAL=60s)內合理發生的成交量，
+# 超限就停、記 warning，下一輪從已推進的游標續拉（見 security-fix Medium-2）。
+TRADE_STATS_MAX_PAGES_PER_SYNC = 10
 
 
 class SyncService:
@@ -210,6 +216,19 @@ class SyncService:
         if clock.now() - self._last_trade_stats_at < TRADE_STATS_INTERVAL:
             return
 
+        try:
+            await self._sync_trade_stats_body()
+        except Exception as e:
+            # 兄弟方法（_sync_positions/_sync_orders/_sync_account/_sync_funding_rates）
+            # 每一個都保證不拋例外（spec §6）；這是這組方法裡唯一沒有整段包住的一個。
+            # 例外冒泡的路徑：_handle_ticker → ws_client.py 的 outer except（檔頭
+            # characterization 註解鎖定的語意：handler 例外=強制重連）⇒ 若失敗持續發生，
+            # 變成每 5 秒重連一次的永久迴圈，decide() 停擺，手上還有實倉與掛單
+            # （見 security-fix Medium-1）。內層分頁 try/except 已經處理絕大多數失敗，
+            # 這層是最後一道保險，不改變內層「整批丟棄/單筆跳過」的既有語意。
+            logger.error(f"同步成交統計失敗（外層保險，不應常態觸發）: {e}")
+
+    async def _sync_trade_stats_body(self):
         for sym_config in self.config.symbols.values():
             if not sym_config.enabled:
                 continue
@@ -227,8 +246,11 @@ class SyncService:
             pending_n = 0
             pending_pnl = 0.0
             last_seen_ts = None
+            id_warn_logged = False   # 節流：同一輪同一 symbol 只記一次 id 解析失敗警告
+            page_count = 0
             try:
                 while True:
+                    page_count += 1
                     trades = await self.gateway.call(
                         self.ctx.exchange.fetch_my_trades,
                         symbol=symbol, since=since, limit=1000)
@@ -238,6 +260,15 @@ class SyncService:
                         try:
                             tid = int(t.get('id'))
                         except (TypeError, ValueError):
+                            # 與下方 realizedPnl/timestamp 對齊：不對稱的靜默 continue
+                            # 正是本分支要根除的「數字靜默停住」換個形式回來（見
+                            # security-fix Low-3）。節流成每輪至多一次，避免整批畸形
+                            # id 洗版 log。
+                            if not id_warn_logged:
+                                logger.warning(
+                                    f"{symbol} 成交 id 解析失敗（tid={t.get('id')!r}），"
+                                    f"跳過此筆計數（本輪同類警告僅記一次）")
+                                id_warn_logged = True
                             continue
                         if tid <= page_max_id:
                             continue
@@ -310,6 +341,16 @@ class SyncService:
                             f"（同毫秒成交量超過單頁上限），本輪停止推進")
                         break
                     since = nxt
+                    if page_count >= TRADE_STATS_MAX_PAGES_PER_SYNC:
+                        # 這段迴圈 inline 跑在 WS recv 迴圈內（呼叫鏈：ws_client.py
+                        # handler → bot.py maybe_sync → sync_all → 這裡）；無上限會讓
+                        # 單次同步吃光 recv/ping/watchdog 的時間片（見 security-fix
+                        # Medium-2）。已處理的 pending_n/pending_pnl/游標照常在迴圈
+                        # 外套用，下一輪從這裡推進到的 since 續拉，不漏不重。
+                        logger.warning(
+                            f"{symbol} 成交分頁達單輪上限 {TRADE_STATS_MAX_PAGES_PER_SYNC} "
+                            f"頁，本輪停止，游標已推進至 since={since}，下一輪續拉")
+                        break
             except Exception as e:
                 # 失敗：緩衝區整個丟棄，不套用到 st、不推進游標，保留既有數值。
                 # 把失敗當成 0 筆寫回去、或把已算的部分半套用，都會讓數字錯（倒退或翻倍）。

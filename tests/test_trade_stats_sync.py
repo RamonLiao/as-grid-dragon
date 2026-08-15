@@ -11,7 +11,10 @@ import pytest
 
 from grid_engine import clock
 from grid_engine.state import GlobalState, SymbolState
-from grid_engine.sync_service import SyncService, TRADE_STATS_INTERVAL, TRADE_STATS_SINCE_MARGIN_MS
+from grid_engine.sync_service import (
+    SyncService, TRADE_STATS_INTERVAL, TRADE_STATS_SINCE_MARGIN_MS,
+    TRADE_STATS_MAX_PAGES_PER_SYNC,
+)
 
 BOT_PY = Path(__file__).resolve().parents[1] / "grid_engine" / "bot.py"
 
@@ -528,6 +531,104 @@ def test_narrow_time_monkeypatch_does_not_leak_to_global_time_module(monkeypatch
     assert real_time_module.time is original, (
         "monkeypatch 不得外溢到真正的 stdlib time.time"
         "（修復前：patch grid_engine.sync_service.time.time 等於整程序都被換掉）"
+    )
+
+
+def test_summary_aggregation_exception_does_not_propagate(frozen_clock):
+    """security-fix Medium-1：結尾彙總 `sum(s.total_trades for s in ...)` 若拋例外，
+    不得冒泡出 `_sync_trade_stats`（冒泡 = WS handler 例外 = 強制重連，見 finding
+    說明）。這裡不是模擬——用一個讀取 total_trades 時刪除自己的 trap 物件，在
+    sum() 真正迭代 dict.values() 期間觸發真正的
+    `RuntimeError: dictionary changed size during iteration`。
+    """
+    class ExplodingSymbolState:
+        def __init__(self, container, key):
+            self.container = container
+            self.key = key
+            self.total_profit = 0.0
+
+        @property
+        def total_trades(self):
+            del self.container[self.key]   # 迭代中途改變 dict 大小
+            return 0
+
+    svc, state, ex = make_service([[trade(1, "0.5")]])
+    trap_key = "TRAP/USDC:USDC"
+    state.symbols[trap_key] = ExplodingSymbolState(state.symbols, trap_key)
+
+    # 修復前：RuntimeError 會從這裡冒出去，測試在這一行直接失敗（asyncio.run 重拋）。
+    asyncio.run(svc._sync_trade_stats())
+
+    assert trap_key not in state.symbols, "trap 的刪除自身副作用必須已發生，證明真的跑進了 sum()"
+    # 個別 symbol 的正常同步不應被外層保險影響——BNB 那筆該算的還是要算到。
+    assert state.symbols["BNB/USDC:USDC"].total_trades == 1
+
+
+def test_page_cap_stops_and_resumes_across_rounds(frozen_clock, caplog):
+    """security-fix Medium-2：分頁迴圈頁數必須有上限（跑在 WS recv 迴圈內，無上限
+    會讓 ping/watchdog/recv 全部被卡住）。超限要停、記 warning，且下一輪要能從
+    已推進的游標續拉，不漏不重。
+    """
+    import logging
+    caplog.set_level(logging.WARNING, logger="as_grid_max")
+
+    start = 1_700_000_000_000
+    total_ids = 1000 * (TRADE_STATS_MAX_PAGES_PER_SYNC + 3)
+    all_trades = [trade(i, "0.01", ts=start + i) for i in range(1, total_ids + 1)]
+    ex = SinceFilterExchange(all_trades, page_limit=1000)
+
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[], start_time_ms=start)
+
+    asyncio.run(svc._sync_trade_stats())
+    st = state.symbols["BNB/USDC:USDC"]
+
+    # 修復前：沒有頁數上限，第一輪就會一路撈到 total_ids，下面兩個斷言都會紅。
+    assert len(ex.since_calls) == TRADE_STATS_MAX_PAGES_PER_SYNC, (
+        "單輪分頁次數必須被硬上限擋住，不能無限跑下去"
+    )
+    assert st.total_trades < total_ids, "頁數上限應該讓第一輪撈不完，留給下一輪續拉"
+    assert any("達單輪上限" in r.message for r in caplog.records), "超限必須記 warning"
+
+    # 之後多輪續拉：不漏（最終要等於 total_ids）、不重（不能超過 total_ids）。
+    for _ in range(20):
+        if st.total_trades >= total_ids:
+            break
+        frozen_clock["t"] += TRADE_STATS_INTERVAL
+        asyncio.run(svc._sync_trade_stats())
+
+    assert st.total_trades == total_ids, "多輪續拉後總數必須精確等於真值，不漏不重"
+
+
+def test_malformed_trade_id_warns_once_per_round_not_per_trade(frozen_clock, caplog):
+    """security-fix Low-3：trade id 解析失敗（`int(t.get('id'))` 拋例外）不得是靜默
+    continue——與下方 realizedPnl/timestamp 的處理不對稱，會讓 total_trades 靜默
+    少算且無任何線索。同一輪即使多筆 id 畸形，也只記一次 warning（節流），不逐筆洗版。
+    """
+    import logging
+    caplog.set_level(logging.WARNING, logger="as_grid_max")
+
+    bad1 = trade(1, "0.1")
+    bad1["id"] = None
+    bad2 = trade(2, "0.2")
+    bad2["id"] = "not-a-number"
+    good = trade(3, "0.3")
+
+    svc, state, ex = make_service([[bad1, bad2, good]])
+    asyncio.run(svc._sync_trade_stats())
+
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 1, "id 畸形的兩筆不該計入，正常那筆要照樣算"
+    assert st.total_profit == pytest.approx(0.3)
+
+    id_warnings = [r for r in caplog.records if "id 解析失敗" in r.message]
+    # 修復前：這條路徑是靜默 continue，完全不記 log，這裡會紅在 len(...) == 0。
+    assert len(id_warnings) == 1, (
+        "同一輪內即使多筆 id 畸形，也只該記一次警告（節流），"
+        f"實際記了 {len(id_warnings)} 次"
     )
 
 

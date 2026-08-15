@@ -39,6 +39,30 @@ class TestTelegramNotifier:
             assert result is False
 
     @pytest.mark.asyncio
+    async def test_send_failure_masks_bot_token_in_log(self, caplog):
+        """security-fix Low-4：aiohttp 連線類例外字串化會帶出完整 URL（含 token）；
+        log 內容不得出現 token 明文（該檔會被人工貼出、也在 repo 目錄下）。"""
+        import logging
+        token = "123456789:AAExampleSecretTokenValue"
+        notifier = TelegramNotifier(bot_token=token, chat_id="456")
+        boom = Exception(
+            f"Cannot connect to host api.telegram.org:443 ssl:default "
+            f"[https://api.telegram.org/bot{token}/sendMessage]"
+        )
+        caplog.set_level(logging.WARNING, logger="as_grid_max")
+        with patch("aiohttp.ClientSession.post", side_effect=boom):
+            result = await notifier.send("test message")
+            assert result is False
+        assert token not in caplog.text, "bot token 明文洩漏進 log"
+
+    @pytest.mark.asyncio
+    async def test_send_failure_with_empty_token_does_not_crash(self, caplog):
+        """bot_token 為空字串時 str.replace 不能炸出奇怪結果（notifier.enabled 為
+        False 時 send() 提早 return，這裡直接測 _redact 本身涵蓋這個邊界）。"""
+        notifier = TelegramNotifier(bot_token="", chat_id="456")
+        assert notifier._redact(Exception("some error")) == "some error"
+
+    @pytest.mark.asyncio
     async def test_notify_crash_formats_message(self):
         notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
         notifier.send = AsyncMock(return_value=True)
