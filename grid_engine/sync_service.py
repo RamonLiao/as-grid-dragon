@@ -21,12 +21,17 @@ TRADE_STATS_INTERVAL = 60.0     # 與 sync_interval(10s) 解耦，省 API 權重
 # 會被 dedup 永久判定成「舊資料」而漏抓。這是已知風險，未处理：Binance 同一帳戶/
 # symbol 的 trade id 實務上單調遞增且依序回傳，此情境判定為極低機率，改成「有界的
 # 已見 id 集合」需要額外的記憶體管理與過期策略，這輪不做。
+# 反方向的限制（whole-branch review 已裁決不修，同樣記在這裡）：若某筆成交的 id
+# 異常偏大（例如交易所端資料錯亂），page_max_id 會被它一次跳到很高，之後所有 id
+# 比它小、但其實是尚未處理過的正常成交，會被 `tid <= page_max_id` 誤判成舊資料而
+# 永久漏抓——同一個 dedup 判準，方向相反的盲點。未處理：同上，trade id 實務上
+# 不會亂跳，機率極低。
 TRADE_STATS_SINCE_MARGIN_MS = 5_000
 
 
 class SyncService:
     def __init__(self, gateway, ctx, config, state, locks, notifier, risk_monitor, tasks,
-                 start_time_ms: int = 0):
+                 start_time_ms: int = None):
         self.gateway = gateway
         self.ctx = ctx
         self.config = config
@@ -38,7 +43,11 @@ class SyncService:
         # 並發鎖：sync 防重入（鎖序固定 _sync_lock → symbol lock）
         self._sync_lock = asyncio.Lock()
         self.last_sync_time = 0
-        # 成交統計：口徑為「本次引擎啟動以來」，與 userData 時代的語意一致
+        # 成交統計：口徑為「本次引擎啟動以來」，與 userData 時代的語意一致。
+        # 預設值不可是 0（epoch）：少傳這個 kwarg 會讓口徑從「本次啟動以來」靜默
+        # 變成「全期累計」（見 whole-branch review Minor-3）。
+        if start_time_ms is None:
+            start_time_ms = int(time.time() * 1000)
         self.start_time_ms = start_time_ms
         self._last_trade_id: dict = {}
         self._last_trade_since: dict = {}   # 每 symbol 的分頁游標，跨輪持續推進（見 Critical-1 修復）
@@ -230,23 +239,50 @@ class SyncService:
                             continue
                         if tid <= page_max_id:
                             continue
+                        # tid 先於欄位解析推進 page_max_id：即使這筆的 realizedPnl/info
+                        # 畸形而被下面 continue 跳過，dedup 游標仍然前進，同一筆壞資料
+                        # 不會下一輪又撞到、重複記警告、卡住整批（見 whole-branch review
+                        # Important-3——這正是本分支要根除的「數字靜默停住」換個形式回來）。
                         page_max_id = max(page_max_id, tid)
+                        try:
+                            # 用 .get('info', {}) 而非 `t.get('info') or {}`：缺 info
+                            # 鍵維持原行為（視同 0，不算畸形）；info 鍵存在但顯式 None
+                            # 才是畸形（.get() on None 拋 AttributeError，被下面接住跳過）。
+                            info = t.get('info', {})
+                            pnl = float(info.get('realizedPnl', 0) or 0)
+                        except (TypeError, ValueError, AttributeError) as e:
+                            # 單筆隔離，不比照 id 的 continue 之外再毒死整個 symbol
+                            # 那一輪（硬化不對稱是 review 指出的問題本身）。
+                            logger.warning(
+                                f"{symbol} 成交 id={tid} 欄位解析失敗，跳過此筆計數"
+                                f"（不影響同批其他筆與游標推進）: {e}")
+                            continue
                         pending_n += 1
-                        pending_pnl += float(
-                            t.get('info', {}).get('realizedPnl', 0) or 0)
-                    last_ts = trades[-1].get('timestamp')
-                    if last_ts:
-                        last_seen_ts = int(last_ts)
+                        pending_pnl += pnl
+                    raw_last_ts = trades[-1].get('timestamp')
+                    last_ts = None
+                    if raw_last_ts:
+                        try:
+                            last_ts = int(raw_last_ts)
+                        except (TypeError, ValueError) as e:
+                            # 畸形 timestamp 視同缺 timestamp 處理（走下面既有的安全路徑），
+                            # 不讓它整批丟棄已經算好的 pending_n/pending_pnl。
+                            logger.warning(
+                                f"{symbol} 成交分頁最後一筆 timestamp 解析失敗，"
+                                f"視同缺 timestamp 處理: {e}")
+                    if last_ts is not None:
+                        last_seen_ts = last_ts
                     if len(trades) < 1000:
                         break
-                    if not last_ts:
-                        # 理論上 Binance 不會回 falsy timestamp（未觀測過），但這條分支
-                        # 與上面 Critical-1 同構：若真的發生，_last_trade_since 不推進，
-                        # 下一輪同一個 since 撈回同一頁、全被 tid dedup、又走這條 break
-                        # ⇒ 永久凍結。留一行 log 避免它變成靜默凍結。
+                    if last_ts is None:
+                        # 理論上 Binance 不會回 falsy/畸形 timestamp（未觀測過），但這條
+                        # 分支與上面 Critical-1 同構：若真的發生，_last_trade_since 不
+                        # 推進，下一輪同一個 since 撈回同一頁、全被 tid dedup、又走這條
+                        # break ⇒ 永久凍結。留一行 log 避免它變成靜默凍結。
                         logger.warning(
-                            f"{symbol} 成交分頁最後一筆缺 timestamp，本輪停止推進"
-                            f"（since={since} 未推進，若持續發生請檢查交易所回傳格式）")
+                            f"{symbol} 成交分頁最後一筆缺（或無法解析）timestamp，"
+                            f"本輪停止推進（since={since} 未推進，若持續發生請檢查"
+                            f"交易所回傳格式）")
                         break
                     # 分頁：Binance 單次上限 1000。用最後一筆的 timestamp（不 +1）當下一頁
                     # since —— 若最後一筆與頁尾之後還有同毫秒的成交，+1 會把它們永久跳過；
@@ -254,7 +290,7 @@ class SyncService:
                     # 終止條件是「since 推不動」而非「這頁沒有新 id」：後者在游標持續推進
                     # 的情況下，「這頁全是舊資料」是分頁過程中的正常過渡態（例如追上真正
                     # 邊界前的最後一次重疊頁），不代表卡死，錯把它當卡死會漏抓後面的新資料。
-                    nxt = int(last_ts)
+                    nxt = last_ts
                     if nxt == since:
                         logger.error(
                             f"{symbol} 成交分頁在 ts={nxt} 卡死"

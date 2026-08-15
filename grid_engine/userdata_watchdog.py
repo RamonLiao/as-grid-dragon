@@ -99,8 +99,14 @@ class UserDataWatchdog:
             f"{self.orders_since_event} 張單無推送、靜默 {now - self.last_event_at:.0f}s，"
             f"強制重連（第 {self.attempts}/{len(BACKOFF_SECONDS)} 次）"
         )
-        self.ws_client.request_reconnect()
 
+        # 告警排在 request_reconnect() 之前（見 whole-branch review Minor-2）：
+        # attempts/state/next_attempt_at 已在上面更新完畢，request_reconnect() 若拋例外，
+        # run() 的 broad except 會吞掉、狀態機不受影響——但若告警排在重連之後，
+        # 例外會讓第一封「疑似靜默失效」永遠發不出去，違反 spec §6「Telegram 失敗
+        # 只 log、不影響狀態機」反方向的保證（使用者仍要被通知）。故不包 try/except
+        # 壓制 request_reconnect() 的例外（沒有必要，且會掩蓋真正的重連失敗），
+        # 而是單純把告警移到它前面，確保告警一定送出。
         if not self._alerted:
             self._alerted = True
             self._notify(
@@ -108,6 +114,8 @@ class UserDataWatchdog:
                 f"已下/撤 {self.orders_since_event} 張單但零事件推送。"
                 f"將嘗試自動重連最多 {len(BACKOFF_SECONDS)} 次。"
             )
+
+        self.ws_client.request_reconnect()
 
     # ---- 迴圈 ----
     async def run(self):

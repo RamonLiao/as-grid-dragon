@@ -338,6 +338,106 @@ def test_since_floor_does_not_regress(frozen_clock):
     assert ex.since_calls[-1] == start + 45_000, "游標不能被較小的候選值往回拉"
 
 
+def test_sync_all_actually_calls_sync_trade_stats(frozen_clock, monkeypatch):
+    """verifier-fix finding 1：sync_all() 必須真的呼叫 _sync_trade_stats()，不能被
+    靜默拔線。其餘四個 _sync_* 換成 no-op，只用 spy 包住 _sync_trade_stats 本尊
+    （不是讀原始碼字串）——刪掉 sync_all() 裡那一行呼叫，這個測試必須紅在
+    `assert called == [True]`。
+    """
+    svc, state, ex = make_service([[trade(1, "0.5")]])
+
+    called = []
+    orig = svc._sync_trade_stats
+
+    async def spy():
+        called.append(True)
+        await orig()
+
+    async def noop():
+        return None
+
+    monkeypatch.setattr(svc, "_sync_trade_stats", spy)
+    monkeypatch.setattr(svc, "_sync_positions", noop)
+    monkeypatch.setattr(svc, "_sync_orders", noop)
+    monkeypatch.setattr(svc, "_sync_account", noop)
+    monkeypatch.setattr(svc, "_sync_funding_rates", noop)
+
+    asyncio.run(svc.sync_all())
+
+    assert called == [True], "sync_all() 沒有真的呼叫 _sync_trade_stats()"
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 1, "spy 轉呼叫本尊後，統計要真的被寫入"
+
+
+def test_default_start_time_ms_uses_now_not_epoch(monkeypatch):
+    """verifier-fix finding 4：不傳 start_time_ms 時，口徑要是「本次啟動以來」
+    （= 建構當下的 now），不能靜默退化成 epoch(0) 等於拉全部歷史。"""
+    monkeypatch.setattr("grid_engine.sync_service.time.time", lambda: 1_700_000_000.0)
+    ex = FakeExchange([[]])
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[])
+    assert svc.start_time_ms == 1_700_000_000_000, \
+        "預設值必須是建構當下的 now(ms)，不是 0(epoch)"
+
+
+def test_malformed_realized_pnl_does_not_freeze_symbol(frozen_clock):
+    """verifier-fix finding 3：單筆 realizedPnl 畸形（例如 'abc'）不得毒死整個
+    symbol 那一輪——正常那幾筆要照樣計入、游標要推進、下一輪不能撞回同一筆卡死。
+    """
+    bad = trade(1, "0.5")
+    bad["info"]["realizedPnl"] = "abc"   # float() 會拋 ValueError
+    good1 = trade(2, "0.3")
+    good2 = trade(3, "0.2")
+
+    svc, state, ex = make_service([[bad, good1, good2]])
+    asyncio.run(svc._sync_trade_stats())
+
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 2, "正常的兩筆必須被計入，不能整批被畸形那筆拖累丟棄"
+    assert st.total_profit == pytest.approx(0.5)
+
+    # 游標必須推進過畸形那筆的 id，下一輪重打同樣三筆(含壞的那筆)不能再撞到它、
+    # 也不能重複計入好的兩筆。
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    ex.pages.append([bad, good1, good2, trade(4, "1.0")])
+    asyncio.run(svc._sync_trade_stats())
+    assert st.total_trades == 3, "下一輪只有新增的 id=4 該被算，不能卡在畸形那筆重複掃描"
+    assert st.total_profit == pytest.approx(1.5)
+
+
+def test_malformed_info_none_does_not_freeze_symbol(frozen_clock):
+    """verifier-fix finding 3：info=None（非缺欄位而是顯式 None）同樣要逐筆隔離，
+    不得讓 .get() on None 的 AttributeError 毒死整個 symbol 那一輪。"""
+    bad = trade(1, "0.5")
+    bad["info"] = None
+    good = trade(2, "0.3")
+
+    svc, state, ex = make_service([[bad, good]])
+    asyncio.run(svc._sync_trade_stats())
+
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 1, "info=None 那筆要被跳過，但正常那筆要照樣計入"
+    assert st.total_profit == pytest.approx(0.3)
+
+
+def test_malformed_last_timestamp_does_not_lose_page(frozen_clock):
+    """verifier-fix finding 3：頁尾最後一筆 timestamp 畸形，仍要保留這一頁已經算好
+    的筆數/盈虧（視同缺 timestamp 處理），不能讓整輪被拋出的例外整批丟棄。"""
+    t1 = trade(1, "0.5")
+    t2 = trade(2, "0.3")
+    t2["timestamp"] = "not-a-number"
+
+    svc, state, ex = make_service([[t1, t2]])
+    asyncio.run(svc._sync_trade_stats())
+
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 2, "頁尾 timestamp 畸形不能讓已算好的整頁被丟棄"
+    assert st.total_profit == pytest.approx(0.8)
+
+
 def test_userdata_handler_no_longer_writes_counters():
     """單一 writer 守衛：handler 原始碼不得再累加這兩個計數器。"""
     src = BOT_PY.read_text(encoding="utf-8")

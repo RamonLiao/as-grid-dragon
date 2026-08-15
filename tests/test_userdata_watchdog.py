@@ -212,6 +212,63 @@ def test_watchdog_constants_are_pinned():
     assert CHECK_INTERVAL == 60.0
 
 
+def test_record_event_updates_last_event_at(frozen_clock):
+    """verifier-fix finding 2：record_event() 必須真的推進 last_event_at。若拿掉
+    `self.last_event_at = clock.now()` 這行，last_event_at 永遠停在舊值，之後只要
+    湊滿門檻張數就會立刻判死——600s 的推送延遲餘裕永久消失。
+    mutation test：拿掉那一行賦值，下面 `assert wd.state == "healthy"` 必須紅。
+    """
+    wd, ws, notifier = make_wd()
+    for _ in range(DEFAULT_ORDER_THRESHOLD):
+        wd.record_order_action()
+    frozen_clock["t"] += DEFAULT_SILENCE_SECONDS + 1
+    wd.check()
+    assert wd.state == "degraded"
+    assert ws.reconnects == 1
+
+    wd.record_event()
+    assert wd.state == "healthy"
+
+    # 推進的時間 < silence_seconds，但湊滿門檻張數：若 last_event_at 沒被更新，
+    # now - last_event_at 會用回舊的 last_event_at，超過 silence_seconds，立刻誤判死。
+    frozen_clock["t"] += DEFAULT_SILENCE_SECONDS - 1
+    for _ in range(DEFAULT_ORDER_THRESHOLD):
+        wd.record_order_action()
+    wd.check()
+    assert wd.state == "healthy", \
+        "record_event() 沒更新 last_event_at，600s 推送延遲餘裕消失了"
+    assert ws.reconnects == 1, "不該有新的重連——餘裕還沒到"
+
+
+def test_first_alert_sent_even_if_reconnect_raises(frozen_clock):
+    """verifier-fix finding 5：_notify() 必須排在 request_reconnect() 之前。若
+    request_reconnect() 拋例外而 _notify() 排在它後面，第一封「⚠️ 疑似靜默失效」
+    會永遠發不出去（run() 的 broad except 接住例外，watchdog 不死，但這封信沒了）。
+    mutation test：把 _notify 挪回 request_reconnect() 之後，
+    `assert len(notifier.sent) == 1` 必須紅（notifier.sent 會是空的，因為
+    request_reconnect() 先拋例外，_notify 那行永遠執行不到）。
+    """
+    class BoomWs(FakeWs):
+        def request_reconnect(self):
+            super().request_reconnect()
+            raise RuntimeError("ws down")
+
+    ws = BoomWs()
+    notifier = FakeNotifier()
+    wd = UserDataWatchdog(ws_client=ws, notifier=notifier, tasks=[],
+                          stop_event=asyncio.Event())
+    for _ in range(DEFAULT_ORDER_THRESHOLD):
+        wd.record_order_action()
+    frozen_clock["t"] += DEFAULT_SILENCE_SECONDS + 1
+
+    with pytest.raises(RuntimeError):
+        wd.check()
+
+    assert len(notifier.sent) == 1, \
+        "request_reconnect() 掛掉不能連累第一封告警發不出去"
+    assert ws.reconnects == 1
+
+
 def test_watchdog_has_no_trading_surface():
     """安全約束：watchdog 不得具備下單/撤單能力。"""
     forbidden = {"place_order", "cancel_order", "cancel_orders_for_side",
