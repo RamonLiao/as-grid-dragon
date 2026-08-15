@@ -25,12 +25,28 @@ class WsClient:
         self.handlers = handlers
         self.listen_key: Optional[str] = None
 
+        # watchdog 觸發的重連請求：只設旗標，由 run() 內層迴圈自行 break。
+        # 不從外部關 socket、也不對 run() 拋例外——後者會污染本檔開頭
+        # characterization 註解鎖定的「例外冒泡 = 重連」語意。
+        self._reconnect_requested = False
+
     def _fetch_listen_key(self) -> str:
         response = self.ctx.exchange.fapiPrivatePostListenKey()
         return response.get("listenKey")
 
     async def acquire_listen_key(self):
         self.listen_key = await self.gateway.call(self._fetch_listen_key)
+
+    def request_reconnect(self):
+        """請求下一次迴圈檢查時斷開重連（最壞延遲 = recv timeout 30s）。"""
+        self._reconnect_requested = True
+
+    def _consume_reconnect_request(self) -> bool:
+        """讀取並清除旗標。一次性語意：清不掉會變成永久重連迴圈。"""
+        if self._reconnect_requested:
+            self._reconnect_requested = False
+            return True
+        return False
 
     async def run(self):
         ssl_context = ssl.create_default_context(cafile=certifi.where())
@@ -77,6 +93,10 @@ class WsClient:
 
                         except asyncio.TimeoutError:
                             await ws.ping()
+
+                        if self._consume_reconnect_request():
+                            logger.warning("[WebSocket] 收到重連請求，主動斷開重連")
+                            break
             except Exception as e:
                 self.state.connected = False
                 if not self._stop_event.is_set():
