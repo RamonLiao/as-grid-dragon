@@ -9,10 +9,18 @@ from . import clock
 from .utils import logger
 
 TRADE_STATS_INTERVAL = 60.0     # 與 sync_interval(10s) 解耦，省 API 權重
-# 分頁游標往回退的安全邊際：REST 端偶有到達延遲/時鐘誤差，
-# 純用「上次看到的最大 timestamp」當下次 since 會有漏抓風險；退幾秒換一點重覆讀取
-# （靠 tid dedup 擋掉重複計數，成本可忽略），換到不會漏。5s 是主觀但有理由的取值：
-# 遠大於 REST 正常延遲（通常 < 1s），又遠小於「累計成交數已破千」時重拉全部歷史的成本。
+# 分頁游標往回退的安全邊際：REST 端偶有到達延遲/時鐘誤差，純用「上次看到的最大
+# timestamp」當下次 since 會漏掉「timestamp 落在邊際窗內、但比上輪 cursor 晚才可見」
+# 的成交；退幾秒換一點重複讀取（靠 tid dedup 擋掉重複計數，成本可忽略），兜住這種
+# timestamp 到達順序亂掉的情況。5s 是主觀但有理由的取值：遠大於 REST 正常延遲
+# （通常 < 1s），又遠小於「累計成交數已破千」時重拉全部歷史的成本。
+#
+# 已知限制（不是這個邊際能解的）：dedup 判準是 `tid <= page_max_id`（純看 id 大小），
+# 邊際只兜「timestamp 亂序」，兜不了「id 有空洞」——若某筆成交的 id 落在已處理過的
+# id 區間內但遲遲不可見（例如先看到 id=1,2,3,5，id=4 之後才出現），無論邊際多大都
+# 會被 dedup 永久判定成「舊資料」而漏抓。這是已知風險，未处理：Binance 同一帳戶/
+# symbol 的 trade id 實務上單調遞增且依序回傳，此情境判定為極低機率，改成「有界的
+# 已見 id 集合」需要額外的記憶體管理與過期策略，這輪不做。
 TRADE_STATS_SINCE_MARGIN_MS = 5_000
 
 

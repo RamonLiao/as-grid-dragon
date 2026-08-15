@@ -8,7 +8,7 @@ import pytest
 
 from grid_engine import clock
 from grid_engine.state import GlobalState, SymbolState
-from grid_engine.sync_service import SyncService, TRADE_STATS_INTERVAL
+from grid_engine.sync_service import SyncService, TRADE_STATS_INTERVAL, TRADE_STATS_SINCE_MARGIN_MS
 
 
 class FakeGateway:
@@ -251,6 +251,87 @@ def test_steady_state_after_exceeding_page_limit_does_not_freeze(frozen_clock):
         all_trades.append(trade(i, "0.01", ts=1_700_000_000_000 + i))
     asyncio.run(svc._sync_trade_stats())
     assert st.total_trades == 1215, "連續多輪新成交（再 +10）持續正確累加"
+
+
+def test_since_cursor_persists_across_rounds(frozen_clock):
+    """游標必須跨輪推進，不能每輪重打 start_time_ms（review 修復輪 2 Important：
+    這個機制本身之前完全沒測試守住，撤銷持久化全套照綠）。用下一輪實際打出去的
+    since 參數直接驗證機制存在，不靠計數側面推論。
+    """
+    start = 1_700_000_000_000
+    all_trades = [trade(1, "0.5", ts=start + 10_000)]   # 遠超過 margin(5s)，cursor 會明顯偏離 start
+    ex = SinceFilterExchange(all_trades, page_limit=1000)
+
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[], start_time_ms=start)
+
+    asyncio.run(svc._sync_trade_stats())
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    asyncio.run(svc._sync_trade_stats())
+
+    # 第 2 輪打出去的 since 必須是「上輪看到的最大 ts − margin」，不能還是 start_time_ms。
+    assert ex.since_calls[-1] == start + 10_000 - TRADE_STATS_SINCE_MARGIN_MS
+
+
+def test_margin_catches_late_arriving_trade_within_window(frozen_clock):
+    """安全邊際存在的理由：REST 端偶有到達延遲——timestamp 落在邊際窗內、
+    但直到下一輪才在回應中可見的成交，要靠邊際兜住；margin=0 會漏抓
+    （review 修復輪 2 Important：這個機制之前也完全沒測試守住）。
+    """
+    start = 1_700_000_000_000
+    all_trades = [trade(1, "0.01", ts=start + 50_000)]
+    ex = SinceFilterExchange(all_trades, page_limit=1000)
+
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[], start_time_ms=start)
+
+    asyncio.run(svc._sync_trade_stats())
+    st = state.symbols["BNB/USDC:USDC"]
+    assert st.total_trades == 1
+
+    # id=2 的 timestamp 比上輪看到的最大 ts 早 2s（落在 5s 邊際窗內），但這一輪才
+    # 第一次在 REST 回應中出現——模擬到達延遲。
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    all_trades.append(trade(2, "0.02", ts=start + 48_000))
+    asyncio.run(svc._sync_trade_stats())
+    assert st.total_trades == 2, "落在邊際窗內、遲到才可見的成交必須被抓到"
+
+
+def test_since_floor_does_not_regress(frozen_clock):
+    """游標只能單調前進，候選值比既有 floor 小時不能把游標往回拉——否則會不必要
+    地重掃更長歷史，把 I1 的效能訴求打回原形（review 修復輪 2 Important）。
+
+    觸發情境：某輪回應中「頁尾最後一筆」(trades[-1]) 的 timestamp 不是這頁真正
+    最大的 ts（list 順序與 ts 大小不同步的邊界情況），算出的候選值會小於既有 floor。
+    """
+    start = 1_700_000_000_000
+    all_trades = [trade(1, "0.01", ts=start + 50_000)]
+    ex = SinceFilterExchange(all_trades, page_limit=1000)
+
+    state = GlobalState()
+    state.symbols["BNB/USDC:USDC"] = SymbolState(symbol="BNB/USDC:USDC")
+    svc = SyncService(gateway=FakeGateway(), ctx=FakeCtx(ex), config=FakeConfig(),
+                      state=state, locks=None, notifier=None, risk_monitor=None,
+                      tasks=[], start_time_ms=start)
+
+    asyncio.run(svc._sync_trade_stats())   # cursor -> start + 45_000
+
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    # id=2 的 ts 比 id=1 小，但在 list 中排在後面 => 這輪 trades[-1] 的 ts 比既有
+    # floor 的推算基準還小，候選值 = (start+46_000) - 5_000 = start+41_000 < 既有 floor。
+    all_trades.append(trade(2, "0.01", ts=start + 46_000))
+    asyncio.run(svc._sync_trade_stats())
+
+    frozen_clock["t"] += TRADE_STATS_INTERVAL
+    asyncio.run(svc._sync_trade_stats())
+
+    assert ex.since_calls[-1] == start + 45_000, "游標不能被較小的候選值往回拉"
 
 
 def test_userdata_handler_no_longer_writes_counters():
