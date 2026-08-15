@@ -36,6 +36,7 @@ from .risk_monitor import RiskMonitor
 from .reporting import DailyReporter
 from .sync_service import SyncService
 from .ws_client import WsClient
+from .userdata_watchdog import UserDataWatchdog
 
 
 def _create_exchange(exchange_id: str, config: dict):
@@ -122,6 +123,12 @@ class MaxGridBot:
                 'ORDER_TRADE_UPDATE': self._handle_order_update,
             },
         )
+        # userData 靜默失效偵測（必須在 ws_client 之後建構：需要它的 request_reconnect）
+        self.userdata_watchdog = UserDataWatchdog(
+            ws_client=self.ws_client, notifier=self.notifier,
+            tasks=self.tasks, stop_event=self._stop_event,
+        )
+        self.order_executor.watchdog = self.userdata_watchdog
 
         self.last_order_times: Dict[str, float] = {}
 
@@ -534,6 +541,7 @@ class MaxGridBot:
     async def _handle_account_update(self, data: dict):
         """處理 ACCOUNT_UPDATE 事件"""
         try:
+            self.userdata_watchdog.record_event()
             account_data = data.get('a', {})
 
             balances = account_data.get('B', [])
@@ -594,6 +602,7 @@ class MaxGridBot:
     async def _handle_order_update(self, data: dict):
         """處理 ORDER_TRADE_UPDATE 事件"""
         try:
+            self.userdata_watchdog.record_event()
             order_data = data.get('o', {})
             symbol_raw = order_data.get('s', '')
             order_status = order_data.get('X', '')
@@ -695,6 +704,7 @@ class MaxGridBot:
         self.tasks.extend([
             asyncio.create_task(self.ws_client.run()),
             asyncio.create_task(self.ws_client.keep_alive_loop()),
+            asyncio.create_task(self.userdata_watchdog.run()),
         ])
         if self.notifier.enabled:
             self.tasks.append(asyncio.create_task(self.reporter.run()))

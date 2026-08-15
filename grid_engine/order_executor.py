@@ -17,7 +17,7 @@ ORDER_CIRCUIT_COOLDOWN = 300.0
 
 class OrderExecutor:
     def __init__(self, gateway, ctx, state, notifier, config, locks,
-                 stop_event: asyncio.Event, tasks: List[asyncio.Task]):
+                 stop_event: asyncio.Event, tasks: List[asyncio.Task], watchdog=None):
         self.gateway = gateway
         self.ctx = ctx          # 呼叫當下讀 ctx.exchange/ctx.precisions，絕不快照
         self.state = state
@@ -26,6 +26,7 @@ class OrderExecutor:
         self.locks = locks
         self._stop_event = stop_event
         self.tasks = tasks      # bot.tasks 共享參照：斷路通知 task 防 GC + stop 可 cancel
+        self.watchdog = watchdog  # userData 靜默失效偵測；None 時整條路徑降級為 no-op（回測不接）
 
         # 下單失敗退避/斷路器（per symbol）
         self._order_fail_counts: Dict[str, int] = {}
@@ -98,6 +99,9 @@ class OrderExecutor:
             if not reduce_only:
                 self._order_fail_counts[symbol] = 0
                 self._order_block_until.pop(symbol, None)
+            # 交易所端每次下單成功必定推一筆 ORDER_TRADE_UPDATE ⇒ 這是 watchdog 的訊號源
+            if self.watchdog:
+                self.watchdog.record_order_action()
             return result
         except Exception as e:
             self._register_order_failure(symbol, e)
@@ -149,5 +153,7 @@ class OrderExecutor:
 
                 if should_cancel:
                     await self.gateway.call(self.ctx.exchange.cancel_order, order['id'], symbol)
+                    if self.watchdog:
+                        self.watchdog.record_order_action()
         except Exception as e:
             logger.error(f"撤單失敗 {symbol}: {e}")
