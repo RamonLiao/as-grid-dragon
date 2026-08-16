@@ -1,8 +1,77 @@
 # Progress
 
-## Current Task（2026-08-14 更新）
+## Current Task（2026-08-15 更新）
 
-### 🔴🔴 userData stream 到現在**還是死的**，而且原本的修復方向被實驗否決
+### ✅ 本次完成：userData watchdog 全線 merge 進 main
+`main` = `69b5022`，13 commits（`caec67e..69b5022`，rebase 後 fast-forward）。
+**main 上實跑 670 passed / 1 skipped**（分支起點 589/2 + 80 條新測試；worktree 少的那條
+`test_config_store` 在有真實 `config/` 的 main 上會跑）。**尚未 push。**
+
+- spec：`docs/superpowers/specs/2026-08-15-userdata-watchdog-design.md`（六處更正皆留痕）
+- plan：`docs/superpowers/plans/2026-08-15-userdata-watchdog.md`（5 tasks）
+- 做了三件事：**偵測**靜默失效並告警、**有限復原**（3 次，退避 300/900/2700 後進 `given_up`）、
+  **成交統計改由 REST 增量拉取**（單一 writer，userData handler 停寫）。
+- 新增 `grid_engine/userdata_watchdog.py`；改 `ws_client.py`（旗標式 `request_reconnect()`）、
+  `order_executor.py`（餵張數）、`bot.py`（餵事件 + 接線）、`sync_service.py`（REST 統計）、
+  `reporting.py`/`notifier.py`（每日摘要帶 watchdog 狀態）。
+- review 全程：4 輪 per-task + whole-branch(opus) + verifier 兩輪(opus) + security-review(opus)
+  + dual-review 外部輪(opus)/Round 2 + 最終 scoped re-review(opus) = **Ship as-is**。
+
+**⚠️ 這是止血不是治本**：stream 仍然是死的。本次讓「它死了會被發現」且「數字是真的」。
+
+### 🔴 下次開工必做（依序）
+
+1. **重啟引擎做活體驗收**——唯一還沒走過的關卡。生產現在就處在失效態，重啟後會走完整條路徑：
+   `t0+600` 判死 + Telegram 第 1 封 + 重連 1/3 → **`t0+4200`（70 分）**進 `given_up` + 第 2 封
+   → 之後每日摘要天天顯示狀態。驗收指令見 plan Task 5。
+   注意：spec §7.3 寫的 75 分鐘是舊值，改成每輪重取證據後是 70 分（見 spec §8.2）。
+2. **修 M1（一行）**：`reporting.py` 的 `_format_watchdog_line` 對「key 存在但值型別錯」
+   （如 `silence_seconds` 是字串）無防禦，會讓當天摘要整封發不出去。目前不可達
+   （唯一生產者必回 float），但那是「摘要不得發不出去」硬性要求的唯一剩餘缺口。
+3. **userData 根因**：唯一剩下的可測假設是「這把 API key 在 Binance 端壞掉」。
+   需使用者在後台開一把新 key（Enable Reading + Enable Futures + 白名單加當前 IP），
+   用同一套探針重測。有事件 ⇒ 輪換 key 收工；沒有 ⇒ 開 Binance 客服單。
+   **已否決的假設完整清單見 `tasks/notes.md` 的 2026-08-15 條**（含 08-14 那輪）。
+4. `tasks/lessons.md` 已 ~120 行，超過 ~50 行門檻，該做第三次整併（三層制）。
+
+### 📋 backlog（本次認列未做，詳見 spec §8.1 / §8.2）
+- watchdog 用牆鐘量靜默時長與退避 → 應改 `time.monotonic()`（需另開注入點，不能共用現有 `clock`）。
+- `start_time_ms` 用本機時鐘當交易所 `since` 起點 → 應改用交易所時間。
+- `_handle_ticker` 無價格時效守衛（既有缺口，本次只用頁數上限縮小觸發面）。
+- **`bandit` / `dgt` 的 `record_trade` 仍只由死掉的 userData 餵**，而它們回頭影響 `decide()`。
+  三者生產上皆 `enabled: false` 故無實害，但**日後要開回任何一個，它們會拿到全零歷史且無警告**。
+- 裝死模式（零新單）下狀態機會停在 `degraded` 永遠走不到 `given_up`（設計必然，
+  可見性由每日摘要接住）。
+
+---
+
+## 先前狀態（2026-08-14）
+
+### 🔴 userData stream 死因調查——**結論見 `tasks/notes.md`**
+根因仍未確定且可能在 Binance 端。08-14/08-15 兩輪實驗已否決：訂閱方式（A/B 雙路）、
+stream name 被靜默丟棄（`LIST_SUBSCRIPTIONS` 證明有登記）、listenKey 過期/keepalive、
+socket 健康度、**listenKey 卡在伺服器端壞狀態（三次 DELETE+POST 輪換出全新 key 仍零推送）**、
+Portfolio Margin、multi-assets、API 權限；IP 白名單大幅弱化（REST 從同一 IP 全通）。
+08-15 另在舊 log 找到死亡時點：archive 有 58,408 筆 `[userData]`，最後一筆之後
+`WebSocket 錯誤: no close frame` → 重連 → 永久零筆。且 `POST listenKey` 在 key 有效時
+只回同一把舊 key ⇒ 這解釋了 `6a264d6` 為何修不好。
+
+### 🔴 生產問題：`-2015 Invalid API-key, IP` 反覆發作（TODO 6 的真正代價）
+出現過的 request ip 共 6 個：`223.140.219.162`(1739 筆, 07-18)、`111.241.136.139`(132, 08-10)、
+`61.216.73.207`(104)、`36.225.34.156`(15)、`118.166.239.83`(12)、`36.225.15.37`(10, 08-14)。
+被擋時撤單/下單/同步全掛。**⇒ TODO 6（GCE 固定 IP）優先度高。**
+
+### ⚠️ 另一個未解形態
+`2026-08-14 21:21:10` log 出現 `[MAX] 初始化完成` + `Task was destroyed but it is pending!`，
+但行程 pid 75367 從 08-12 一路活著沒重啟。**行程沒重啟卻跑了一次策略初始化**，形態不對，未查。
+
+### ✅ `assumed_leverage` 值域守衛（已 commit `3119e68`）
+掛在 `SymbolConfig.__setattr__`（不是 `from_dict`）——dataclass `__init__` 也走 setattr ⇒
+唯一涵蓋 from_dict / TUI / web 三個賦值點 / REPL 的咽喉點。非整數**拒絕不截斷**。
+
+<details><summary>更早的 08-14 實驗細節（已被 08-15 結論取代）</summary>
+
+### 原 08-14 記錄
 2026-07-30 的 listenKey 修復（`6094f4c`）確實解掉了 `-1125`（最後一筆 08-06 19:10，之後 8 天零筆），
 **但 `[userData]` 從 07-12 至今仍是 0 筆**。08-14 實驗證據鏈：
 
@@ -52,11 +121,13 @@ web 三個直接賦值點（`2_⚙️:194,306`、`3_🔬:214`）/ REPL 的咽喉
   的測試，該 mutation 現在會紅（實測 `1 failed, 10 passed`）。回歸面第二輪查過：roundtrip、
   型別依賴、`__init__` 順序、生產 config 載入後仍 int 5，全 PASS。
 
-工作區：` M .gitignore`（既有）、` M grid_engine/config.py`、`?? tests/test_assumed_leverage_config.py`。**未 commit。**
+（該段當時記為「未 commit」，實際已於 `3119e68` commit。）
+
+</details>
 
 ---
 
-## 先前狀態
+## 更早的狀態（2026-07-30）
 **TODO 1c 全線完成並 merge + push（2026-07-30）。**
 `main == origin/main`（`b7fd7de`，本次推 20 commits）。三條舊 branch 已刪（本地 + 遠端，全部 `--merged main` 確認過）。
 工作區只剩 ` M .gitignore`（既有，與近期任務無關，使用者未指示處理）。
