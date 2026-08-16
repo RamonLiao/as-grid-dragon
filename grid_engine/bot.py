@@ -129,6 +129,9 @@ class MaxGridBot:
             tasks=self.tasks, stop_event=self._stop_event,
         )
         self.order_executor.watchdog = self.userdata_watchdog
+        # 後綁定（比照 order_executor.watchdog）：reporter 建構得比 watchdog 早，
+        # 建構順序硬約束無法倒過來（reporter 不需要 ws_client/watchdog 就能跑）。
+        self.reporter.watchdog = self.userdata_watchdog
 
         self.last_order_times: Dict[str, float] = {}
 

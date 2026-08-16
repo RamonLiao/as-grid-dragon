@@ -134,6 +134,8 @@ class TelegramNotifier:
             pos_lines.append(f"  {coin}: {', '.join(sides)} | PnL: {pos.get('pnl', 0):+.2f}")
         pos_text = "\n".join(pos_lines) or "  (無持倉)"
 
+        watchdog_line = self._format_watchdog_line(pnl_data.get("watchdog"))
+
         msg = (
             f"{icon} <b>每日損益摘要</b>\n"
             f"時間: {now}\n"
@@ -142,9 +144,35 @@ class TelegramNotifier:
             f"未實現 PnL: <b>{total_pnl:+.2f}</b>\n"
             f"累計已實現: {total_profit:+.2f}\n"
             f"運行: {running_hours:.1f} 小時\n"
+            f"{watchdog_line}"
             f"\n<b>持倉概況:</b>\n{pos_text}"
         )
         await self.send(msg)
+
+    @staticmethod
+    def _format_watchdog_line(watchdog) -> str:
+        """userData watchdog 狀態行（見 tasks 分支說明：終態訊號要進使用者真的
+        會看的每日摘要，不能只留在 log 裡）。
+
+        安全要求：狀態字串一律是這裡自己定義的常數，不把交易所資料或例外訊息
+        未跳脫插進 HTML 訊息（parse_mode=HTML）。watchdog 為 None／格式不符
+        時整行省略，不得影響既有欄位。
+        """
+        if not isinstance(watchdog, dict):
+            return ""
+        state = watchdog.get("state")
+        if state == "given_up":
+            silence_minutes = watchdog.get("silence_seconds", 0) / 60
+            attempts = watchdog.get("attempts", 0)
+            return (
+                f"⛔ <b>userData 監控：已放棄自動重連，需人工介入</b>"
+                f"（已重連 {attempts} 次、靜默 {silence_minutes:.0f} 分鐘）\n"
+            )
+        if state == "degraded":
+            return "⚠️ userData 監控：重連中\n"
+        if state == "healthy":
+            return "✅ userData 監控：正常\n"
+        return ""
 
     async def notify_risk_alert(self, alert: str):
         """風控警報"""

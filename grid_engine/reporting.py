@@ -2,15 +2,43 @@
 import asyncio
 from datetime import datetime
 
+from . import clock
 from .utils import logger
+
+_WATCHDOG_VALID_STATES = ("healthy", "degraded", "given_up")
 
 
 class DailyReporter:
-    def __init__(self, config, state, notifier, stop_event: asyncio.Event):
+    def __init__(self, config, state, notifier, stop_event: asyncio.Event, watchdog=None):
         self.config = config
         self.state = state
         self.notifier = notifier
         self._stop_event = stop_event
+        self.watchdog = watchdog
+
+    def _get_watchdog_status(self):
+        """讀取 watchdog 狀態供每日摘要顯示。
+
+        硬性要求：取狀態失敗絕不能讓每日摘要發不出去——任何例外都在這裡
+        被吞掉降級成「不顯示該行」（回傳 None），不得往外冒泡。只讀屬性，
+        不呼叫任何會改變 watchdog 狀態的方法。
+        """
+        if self.watchdog is None:
+            return None
+        try:
+            state = self.watchdog.state
+            if state not in _WATCHDOG_VALID_STATES:
+                return None
+            silence_seconds = max(0.0, clock.now() - self.watchdog.last_event_at)
+            attempts = int(self.watchdog.attempts)
+            return {
+                "state": state,
+                "silence_seconds": silence_seconds,
+                "attempts": attempts,
+            }
+        except Exception as e:
+            logger.warning(f"[reporter] watchdog 狀態讀取失敗，摘要跳過該行: {e}")
+            return None
 
     async def run(self):
         """每日 telegram_daily_pnl_hour (Asia/Taipei, UTC+8) 整點發送損益摘要"""
@@ -49,6 +77,7 @@ class DailyReporter:
                     "total_profit": self.state.total_profit,
                     "positions": positions,
                     "running_hours": running_hours,
+                    "watchdog": self._get_watchdog_status(),
                 }
                 await self.notifier.notify_daily_pnl(pnl_data)
             except asyncio.CancelledError:

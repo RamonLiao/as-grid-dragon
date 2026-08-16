@@ -209,6 +209,21 @@ def test_order_update_resets_watchdog_even_on_unknown_symbol():
         clock.reset_clock()
 
 
+def test_daily_reporter_is_wired_to_watchdog():
+    """接線守衛：bot.py 沒把 watchdog 傳給 DailyReporter，這條要紅。
+
+    這個改動本身就是一條新接線（每日摘要要顯示 watchdog 狀態），元件各自正確
+    但沒被接上是本分支反覆出現的失效模式（見同檔案其他接線測試的說明）。
+    刪掉 bot.py 裡 `self.reporter.watchdog = self.userdata_watchdog` 那行，
+    這條測試必須紅在下面的 `is` 斷言。
+    """
+    from grid_engine.bot import MaxGridBot
+    from grid_engine.config import GlobalConfig
+
+    bot = MaxGridBot(GlobalConfig())
+    assert bot.reporter.watchdog is bot.userdata_watchdog
+
+
 def test_account_update_alone_does_not_reset_watchdog():
     """finding 1 行為守衛（非原始碼掃描）：只收到 ACCOUNT_UPDATE、完全沒有
     ORDER_TRADE_UPDATE 的情境下，watchdog 不得被重置。資金費結算

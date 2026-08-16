@@ -301,6 +301,64 @@ class TestNotifierSwitch:
         msg = notifier.send.call_args[0][0]
         assert "(無持倉)" in msg
 
+    @pytest.mark.asyncio
+    async def test_daily_pnl_watchdog_given_up_demands_human_intervention(self):
+        """given_up 時摘要必須明確講出需要人工介入，並帶關鍵數字（重連次數、靜默時長）。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({
+            "total_pnl": 1.0, "total_equity": 100.0,
+            "positions": {}, "running_hours": 1,
+            "watchdog": {"state": "given_up", "silence_seconds": 7200, "attempts": 3},
+        })
+        msg = notifier.send.call_args[0][0]
+        assert "需人工介入" in msg
+        assert "3 次" in msg
+        assert "120 分鐘" in msg
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_watchdog_healthy_is_short(self):
+        """healthy 時要簡短不佔版面：不得出現「需人工介入」或「重連中」字樣。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({
+            "total_pnl": 1.0, "total_equity": 100.0,
+            "positions": {}, "running_hours": 1,
+            "watchdog": {"state": "healthy", "silence_seconds": 0, "attempts": 0},
+        })
+        msg = notifier.send.call_args[0][0]
+        assert "✅" in msg and "userData" in msg
+        assert "需人工介入" not in msg
+        assert "重連中" not in msg
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_watchdog_degraded_is_visible(self):
+        """degraded（重連中）要看得出來，且不能被誤判成 given_up 或 healthy。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({
+            "total_pnl": 1.0, "total_equity": 100.0,
+            "positions": {}, "running_hours": 1,
+            "watchdog": {"state": "degraded", "silence_seconds": 300, "attempts": 1},
+        })
+        msg = notifier.send.call_args[0][0]
+        assert "重連中" in msg
+        assert "需人工介入" not in msg
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_watchdog_none_omits_line_and_does_not_crash(self):
+        """watchdog 為 None（未接線／舊呼叫點）時摘要照常發出，且不含 watchdog 行。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({
+            "total_pnl": 1.0, "total_equity": 100.0,
+            "positions": {}, "running_hours": 1,
+            "watchdog": None,
+        })
+        msg = notifier.send.call_args[0][0]
+        assert "userData" not in msg
+        assert notifier.send.called
+
 
 class TestNotifierMonkey:
     """極端測試 — 故意把 notifier 玩壞"""
@@ -340,6 +398,21 @@ class TestNotifierMonkey:
         notifier.send = AsyncMock(return_value=True)
         await notifier.notify_daily_pnl({})
         assert notifier.send.called
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_watchdog_garbage_shapes_do_not_crash(self):
+        """Monkey test：watchdog 欄位塞各種不合法形狀（非 dict、未知 state、
+        缺 key），一律不得讓摘要發不出去。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        for garbage in ["not a dict", 123, [], {}, {"state": "???"},
+                        {"state": "given_up"}, {"state": None}]:
+            await notifier.notify_daily_pnl({
+                "total_pnl": 1.0, "total_equity": 100.0,
+                "positions": {}, "running_hours": 1,
+                "watchdog": garbage,
+            })
+        assert notifier.send.call_count == 7
 
     @pytest.mark.asyncio
     async def test_daily_pnl_with_negative_values(self):
