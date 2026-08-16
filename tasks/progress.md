@@ -1,8 +1,52 @@
 # Progress
 
-## Current Task（2026-08-15 更新）
+## Current Task（2026-08-16 更新）
 
-### ✅ 本次完成：userData watchdog 全線 merge 進 main
+### 🟢 0a watchdog 活體驗收：狀態機全程走完（引擎 `09:29:08` 重啟，跑 `f4bdd8a`）
+**兩封 Telegram 使用者皆已確認收到**（09:39 的 ⚠️、11:27 的 ⛔）。
+**還沒關的一格**：今晚 **20:00** 的每日摘要是否帶 `⛔ userData 監控：已放棄自動重連，需人工介入`
+那行（`telegram_daily_pnl_hour: 20`）—— 今晚才驗得到。
+
+實測時間軸（`log/as_terminal_max.log`，非推論）：
+
+| 時點 | 事件 | 證據 |
+|---|---|---|
+| 09:29:08 | 已訂閱 userData stream | 啟動撤 4 + 掛 4 = 8 張單 |
+| **09:39:08** | **判死 + 強制重連 1/3** | `8 張單無推送、靜默 605s`；10 秒後重新訂閱 |
+| 10:03:45 | requote（撤 4 + 掛 4） | 補滿新證據 |
+| **10:04:08** | **重連 2/3** | `靜默 1500s` |
+| 10:20:55 | requote | |
+| **10:21:08** | **重連 3/3** | `靜默 1020s`；`next_attempt_at = 11:06:08` |
+| 11:06:08 | 退避到期，但**沒進 given_up** | 10:21 後零 requote ⇒ `orders_since_event=0`、`_is_dead()` 不成立 |
+| 11:26:11 | requote（65 分鐘的安靜期結束） | 補滿新證據 |
+| **11:27:08** | **進 `given_up` + ⛔ Telegram 第 2 封** | `已重連 3 次仍無事件推送，停止自動復原` |
+
+⇒ **整條路徑走完，t0+118 分鐘**（09:29:08 → 11:27:08）。之後零重連（終態只 log 不動作，
+每 3600s 節流提醒一次），符合 spec §5.2。
+
+- ✅ **證據重取路徑實測走通**：重連後 `orders_since_event` / `last_event_at` 歸零，一定要等
+  下一次 requote 補滿 8 張單才會再判死 —— 這正是 dual-review B2 要的行為。
+- ✅ log 零 `Telegram 發送失敗`（最後一筆 403 停在 2026-07-12），且**使用者已確認 09:39 那封
+  「⚠️ userData stream 疑似靜默失效」實際收到** —— 端到端告警路徑活體驗證完成。
+- 🔴 **時間表要回寫 spec §8.2**：實際每階耗時是 `max(退避, 600s 靜默) + 等下一次 requote`。
+  spec 的 70 分鐘與「純退避累加 = 80 分」**都低估**，實測 **118 分**（1→2 花 25 分、2→3 花 17 分、
+  3→given_up 花 66 分，其中 21 分純粹在等 requote）。
+  **正確的描述是：`given_up` 的抵達時間不是時間函數，是 requote 事件函數，安靜市況下無上界。**
+  今日 requote 間隔實測 25~80 分（03:50 / 05:12 / 06:13 / 07:13 / 07:38 / 09:29 / 10:03 / 10:20 / 11:26）。
+
+### ✅ 本次完成：0b（M1 型別守衛）+ 0d（lessons 第三次整併）
+
+- **0b**：`grid_engine/notifier.py:164-176` `given_up` 分支的 `silence_seconds`/`attempts`
+  改成 `float()`/`int()` + 各自 `try/except Exception`（fallback `0.0`/`0`），「需人工介入」
+  留在 try 之外。verifier(opus) **ACCEPT WITH FINDINGS**（5 條自選 mutation 殺 4 存 1，
+  存活的「fallback 常數 → 999」已補逐案字面值斷言、實跑紅在 `tests/test_notifier.py:455`）。
+  **671 passed / 1 skipped**。細節與 verifier 帶出的同型缺口見 `tasks/notes.md` 2026-08-16 條。
+  ⚠️ 註：M1 原記在 `reporting.py`，實際位置是 `notifier.py`。
+- **0d**：`tasks/lessons.md` **115 → 89 行**（通則 3 + 通則 6 合併成 13 條假守衛總表；
+  三條已內化進 dev-rules 的降為一行錨點）。完整敘事搬 `tasks/lessons-archive.md`（不注入）。
+  **仍超過 ~50 行門檻**，再砍就會刪掉還在咬人的判準 —— 待使用者裁決要不要更激進。
+
+### ✅ 先前完成：userData watchdog 全線 merge 進 main
 `main` = `69b5022`，13 commits（`caec67e..69b5022`，rebase 後 fast-forward）。
 **main 上實跑 670 passed / 1 skipped**（分支起點 589/2 + 80 條新測試；worktree 少的那條
 `test_config_store` 在有真實 `config/` 的 main 上會跑）。**尚未 push。**
@@ -21,18 +65,15 @@
 
 ### 🔴 下次開工必做（依序）
 
-1. **重啟引擎做活體驗收**——唯一還沒走過的關卡。生產現在就處在失效態，重啟後會走完整條路徑：
-   `t0+600` 判死 + Telegram 第 1 封 + 重連 1/3 → **`t0+4200`（70 分）**進 `given_up` + 第 2 封
-   → 之後每日摘要天天顯示狀態。驗收指令見 plan Task 5。
-   注意：spec §7.3 寫的 75 分鐘是舊值，改成每輪重取證據後是 70 分（見 spec §8.2）。
-2. **修 M1（一行）**：`reporting.py` 的 `_format_watchdog_line` 對「key 存在但值型別錯」
-   （如 `silence_seconds` 是字串）無防禦，會讓當天摘要整封發不出去。目前不可達
-   （唯一生產者必回 float），但那是「摘要不得發不出去」硬性要求的唯一剩餘缺口。
-3. **userData 根因**：唯一剩下的可測假設是「這把 API key 在 Binance 端壞掉」。
-   需使用者在後台開一把新 key（Enable Reading + Enable Futures + 白名單加當前 IP），
-   用同一套探針重測。有事件 ⇒ 輪換 key 收工；沒有 ⇒ 開 Binance 客服單。
+1. **收 0a 尾巴**：確認 `given_up` 有進、Telegram 第 2 封有到、隔天每日摘要顯示狀態行；
+   把實測時間表回寫 spec §8.2（現有數字低估，見上表）。
+2. ~~**userData 根因**（開新 API key 重測）~~ —— **使用者 2026-08-16 裁決：不做。**
+   ⇒ 根因調查到此打住，接受「stream 死著、watchdog 看著、成交統計走 REST」這個穩態。
+   若日後要重啟調查：唯一剩下的可測假設仍是「這把 API key 在 Binance 端壞掉」，
+   做法是後台開新 key（Enable Reading + Enable Futures + 白名單加當前 IP）用同一套探針重測；
    **已否決的假設完整清單見 `tasks/notes.md` 的 2026-08-15 條**（含 08-14 那輪）。
-4. `tasks/lessons.md` 已 ~120 行，超過 ~50 行門檻，該做第三次整併（三層制）。
+3. `notify_daily_pnl` 其餘欄位（`total_pnl` / `total_equity` / 持倉 dict）同樣無型別守衛
+   —— verifier 帶出的同型缺口，見 `tasks/notes.md` 2026-08-16 條。
 
 ### 📋 backlog（本次認列未做，詳見 spec §8.1 / §8.2）
 - watchdog 用牆鐘量靜默時長與退避 → 應改 `time.monotonic()`（需另開注入點，不能共用現有 `clock`）。
@@ -361,10 +402,11 @@ uPnL 改善 +10.4 是把浮虧搬成實虧的帳務搬家，**不是收益**。�
 
 ## TODO（優先序）
 
-**0a. 【最高】userData watchdog 活體驗收**（需使用者重啟引擎）——見 Current Task 第 1 項。
-**0b. 修 M1（一行）**：`reporting.py` 的 `_format_watchdog_line` 對「key 存在但值型別錯」無防禦。
-**0c. userData 根因**：開一把新 Binance API key 重測（唯一剩下的可測假設）。
-**0d. `tasks/lessons.md` 第三次整併**（~120 行，超過 ~50 門檻）。
+**0a. 【最高】userData watchdog 活體驗收** —— 🟡 進行中（2026-08-16 09:29 起，3/3 次重連已走完，
+等 `given_up`）。實測時間軸見 Current Task。
+~~**0b. 修 M1**~~ ✅ 2026-08-16 完成（實際在 `notifier.py` 不是 `reporting.py`）。
+~~**0c. userData 根因**~~ ❌ **使用者 2026-08-16 裁決不做** —— 調查打住，接受 watchdog + REST 穩態。
+~~**0d. `tasks/lessons.md` 第三次整併**~~ ✅ 2026-08-16 完成（115 → 89 行，仍超標）。
 
 ---
 

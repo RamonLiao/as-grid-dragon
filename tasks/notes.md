@@ -1,5 +1,46 @@
 # Notes
 
+## 2026-08-16 使用者裁決：userData 根因調查停止
+
+**裁決**：不開新 API key、不再往下查根因（TODO 0c 關閉）。
+
+**這代表接受的穩態**：userData stream 永久死著，watchdog 負責讓「它死了」這件事被看見
+（判死告警 + 3 次重連 + `given_up` + 每日摘要狀態行），成交統計由 `sync_service` 的
+REST 增量拉取維持真值。**面板與 Telegram 的累計已實現數字因此是對的**，這條已解。
+
+**代價（必須記住，日後會咬人）**：
+1. `bandit` / `dgt` / `leading_indicator` 的 `record_trade` 唯一餵食來源就是死掉的 userData
+   handler。三者生產上皆 `enabled: false` 故現在無實害，但**日後開回任何一個，它會拿到
+   全零歷史而且不會警告** —— 這現在是**永久狀態**，不是「等根因修好就沒事」。
+   要開之前必須先把 `record_trade` 改接 REST 那條路徑。
+2. 成交的即時反應延遲由 WS 推送退化成 REST 輪詢週期（10s）。
+3. 若 Binance 端哪天自己好了，`record_event()` 會發「✅ 已恢復推送」並把狀態機復位 ——
+   不需要人工動作，但也沒人在等它。
+
+## 2026-08-16 TODO 0b（M1）修復完成 + verifier 帶出的同型缺口
+
+**改動**（fast-track，兩檔）：`grid_engine/notifier.py` `_format_watchdog_line` 的 `given_up`
+分支對 `silence_seconds` / `attempts` 做 `float()` / `int()` 轉換並各自包 `try/except Exception`
+（fallback `0.0` / `0`）。「需人工介入」那句留在 try 之外 ⇒ 型別錯時只掉數字、不掉訊號。
+`tests/test_notifier.py` 新增一條 monkey test（字串／None／list／`__float__` 拋 `KeyError` 的物件）。
+
+**為什麼是 `except Exception` 而不是 `(TypeError, ValueError)`**：這裡的硬性要求是「摘要在
+任何情況下都不得發不出去」，而 `__float__` 可以拋任意例外（lessons 通則 3 有同型前例）。
+與 `reporting.py:_get_watchdog_status()` 的既有 pattern 一致。
+
+**verdict**：verifier(opus) **ACCEPT WITH FINDINGS**。5 條自選 mutation 殺 4 存 1——存活的是
+「fallback 常數 `0`/`0` 改成 `999`」（測試只斷言「需人工介入」在，不看數字）。**已補**：
+測試改成逐案斷言字面值（`"0 次"` / `"0 分鐘"`，可轉換的 `"7200"` 仍要算出 `"120 分鐘"`），
+實跑該 mutation 現在紅在 `tests/test_notifier.py:455`。全套 **671 passed / 1 skipped**（基線 670 +1）。
+
+**verifier 帶出、本次未修的同型缺口（backlog，非本 TODO 範圍）**
+- `notifier.py:142-146`：`total_pnl` / `total_equity` / `margin_usage` / `total_profit` /
+  `running_hours` 一樣是 `.get()` 取值後直接 `:+.2f` / `:.1%` 格式化，**無型別守衛**。
+- `notifier.py:130-134`：持倉 dict 的 `long` / `short` / `pnl` 非數值時，迴圈內就會炸。
+- 兩者都會讓當天摘要發不出去（`reporting.py` 的 `run()` catch-all 只讓它「這輪跳過」）。
+  ⇒ 若要把「摘要不得發不出去」做成真正的硬保證，該在 `notify_daily_pnl` 入口統一 coerce，
+  而不是一個欄位補一次。**現況：watchdog 那條已守，其餘欄位未守。**
+
 ## 2026-08-15 userData 死因調查續：listenKey 輪換假設也被否決，改為工程止血
 
 **結論先講**：根因**仍未確定**，而且很可能在 Binance 端。剩下唯一可測的假設是
