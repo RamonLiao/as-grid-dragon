@@ -1,5 +1,54 @@
 # Notes
 
+## 2026-08-15 userData 死因調查續：listenKey 輪換假設也被否決，改為工程止血
+
+**結論先講**：根因**仍未確定**，而且很可能在 Binance 端。剩下唯一可測的假設是
+「這把 API key 本身在交易所端壞掉」——需要在後台開一把新 key 重測（**未做，掛帳**）。
+其餘假設全部被實驗否決。
+
+**08-15 新拿到的證據（依取得順序）**
+
+1. **`LIST_SUBSCRIPTIONS` 顯示 listenKey 確實被登記成有效訂閱。**
+   ⇒ 推翻 `ws_client.py:44-47` 註解裡「Binance 對無效 stream name 靜默接受」那個心智模型。
+   它不是被靜默丟掉，是**登記了但不推**。這一格是 08-14 那輪沒拿到的。
+2. **`ipRestrict: true` 確認，但當下 IP 通過白名單**（REST 全通、listenKey 也是同一 IP POST 的）
+   ⇒ IP 假設大幅弱化。
+3. **舊 log 裡找到死亡的那一刻**：`log/as_terminal_max.log.archive-20260712` 有 **58,408 筆**
+   `[userData]`（`開倉成交` 39,776 筆等）⇒ 這條路徑歷史上完全正常。最後一筆真事件在該檔
+   第 1,057,232 行（全檔 2,338,647 行），緊接著就是
+   `WebSocket 錯誤: no close frame received or sent` → `已訂閱 userData stream`（重連）
+   → **之後 128 萬行 + 新 log 47,168 行，零筆**。**一次斷線重連之後永久死亡。**
+4. **`POST /fapi/v1/listenKey` 在 key 仍有效時只回同一把舊 key。** 實測 14:54 / 15:05 / 16:04
+   三次 POST 都是 `hC98My4OnDww…FzqgAh`。
+   ⇒ 這解釋了為什麼 `6a264d6`（重連時重新 POST）修不好：重新 POST 拿回的是同一把。
+   新 log 裡 `已訂閱 userData stream` 出現 **90 次**，重連重取路徑早就走過幾十遍。
+   （progress.md 舊記的「這條路徑尚未走到」已過期。）
+5. **輪換假設被決定性否決**：`DELETE` → `POST` 確實換出全新 key（做了三次），
+   `LIST_SUBSCRIPTIONS` 確認訂上，窗口內交易所端有 **4 筆真實訂單事件**
+   （`allOrders` 交叉驗證，17:35:31-32），同連線 bookTicker **2,853 筆** ⇒ **userData 0 筆**。
+
+**方法論教訓（比結論更值錢，這次踩了三次）**
+
+- **窗口內沒有真事件的觀察，證明不了任何事。** 前兩輪探針各作廢一次：一輪窗口內
+  `allOrders = 0`（引擎 13 分鐘沒 requote），一輪人工製造的事件落在窗口關閉之後。
+  **每次 userData 觀察都必須附「同窗 REST 交叉驗證」，且要在報告裡印出同窗事件數。**
+- **探針自己的失效模式必須被儀器化。** v1 探針的 WS task 拋例外後靜默死亡而 heartbeat 照跑，
+  導致「bookTicker 凍在 231」被誤讀成資料停了，其實是 task 已經不在了。
+  v2 起每條連線都有 reconnect 迴圈 + 例外落 log + 連線代數（gen）計數。
+  這與 08-14 漏 keepalive 是同一類錯：**觀測工具沒有自我監控 = 觀測結果不可信。**
+
+**已排除的完整清單**：訂閱方式（A/B 雙路）、stream name 被靜默丟棄（LIST_SUBSCRIPTIONS）、
+listenKey 過期／keepalive 沒跑、socket 健康度（bookTicker 對照）、listenKey 卡在伺服器端
+壞狀態（三次輪換）、Portfolio Margin、multi-assets、API 權限、IP 白名單（大幅弱化）。
+
+**下一步（掛帳，未做）**：Binance 後台開一把全新 API key（Enable Reading + Enable Futures，
+白名單加當前 IP），用同一套探針重測。新 key 有事件 ⇒ 根因是舊 key，生產輪換 key 即可收工；
+新 key 也沒有 ⇒ 帳號層級，只能開客服單。
+
+**因此本次的工程對策不是修根因，而是止血**：見
+`docs/superpowers/specs/2026-08-15-userdata-watchdog-design.md`。
+設計刻意**不假設根因可修**——偵測 + 有限復原 + 讓成交統計改由 REST 取得而不再依賴 userData。
+
 ## 2026-08-14 userData stream 死因調查（決定性實驗，why 留檔）
 
 **結論先講**：`ws_client.py:64` 的「`SUBSCRIBE [listenKey]` vs 直接連 `/ws/<listenKey>`」

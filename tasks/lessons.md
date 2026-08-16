@@ -83,6 +83,30 @@
 - 為什麼會漏：加倍規則本身早就讀過、也記在 progress（「持倉被壓在 0.28 平衡點」），但當時只當成「回測倉位長不大」的解釋，沒推到「它會拆掉外部注入的部位」。**同一機制在不同劇本下的後果要各自推一次。**
 - Rule：任何「人工建立 / 一次性注入」的結構（對沖倉、seed、手動補倉）都要問「策略的常態行為會不會把它拆掉？」拆解速率用「絕對量 vs 該側基數」算相對衰減，不是看絕對量相等就當公平。涉及入金/開倉的建議必附這條檢查。
 
+## 通則 6：測試「看起來守住了」的八種假守衛（2026-08-15 一條分支內全部踩過，最貴的一族）
+
+- **形態清單**（每條都在真實 mutation 下實測過會漏）：
+  1. **期望值從被測 module import**：`assert x == start + 10_000 - MARGIN`——改 `MARGIN` 時期望值同步位移，恆真。（`assumed_leverage` fixture 用預設值 20；`BACKOFF_SECONDS` 驅動自己的時間軸）
+  2. **測資從被測常數推導**：`total_ids = 1000 * (MAX_PAGES + 3)`——常數改錯，測資跟著放大。
+  3. **子字串掃描當行為守衛**：`assert "total_trades += 1" not in body`——改寫成 `= x + 1` 就繞過；`assert "record_event()" in body` 對 `if never: record_event()` 照樣通過。**這是最貴的一條**，它守的是「使用者看到的金額數字」這個核心不變式。
+  4. **測資混入其他因素繞過缺陷**：測「畸形筆的游標推進順序」卻在同批混了 id 更高的正常筆，那些筆自己就把游標推過去了。
+  5. **斷言抓的是共通後果而非差異**：`assert connect_calls == 2` 分不出「break 重連」與「raise → outer except 重連」，真正有效的是 `assert errors == []`。
+  6. **截斷值恰好等於 fallback**：`int(5.7)==5` 而 fallback 也是 5 ⇒ 靜默截斷與正確拒絕不可分辨。改用 `7.3`/`20.9`。
+  7. **註解宣稱的不變式沒有測試**＝會執行的註解（`page_max_id` 前置順序、`progressed` 防線）。
+  8. **接線完全沒被守**：刪掉 `sync_all()` 裡的 `await self._sync_trade_stats()`，625 條全綠——元件對、測試對、就是沒接上，正是本專案 userData 死一個月的同型缺陷。
+- **Rule**：
+  - 每條新守衛都要**實跑** mutation 看它紅，且要說出**紅在哪一行斷言**。「應該會紅」不算。
+  - 「改常數值」型 mutation 的守衛，期望值與測資一律**寫死字面值**。
+  - 行為不變式用**行為測試**（建真實物件、餵事件、斷言狀態），不用原始碼字串掃描。字串掃描只能當第二道防線。
+  - 宣稱「一條測試守住多個缺陷」時，逐條指出紅在哪一行——曾有斷言看起來守住但實際抓不到。
+  - **每個「元件 → 排程/呼叫端」的接線都要有一條守衛**（刪掉那行呼叫會紅）。
+- **方法論**：派 verifier / 外部 reviewer 時**不要給自己列的 mutation 清單**，要它自選。本次三個獨立輪次自選 18/5/17 條，抓到 3+1+3 條存活，**全部不在我列的清單裡**——給清單只會複製作者的盲點。
+
+## 2026-08-15：觀測工具沒有自我監控，觀測結果就不可信
+- Context：查 userData 為何不推，寫了三輪探針腳本。
+- Error：round 1 漏 listenKey keepalive（60 分鐘後 key 死，6.6 小時的「零事件」證明不了任何事）；round 2 的 WS task 拋例外後靜默死亡而 heartbeat 照跑，「bookTicker 凍在 231」被誤讀成資料停了；round 3、4 的觀察窗口內交易所端**零事件**（引擎沒 requote / 人工事件落在窗口關閉後），一樣作廢。
+- Rule：長時間被動觀察必須自帶 (a) 目標資源的續期（listenKey 25 分鐘 PUT）、(b) 連線代數/例外落 log、(c) **同窗對照組與獨立交叉驗證**（REST `allOrders` 印出同窗事件數）。**窗口內沒有真事件的「零觀測」不是證據。**
+
 ## 環境/API 事實（參考）
 - ccxt 合約 `fetch_balance` 的 `total`=marginBalance（**已含浮盈**），equity 要從 `info.assets` 取 `walletBalance`+`unrealizedProfit`，否則浮盈雙算。驗算式：marginBalance = walletBalance + uPnL。
 - Binance WS `ACCOUNT_UPDATE` 不推可用餘額/保證金（協定設計），WS 只更新它真有的欄位，available/margin 交給週期 REST 當唯一真值。
