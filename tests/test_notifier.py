@@ -415,6 +415,48 @@ class TestNotifierMonkey:
         assert notifier.send.call_count == 7
 
     @pytest.mark.asyncio
+    async def test_daily_pnl_watchdog_given_up_wrong_typed_values_still_send(self):
+        """M1：given_up 時 key 存在但值型別錯（字串／None／__float__ 會拋非
+        TypeError 的物件），摘要仍必須發得出去，且「需人工介入」不得掉。
+
+        紅在：把 _format_watchdog_line 的兩個 try 拿掉後，這裡會 TypeError／
+        KeyError 直接往外炸（notifier.send 根本沒被呼叫）。
+        """
+        class HostileNumber:
+            def __float__(self):
+                raise KeyError("boom")
+
+            def __int__(self):
+                raise KeyError("boom")
+
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        # (watchdog, 期望出現的次數字串, 期望出現的分鐘字串)
+        # 字面值寫死：fallback 常數若被改成別的數字，這裡要紅（verifier 抓到的存活 mutation）
+        cases = [
+            ({"state": "given_up", "silence_seconds": "7200", "attempts": 3},
+             "3 次", "120 分鐘"),          # 可轉換的字串照樣算出真數字
+            ({"state": "given_up", "silence_seconds": None, "attempts": None},
+             "0 次", "0 分鐘"),
+            ({"state": "given_up", "silence_seconds": [], "attempts": {}},
+             "0 次", "0 分鐘"),
+            ({"state": "given_up", "silence_seconds": HostileNumber(),
+              "attempts": HostileNumber()},
+             "0 次", "0 分鐘"),
+        ]
+        for watchdog, attempts_text, minutes_text in cases:
+            await notifier.notify_daily_pnl({
+                "total_pnl": 1.0, "total_equity": 100.0,
+                "positions": {}, "running_hours": 1,
+                "watchdog": watchdog,
+            })
+            msg = notifier.send.call_args[0][0]
+            assert "需人工介入" in msg
+            assert attempts_text in msg
+            assert minutes_text in msg
+        assert notifier.send.call_count == len(cases)
+
+    @pytest.mark.asyncio
     async def test_daily_pnl_with_negative_values(self):
         """負數值正常處理"""
         notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")

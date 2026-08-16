@@ -162,8 +162,16 @@ class TelegramNotifier:
             return ""
         state = watchdog.get("state")
         if state == "given_up":
-            silence_minutes = watchdog.get("silence_seconds", 0) / 60
-            attempts = watchdog.get("attempts", 0)
+            # key 存在但值型別錯（字串、None、自訂物件）不得讓整封摘要發不出去，
+            # 只降級成不帶數字的告警——「需人工介入」這句本身才是不能掉的訊號。
+            try:
+                silence_minutes = float(watchdog.get("silence_seconds", 0)) / 60
+            except Exception:
+                silence_minutes = 0.0
+            try:
+                attempts = int(watchdog.get("attempts", 0))
+            except Exception:
+                attempts = 0
             return (
                 f"⛔ <b>userData 監控：已放棄自動重連，需人工介入</b>"
                 f"（已重連 {attempts} 次、靜默 {silence_minutes:.0f} 分鐘）\n"
