@@ -49,7 +49,8 @@
 ### ✅ 先前完成：userData watchdog 全線 merge 進 main
 `main` = `69b5022`，13 commits（`caec67e..69b5022`，rebase 後 fast-forward）。
 **main 上實跑 670 passed / 1 skipped**（分支起點 589/2 + 80 條新測試；worktree 少的那條
-`test_config_store` 在有真實 `config/` 的 main 上會跑）。**尚未 push。**
+`test_config_store` 在有真實 `config/` 的 main 上會跑）。
+（原記「尚未 push」，2026-08-16 查證**已推**，`origin/main` 現在是 `f4bdd8a`。）
 
 - spec：`docs/superpowers/specs/2026-08-15-userdata-watchdog-design.md`（六處更正皆留痕）
 - plan：`docs/superpowers/plans/2026-08-15-userdata-watchdog.md`（5 tasks）
@@ -65,8 +66,9 @@
 
 ### 🔴 下次開工必做（依序）
 
-1. **收 0a 尾巴**：確認 `given_up` 有進、Telegram 第 2 封有到、隔天每日摘要顯示狀態行；
-   把實測時間表回寫 spec §8.2（現有數字低估，見上表）。
+1. **收 0a 最後一格**：檢查 2026-08-16 20:00 那封每日摘要有沒有帶
+   `⛔ userData 監控：已放棄自動重連，需人工介入`。沒帶 ⇒ `reporting.py` 的接線有問題。
+   同時把實測時間表回寫 spec §8.2（現有數字低估，見上表）。
 2. ~~**userData 根因**（開新 API key 重測）~~ —— **使用者 2026-08-16 裁決：不做。**
    ⇒ 根因調查到此打住，接受「stream 死著、watchdog 看著、成交統計走 REST」這個穩態。
    若日後要重啟調查：唯一剩下的可測假設仍是「這把 API key 在 Binance 端壞掉」，
@@ -354,8 +356,9 @@ except 裡立刻重建 key。**已知限制**：重建只讓下次重連生效�
 ⇒ 不該再說它「危險」也不該說它「安全」，正確說法是「**它不是現在的限制器，-2019 才是**」。
 （requote 實驗則已核實乾淨：`scripts/calibration_gate.py:38` 用 `leverage=5.0`。）
 
-### git 狀態
-main == origin/main（**2026-07-30 push 完成，`9908faf..b7fd7de`，20 commits**）。
+### git 狀態（2026-08-16 更新）
+`origin/main` = `f4bdd8a`（watchdog 那 13 個 commit **已經推上去了**——舊記的「尚未 push」過期）。
+`main` 領先 **2 個 commit 未 push**：`25b0135`（M1 修復）、`c1b5342`（tasks 文件）。
 工作區只有 ` M .gitignore`（既有、與近期任務無關，使用者未指示處理）。
 舊 branch 已全數清理（`feat/net-exposure-tp`、`feat/backtest-engine-fidelity`、`fix/dead-mode-deadlock`，
 本地 + 遠端，刪前皆以 `git branch --merged main` 確認）。現在只剩 `main`。
