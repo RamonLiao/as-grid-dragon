@@ -360,6 +360,14 @@ uPnL 改善 +10.4 是把浮虧搬成實虧的帳務搬家，**不是收益**。�
   ⇒ **遷移前的回測結果不可再與遷移後直接比較**——保證金/強平模型輸入從 20x 變 5x
 
 ## TODO（優先序）
+
+**0a. 【最高】userData watchdog 活體驗收**（需使用者重啟引擎）——見 Current Task 第 1 項。
+**0b. 修 M1（一行）**：`reporting.py` 的 `_format_watchdog_line` 對「key 存在但值型別錯」無防禦。
+**0c. userData 根因**：開一把新 Binance API key 重測（唯一剩下的可測假設）。
+**0d. `tasks/lessons.md` 第三次整併**（~120 行，超過 ~50 門檻）。
+
+---
+
 1. ~~觀察期複檢（07-13 之後）~~ **完成（2026-07-13）：replay PASS，但發現重大 fidelity 落差 → 衍生 TODO 1a**。
    - **Replay PASS**：全量 98,546 筆重放，9 筆 diff 與首檢完全相同（全部 ≤07-09 19:12 Taipei，舊 code 產物）；修復後窗口 32,630 筆零 diff；新 config 窗口 26.5h、147 筆零 diff。
    - **健檢過的項目**：倉位多 0.58@690.29 / 空 0.34@571.75 不變、權益 115.3、可用 5.95、強平 90.84；雙側 4 張掛單持續在 ±0.3% 刷新（最後刷新 = 最後決策 17:19 Taipei，一致）；新窗口 log 零 -2019、Telegram 修復後零 403；funding 26h 僅 -0.02；07-13 14:16 一筆瞬時同步失敗（REST 錯誤，之後決策照跑，非阻礙）。
@@ -370,8 +378,17 @@ uPnL 改善 +10.4 是把浮虧搬成實虧的帳務搬家，**不是收益**。�
    - tick 級實驗（aggTrades 06-06~07-13、校準 gate 三道全 PASS、N=166 組合全揭露）：factor=1.0（掛到成交）§6 判準 3 FAIL——W1 上漲段 -21.1 / W3 震盪 -4.5（只贏 W2 下跌 +27.7，逆選擇主導）；成本 2/2bps 下全程排序翻成 0.5 最優（成交 20 倍但費用吃光 grinding）；factor 0.8 的 +14.9 是 threshold=limit 邊界懸崖（成交驟降 9 倍），依預註冊規則不採納。**「磨回 -68」路線被數據關死；現行 0.5 語意在成本現實下可辯護。**
    - 已上線的中性產物：`requote_threshold_factor` 參數化（預設 0.5 bit-identical，replay 9/9 不變）、tick 模擬器 + PositionBook + aggTrades 管線（未來 requote 類實驗基礎設施）、FIDELITY_NOTES (13)。holdout 05-01~06-05 保持未開封（§6 未全過，依鎖不跑）。
    - branch 已 merge 進 main（fast-forward `fa5aed7..f8d51e1`，19 commits，合併後 525 passed），branch 已刪。
-1b. **【使用者裁決，最高優先的開放決策】-68 uPnL 出場路線**：(a) 接受凍結等價回 690 平多；(b) 定點認賠收斂；(c) 入金補中性後長期持有；(d) 深究 factor 0.8 regime（需新一輪預註冊驗證：完整 sensitivity curve + holdout 05-01~06-05 仍未開封可用，multiple-testing 代價高，不急）。
-   - **2026-07-26 健檢後依據已更新**（`tasks/health-check-2026-07-26.md`）：**(a) 與現實不符**——網格並沒有凍結，它在以每張 -4 分期實現虧損並拆對沖；**(c) 需先解 1c 的設計問題**，否則補的中性會被拆回去。
+1b. ~~**-68 uPnL 出場路線**（四選項）~~ **2026-08-15 實測後建議關閉：問題自己消失了。**
+   - 08-15 生產快照（現價 611.29，BNB 自 07-30 的 573.67 漲 +6.6%）：
+     多 **0.24 @ 613.55**（原 0.42 @ 652.04）、空 **0.06 @ 601.00**、delta **+0.18**、
+     **uPnL −1.16**（原 −33.39）、強平價 **0（不可達）**、可用 **78.97**（原 41.38）。
+   - **1b 的四個選項全都是在處理「一個深度水下的凍結多頭倉」，那個倉已經不存在了**——
+     均價從 652 掉到 613.55（貼近市價），1c 的新止盈規則 + 一段漲勢把它磨掉了。
+   - **代價已付**：近 15 天 `REALIZED_PNL −24.01` / 36 筆，錢包 148.20 → 121.66（−26.5），
+     但權益 114.81 → **120.56（+5.75）**。這正是 07-30 記的「浮虧轉實虧」照劇本走完。
+   - ⚠️ 附帶推翻一個舊觀察：36 筆/15 天 ⇒ 07-13 健檢記的「實盤 ~1 筆/天、網格幾乎不成交」
+     在震盪+趨勢段**不成立**，那個數字是特定窗口的產物。
+   - 待使用者確認後即可標記關閉。
 1c. ~~**`tp_quantity` 不對稱會吃掉任何人工建立的對沖**~~ **完成並 merge+push（2026-07-30，15 commits `f2f6bbe`..`6094f4c`）**
    - 加倍改為只給淨曝險側；範圍含 `risk_monitor` 不對稱減倉、`bot.py` 死碼、`ui.py` 標籤、七處誤導文案。
    - 驗收：**579 passed / 1 skipped**；A4 replay（排除舊 code 窗口後 43,164 筆零違規）；
@@ -412,11 +429,44 @@ uPnL 改善 +10.4 是把浮虧搬成實虧的帳務搬家，**不是收益**。�
 8. ~~Telegram 通知接通~~ **完成（2026-07-12 21:43）**：根因兩個——chat_id 誤填 bot 自身 ID（log 三筆 `403 the bot can't send messages to the bot` 佐證）+ 引擎啟動時憑證為空致 reporter 未建。使用者修正 chat_id=1054193397 後 21:43 重啟，之後零失敗記錄。**07-13 20:00 Taipei 首封每日摘要使用者確認收到，端到端驗收完成。**
 
 ## Blockers
-**無硬阻礙。**引擎 2026-07-30 11:15:41 重啟並驗收過（pid 1318/1319，跑 `6094f4c`）。
-1c 已完成並 merge+push。**1b 建議先觀察 1-2 週**（使用者裁決：讓倉位順著新規則慢慢收斂到 hedge）；
-4b、4c、3、5、6 隨時可開工。
-**唯一待驗**：`[userData]` 端到端（見 Current Task 的「開工前必做的一行驗證」）——不是阻礙，是掛帳。
-**新增的成本模型待辦**：`backtest/config.py:37` `fee_pct` 預設 2bps 與實查值（maker 0）不符 ⇒ 所有既有回測的成本假設偏保守。修改前要先決定「促銷費率該不該寫進預設值」（我傾向不寫死，改成必填 + 啟動時實查對帳）。
+**無硬阻礙。**
+
+**⚠️ 引擎跑的還是舊碼。** watchdog 已 merge+push 進 main（`b0c6047`），但引擎行程從 08-14 23:20
+就活著（`uv run as_terminal_max.py`），**記憶體裡是舊碼**。要生效必須重啟——而重啟正是
+TODO 0a 的活體驗收。開工前一律先 `ps aux | grep as_terminal_max` 確認實際跑的是什麼。
+
+**掛帳（非阻礙）**：
+- userData 根因未解，watchdog 是止血。唯一剩下的可測假設需要使用者去 Binance 後台開新 key。
+- `backtest/config.py:37` `fee_pct` 預設 2bps 與實查值（maker 0）不符 ⇒ 既有回測成本假設偏保守。
+  修改前要先決定「促銷費率該不該寫進預設值」（傾向不寫死，改成必填 + 啟動時實查對帳）。
+
+## Recently Completed（2026-08-15）：userData watchdog 全線
+- **merge + push 完成**：`main` = `b0c6047`，`origin/main` 同步（推 20 commits `b853da8..b0c6047`）。
+  watchdog 本身 13 commits（rebase 後 fast-forward）。**main 上實跑 670 passed / 1 skipped**
+  （分支起點 589/2，+80 條測試）。worktree / branch / SDD workspace 皆已清除。
+- **做了三件事**：偵測靜默失效並告警、有限復原（3 次，退避 300/900/2700 後進 `given_up`）、
+  成交統計改由 REST 增量拉取（單一 writer，userData handler 停寫）。另加每日摘要帶 watchdog 狀態。
+- **流程**：brainstorming → spec → writing-plans → SDD 4 tasks（每 task fresh implementer +
+  task reviewer）→ whole-branch review(opus) → verifier 兩輪(opus) → security-review(opus)
+  → dual-review 外部輪(opus) + Round 2 → 最終 scoped re-review(opus) = **Ship as-is**。
+- **最有價值的發現（全部來自「要求 reviewer 自選 mutation」而非照我的清單）**：
+  - verifier 自選 18 條，3 條存活。其中 **Critical：刪掉 `sync_all()` 裡的
+    `await self._sync_trade_stats()`，625 條全綠**——一條在修「元件對但沒接上且無偵測」的
+    分支，自己身上有一模一樣的洞。
+  - 外部輪自選 17 條，3 條存活。**兩條打穿核心**：`total_trades += 1` 改寫成 `= x + 1`
+    就繞過「單一 writer」守衛；`if never: record_event()` 就繞過接線守衛，102 條全綠。
+    **那兩條字串掃描測試是我寫進計畫的，而且我下過 ruling 說可以接受——我裁錯了。**
+  - security-review 抓到 `_sync_trade_stats` 是唯一可能讓例外冒泡的 `_sync_*`
+    ⇒ 每 5 秒重連的永久迴圈；以及分頁迴圈無頁數上限、inline 在 WS recv 路徑上。
+  - Round 2 抓到我在 dispatch 裡「比照兄弟方法」這句**未經查證的前提**被固化進程式碼註解，
+    而 `_sync_funding_rates` 根本沒有 try/except（同一條失效路徑仍暢通）。
+- **認列不修**（spec §8.1 / §8.2）：monotonic 時鐘、`start_time_ms` 交易所時間校正、
+  `_handle_ticker` 價格時效守衛、bandit/dgt 的 `record_trade` 仍由死掉的 userData 餵
+  （三者生產停用，但**日後開回會拿到全零歷史且無警告**）、裝死模式下停在 `degraded`
+  走不到 `given_up`（設計必然，可見性由每日摘要接住）、五條存活 mutation（防呆第二層、不可達）。
+- **本次調查的副產品**：`tasks/notes.md` 補上 userData 死因調查續（listenKey 輪換假設被否決、
+  舊 log 找到死亡時點、`POST listenKey` 只回同一把舊 key 解釋了 `6a264d6` 為何修不好）；
+  `tasks/lessons.md` 新增通則 6（八種假守衛形態）與「觀測工具沒有自我監控就不可信」。
 
 ## Recently Completed（2026-07-30）：TODO 1c 止盈加倍只給淨曝險側 + listenKey 修復
 - **1c 全線**：spec v3 → plan 8 tasks → 實作 → A4/A6/A7/A9 驗收 → 四輪 review → 重啟驗收 → merge + push。
