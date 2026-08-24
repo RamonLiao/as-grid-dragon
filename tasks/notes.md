@@ -1,5 +1,39 @@
 # Notes
 
+## 2026-08-24 「行程沒重啟卻跑了策略初始化」形態——不是 bug，但旁邊有一個真的
+
+progress.md 從 2026-08-14 掛著的未解形態（`21:21:10` 出現 `[MAX] 初始化完成` +
+`Task was destroyed but it is pending!`，但 pid 75367 從 08-12 一路活著沒重啟）**已解**。
+
+**答案**：`[MAX] 初始化完成` 印在 `grid_engine/bot.py:151`，是 `MaxGridBot.__init__` 的最後一行，
+而 `MaxGridBot` 唯一的建構點是 `as_terminal_max.py:1236` 的 `TUI.start_trading()`。
+⇒ 這行是**「按下啟動交易」一次印一次，不是「行程啟動」一次印一次**。
+行程活著、從 TUI 選單停止交易再啟動交易，就會出現這個形態。`Task was destroyed but it is
+pending!` 是舊 bot 的 event loop 在 `run_bot_thread` 的 `finally` 裡 `close()` 時，
+還有 pending task 沒收乾淨的標準噪音。**形態正確，無需再查。**
+
+今日（08-24）同型可交叉驗證：`09:38:14` 印了一次 `初始化完成`，但目前行程 pid 15765 是
+`09:38:45` 才起的（`ps -o lstart`），`09:40:03` 又印一次 ⇒ 08:xx 那次屬於上一個行程，
+兩者對得上。
+
+**但查的過程撞到一個真的（新發現，未修，非本次範圍）**：
+`as_terminal_max.py:stop_trading()` 的收尾是
+
+    self.bot_thread.join(timeout=5)
+    self._trading_active = False
+    self.bot = None
+
+**join 逾時後沒有任何檢查**：不看 `is_alive()`、不 log、不擋。逾時的情況下舊 bot thread
+還活著（它的 loop 還在跑、`gateway` 還在送單），但 `_trading_active` 已被清成 False，
+`self.bot` 參照也被丟掉 ⇒ 使用者可以立刻再按「啟動交易」，`start_trading()` 的
+`if self._trading_active` 守衛形同虛設，**同一個帳戶上會有兩個 MaxGridBot 同時撤單/掛單**。
+
+`bot.stop()`（`grid_engine/bot.py`）本身寫得對（set stop_event → cancel 全部 task →
+`gateway.shutdown()`），5 秒正常情況夠用；問題純粹在**逾時路徑無聲**。
+風險等級：需要「停止交易在 5 秒內沒收完」+「使用者馬上再按啟動」兩件事同時發生，
+但代價是真錢上的雙 bot 競爭下單。**屬 Plan track（動的是金流路徑），待使用者裁決。**
+
+
 ## 2026-08-24 非 GCE 的 TODO 清空：摘要欄位統一 coerce + 0a 收尾 + spec 時間表回寫
 
 **1. `notify_daily_pnl` 入口統一 coerce（`grid_engine/notifier.py`）**

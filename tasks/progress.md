@@ -157,9 +157,11 @@ Portfolio Margin、multi-assets、API 權限；IP 白名單大幅弱化（REST �
 `61.216.73.207`(104)、`36.225.34.156`(15)、`118.166.239.83`(12)、`36.225.15.37`(10, 08-14)。
 被擋時撤單/下單/同步全掛。**⇒ TODO 6（GCE 固定 IP）優先度高。**
 
-### ⚠️ 另一個未解形態
-`2026-08-14 21:21:10` log 出現 `[MAX] 初始化完成` + `Task was destroyed but it is pending!`，
-但行程 pid 75367 從 08-12 一路活著沒重啟。**行程沒重啟卻跑了一次策略初始化**，形態不對，未查。
+### ✅ ~~另一個未解形態~~ —— **2026-08-24 已解，不是 bug**
+`[MAX] 初始化完成`（`bot.py:151`）印在 `MaxGridBot.__init__` 尾端，而唯一建構點是
+`as_terminal_max.py:1236` 的 `TUI.start_trading()` ⇒ **按一次「啟動交易」印一次，
+不是行程啟動印一次**。行程活著、從 TUI 停止再啟動交易就是這個形態。
+`Task was destroyed` 是舊 loop `close()` 時的殘留 task 噪音。詳見 `tasks/notes.md` 2026-08-24 條。
 
 ### ✅ `assumed_leverage` 值域守衛（已 commit `3119e68`）
 掛在 `SymbolConfig.__setattr__`（不是 `from_dict`）——dataclass `__init__` 也走 setattr ⇒
