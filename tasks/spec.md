@@ -1,32 +1,37 @@
-# 當前任務 Spec：userData 靜默失效偵測與復原（watchdog）
+# 當前任務 Spec：價格時效守衛（price staleness guard）
 
-完整設計：`docs/superpowers/specs/2026-08-15-userdata-watchdog-design.md`（權威出處）
+完整設計：`docs/superpowers/specs/2026-08-24-price-staleness-guard-design.md`（權威出處）
 
-**前提**：userData stream 自 2026-07-12 靜默死亡至今。2026-08-14/15 的實驗已否決
-訂閱方式、stream name 被丟棄、listenKey 過期、listenKey 卡壞狀態、socket 健康度、
-Portfolio Margin、multi-assets、API 權限；IP 白名單大幅弱化。**根因仍未確定，
-且可能在 Binance 端** ⇒ 本任務不假設根因可修。
+**任務定義被修正過**：backlog 原記「`_handle_ticker` 無價格時效守衛」定位錯誤。
+守衛裝在 ticker handler 入口無用（那裡的價格按定義新鮮）。真缺口在 `adjust_grid`
+的**第二個呼叫端** `bot.py:668`（`_handle_order_update` 成交後），它用的是上一次
+ticker 留下的殘值 `best_bid`/`best_ask`，而 `_grid_step` 的 `bot.py:405`/`419`
+把這兩個值**直接餵給 `place_order()`**，零時效檢查。
+
+**觸發面校準**：生產上 userData stream 是死的 ⇒ 668 路徑目前幾乎不觸發。本項守的是
+「userData 復活後」與「bookTicker 單邊卡住但 userData 活著」兩種形態，**log 裡無實證**，
+優先度排序是推測性的，驗收文案不得宣稱修掉了已觀測到的生產事故。
 
 ## Goals
-1. **偵測**：靜默失效在 10 分鐘量級內判定並告警（log + Telegram）。
-2. **復原**：有限次數（3 次，退避 5/15/45 分鐘）強制重連自救，失敗後進 `given_up` 終態。
-3. **補數字**：面板與 Telegram 的成交次數／累計已實現改由 REST 取得，不再依賴 userData。
+1. 價格快照帶「本機抵達時戳」（`SymbolState.quote_at`），成為一等欄位。
+2. 下單前判定快照年齡，超門檻則跳過本次網格調整，不下新單。
+3. 過期是可觀測事件：節流 log + 每日摘要一行（計數為 0 不出）。
+4. `quote_age` 落進 decision log，讓 5 秒這個猜測門檻日後能用實測收緊。
 
 ## Non-goals
-不修根因；不改交易決策/下單/風控邏輯；不新增自動重啟行程；不改 `rest_gateway`；
-不做全期累計統計（口徑維持「本次引擎啟動以來」）。
+不撤舊單；不做 REST 補價 fallback；不動 `ui.py`；不改 watchdog 的牆鐘（獨立 backlog 項）；
+不改 `backtest/tick_sim.py` 決策邏輯（僅加註解）；不引入 `PriceQuote` 打包型別。
 
 ## Security / Safety constraints
-- watchdog 不得具備下單/撤單/改倉能力；唯一副作用是「請求 WS 重連」與「發通知」。
-- 重連次數硬上限 3，達上限進終態——強制重連會連帶中斷 `bookTicker`（`decide()` 的觸發來源）。
-- 重連採「設旗標 + 內層迴圈自行 break」，**不得**對 `run()` 拋例外借用既有的
-  「例外冒泡 = 重連」不變式（`ws_client.py` 開頭 characterization 註解鎖定）。
-- `total_trades` / `total_profit` 維持**單一 writer**（REST），userData handler 停寫該兩欄。
+- 守衛唯一副作用是「不下單」與「寫 log / 計數」。不得撤單、改倉、發 REST 請求。
+- 不得改寫 `best_bid` / `best_ask` / `latest_price`——只讀不寫。
+- `max_price_age_sec = 0`（關閉）必須讓行為完全回到改動前，作為生產緊急逃生門。
+- 不得影響止盈單路徑與 `sync_service` 的 REST 同步。
 
 ## 可判定驗收準則
-1. 六條指定 mutation 各自先紅一次（判準 `and`→`or`、`K`→0、退避改固定、`given_up` 後仍重連、
-   `record_event` 不重置、增量拉取不去重）。
-2. 全套測試全綠，基線 590 passed / 1 skipped，新增數量明列。
-3. 活體驗收：重啟後 10 分鐘 + 4 張單內出現判死 log 與 Telegram 告警；面板成交次數 60 秒內
-   從 0 變成 REST 實測值；三次重連無效後進 `given_up` 且不再重連。
-4. 回歸：`decide()` 觸發頻率（`[MAX]` log 間隔）不因強制重連顯著劣化。
+1. 11 條測試各自先紅一次，重點是第 4 條：`_handle_order_update` → `adjust_grid`
+   走殘值快照被擋（本次真正要修的形態）。清單見設計文件 §8.1。
+2. 全套測試全綠，基線 **714 passed / 1 skipped**，新增數量明列。
+3. 非 trivial ⇒ fresh-context `verifier`；Plan track + 命中 Red Team Protocol ⇒
+   `security-review` → `dual-review` 外部輪，未拿 `Ship as-is` 不得標記完成。
+4. 改動需重啟引擎才生效；progress 須分開記「已 commit」與「已重啟生效」。
