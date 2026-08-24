@@ -1,5 +1,64 @@
 # Notes
 
+## 2026-08-24 非 GCE 的 TODO 清空：摘要欄位統一 coerce + 0a 收尾 + spec 時間表回寫
+
+**1. `notify_daily_pnl` 入口統一 coerce（`grid_engine/notifier.py`）**
+接 2026-08-16 verifier 帶出的同型缺口。決策是照當時 notes 寫的方向做「入口統一 coerce」，
+不是一個欄位補一次 try/except——理由是硬性要求（「每日摘要不得發不出去」）的邊界在
+**訊息組裝**這一層，逐欄位補會隨新欄位再破一次。
+- `_coerce_num()`：`float()` + `except Exception`（`__float__` 可拋任意例外）+ **NaN/inf
+  也視同無效**（它們不拋例外，但會把 `+nan` / `inf` 印進使用者的摘要）→ fallback `0.0`。
+- `_escape()`：`parse_mode="HTML"`，標的名稱含 `<` 會讓 Telegram 回 **400**，等於整封摘要
+  掉光。這是「型別對但內容有敵意」的那一半，coerce 管不到。
+- `MAX_POSITION_LINES = 20`：Telegram 單則 4096 字元。持倉數量爆掉時截斷並附「另有 N 個
+  標的未列」，優於整封發不出去。（現況只有 1 個標的，這條是預防性的。）
+- **8 條 mutation 逐條實跑轉紅**（拿掉純量 coerce / positions isinstance / `_escape` /
+  行數上限 / fallback `0`→`999` / NaN-inf 檢查 / `pnl_data` 非 dict 守衛 / 倉位 coerce）。
+- 唯一行為變更：倉位數量改用 `:g` ⇒ `3.0` 印成 `L:3`（原本 `L:3.0`）。
+
+**2. 0a 最後一格（20:00 摘要是否帶 ⛔ 那行）—— 改用實跑釘死，不靠人工看 Telegram**
+log 只能證到「當時在 `given_up`」（`2026-08-16 19:30:09` / `20:30:09` 兩筆節流提醒夾住 20:00）
+與「摘要寄出去了」（全 log 零 `Telegram 發送失敗` / 零 `每日摘要發送失敗`）。
+**「⛔ 那行有沒有被組進訊息本體」人工不可判定**——摘要照樣會寄出，只是少一行，看起來一切正常。
+⇒ 新增 `tests/test_reporting_watchdog.py::TestDailyReporterEndToEndWiring`：走真的
+`DailyReporter.run()`（patch 掉 `asyncio.sleep`）+ 真的 `TelegramNotifier`（只 mock `send`），
+斷言訊息含 `⛔ userData 監控：已放棄自動重連，需人工介入`。
+mutation：`reporting.py` 的 `pnl_data` 拿掉 `"watchdog"` key → 轉紅。
+**教訓型的一句**：接線類驗收若只靠「使用者說有收到通知」，斷的是**內容**而不是**通道**時，
+人眼永遠不會紅。這種格子要用 end-to-end 測試關，不要留給下一次活體驗收。
+
+**3. spec 時間表回寫**（`docs/superpowers/specs/2026-08-15-userdata-watchdog-design.md`）
+§7.3 的「75 分鐘進 `given_up`」劃線標錯，§8.2 新增第 4 項放實測時間軸（118 分鐘）與公式
+`max(退避, 600s 靜默) + 等下一次 requote`。**寫死的結論：`given_up` 的抵達時間是 requote
+事件的函數，不是時間的函數，安靜市況下無上界。** 驗收準則裡「次數」（2 封 Telegram、
+3 次重連）可判定，「時間」不可判定。
+
+全套：**679 passed / 1 skipped**（基線 671，+8）。fast-track，終點 verifier。
+
+**4. verifier(opus) verdict：`ACCEPT WITH FINDINGS`**（fresh context、6 條自選 mutation 全紅、
+實跑複核 679/1、`git diff --stat` 證明工作區還原）。兩條 findings **當場補掉，沒進 backlog**：
+
+- **F1 訊息總長度沒有整體上限**（`MAX_POSITION_LINES` 只管持倉行數；極端大浮點或超長標的名
+  單靠 1-2 個欄位就能推過 4096）。→ `TelegramNotifier.send()` 入口加 `_truncate()`：
+  超過 `TELEGRAM_MAX_CHARS = 4096` 才動作，且**截斷版一律把 HTML 標籤整個拿掉**——
+  切一半的 `<b` 與開了沒關的 `<b>` 兩種 Telegram 都回 400「can't parse entities」，
+  單純切片等於白截。**送達 > 排版。** 這一層守的是所有通知，不只每日摘要。
+- **F2 `reporting.py` 的 positions 組裝段沒有等效守衛**（`_get_watchdog_status` 有，它沒有）。
+  關鍵在 `run()` 的外層 `except` 是 `sleep(60)` 後回迴圈頂端重算 `target`，而那時今天的整點
+  已過 ⇒ target 直接 +1 天 ⇒ **當天摘要靜默漏送一整天，不是延遲補送**。
+  → 抽出 `DailyReporter._collect_positions()`：容器層一個 try（讀不到 symbols 就當無持倉）、
+  per-symbol 一個 try（壞掉的標的只讓自己消失）。
+- 兩條各補測試 + **5 條 mutation 逐條實跑轉紅**（拿掉 send 截斷 / 截斷但不拿標籤 /
+  短訊息也被動到 / 拿掉 per-symbol try / 拿掉 symbols 容器 try）。
+- 最終全套：**685 passed / 1 skipped**（基線 671，+14）。
+- **scoped 第二輪 verifier(opus)：`ACCEPT`**（4 條自選 mutation 全紅，含「切片邊界不扣
+  suffix 長度」與「先切片再去標籤」——後者證明 `_truncate` 裡**去標籤必須在切片之前**，
+  順序反了會殘留半個 `</b`）。回歸：`_truncate` 對 `notify_crash`/`notify_start`/
+  `notify_risk_alert` 無影響（長度遠低於 4096）；`_collect_positions` 正常路徑逐行等價。
+- verdict 計數：**verifier 兩輪（R1 ACCEPT WITH FINDINGS → 修 → R2 ACCEPT）**，fast-track
+  免 dual-review 兩輪。
+
+
 ## 2026-08-16 使用者裁決：userData 根因調查停止
 
 **裁決**：不開新 API key、不再往下查根因（TODO 0c 關閉）。

@@ -1,11 +1,63 @@
 # Progress
 
-## Current Task（2026-08-16 更新）
+## Current Task（2026-08-24 更新）
 
-### 🟢 0a watchdog 活體驗收：狀態機全程走完（引擎 `09:29:08` 重啟，跑 `f4bdd8a`）
+### ✅ 本次（2026-08-24）：非 GCE 的 TODO 全部清完
+
+使用者指示「todo 繼續，除了 GCE 有關，其他清完」。剩下的三項狀態：
+
+1. **0a 最後一格（20:00 摘要帶 ⛔ 那行）→ 關閉**。
+   - log 證據：`2026-08-16 19:30:09` 與 `20:30:09` 兩筆 `仍處於 given_up` 節流提醒
+     夾住 20:00 ⇒ **當時狀態確實是 `given_up`**；全 log 自 `2026-07-12` 起零
+     `Telegram 發送失敗` / 零 `每日摘要發送失敗` ⇒ 那封確實寄出去了。
+   - 「⛔ 那行有沒有真的被組進訊息本體」人工看 Telegram 不可判定，改用實跑釘死：
+     `tests/test_reporting_watchdog.py::TestDailyReporterEndToEndWiring` 走真的
+     `DailyReporter.run()` + 真的 `TelegramNotifier`（只 mock `send`），斷言訊息含
+     `⛔ userData 監控：已放棄自動重連，需人工介入` 與 `3 次` / `120 分鐘`。
+     mutation 實測：`reporting.py` 的 `pnl_data` 拿掉 `"watchdog"` key → 該測試轉紅。
+2. **spec §8.2 時間表回寫 → 完成**（見下）。
+3. **`notify_daily_pnl` 其餘欄位型別守衛 → 完成**（見下）。
+
+**未動（使用者指示排除）**：TODO 6 GCE 固定 IP。
+**已由使用者裁決關閉**：0c userData 根因調查。
+
+#### 3-1 `notify_daily_pnl` 入口統一 coerce（`grid_engine/notifier.py`）
+verifier 在 0b 帶出的同型缺口：watchdog 那行守住了，其餘欄位沒守。這次照 notes 的
+建議「在入口統一 coerce，而不是一個欄位補一次」：
+- 新增 `TelegramNotifier._coerce_num()`（`float()` + `except Exception` + NaN/inf 一律
+  視同無效 → fallback `0.0`）、`_escape()`（`& < >`，`parse_mode=HTML` 下標的名稱含
+  `<` 會讓 Telegram 回 400 ⇒ 整封摘要掉）、`MAX_POSITION_LINES = 20`（單則 4096 字元上限）。
+- `total_pnl` / `total_equity` / `margin_usage` / `total_profit` / `running_hours` 全走
+  `_coerce_num`；`positions` 非 dict 直接當空；倉位的 `long` / `short` / `pnl` 同樣 coerce；
+  `pnl_data` 整包不是 dict 也不炸。
+- **8 條 mutation 全殺**（拿掉純量 coerce / positions 守衛 / `_escape` / 行數上限 /
+  fallback 0→999 / NaN-inf 檢查 / `pnl_data` 守衛 / 倉位 coerce），逐條實跑轉紅。
+- **679 passed / 1 skipped**（基線 671，+8 新測試）。
+- 行為變更一處：倉位數量格式從 `f"L:{pos['long']}"` 改成 `:g` ⇒ `3.0` 現在印 `L:3`
+  而不是 `L:3.0`（`0.5` 仍是 `L:0.5`）。純顯示，無斷言依賴。
+
+#### 3-3 verifier findings 當場補掉（不進 backlog）
+verifier(opus) **ACCEPT WITH FINDINGS**（6 條自選 mutation 全紅、實跑複核 679/1）。
+兩條 findings 已修：
+- **F1**：`send()` 入口加 `_truncate()`（`TELEGRAM_MAX_CHARS = 4096`），截斷版**把 HTML
+  標籤整個拿掉**——切一半的 `<b` 與沒關的 `<b>` Telegram 都回 400，單純切片等於白截。
+  守的是所有通知，不只每日摘要。
+- **F2**：抽出 `DailyReporter._collect_positions()`，容器層 + per-symbol 各一層 try。
+  原本壞一個標的 → `run()` 外層 `except` sleep(60) 後 target 自動 +1 天 ⇒
+  **當天摘要靜默漏送一整天**。
+- 5 條 mutation 逐條實跑轉紅。**最終全套 685 passed / 1 skipped（基線 671，+14）。**
+- **scoped 第二輪 verifier(opus)：`ACCEPT`**（4 條自選 mutation 全紅、回歸面確認）。
+
+#### 3-2 spec 時間表回寫（`docs/superpowers/specs/2026-08-15-userdata-watchdog-design.md`）
+§7.3 的「引擎啟動後 75 分鐘進 `given_up`」已標為**錯誤並劃線**，§8.2 新增第 4 項：
+實測時間軸表 + 每階公式 `max(退避, 600s 靜默) + 等下一次 requote`。
+**結論寫死在 spec 裡：`given_up` 的抵達時間是 requote 事件的函數，不是時間的函數，
+安靜市況下無上界；驗收與告警文案都不得承諾任何固定分鐘數。**
+
+---
+
+### 🟢 0a watchdog 活體驗收（2026-08-16）：狀態機全程走完（引擎 `09:29:08` 重啟，跑 `f4bdd8a`）
 **兩封 Telegram 使用者皆已確認收到**（09:39 的 ⚠️、11:27 的 ⛔）。
-**還沒關的一格**：今晚 **20:00** 的每日摘要是否帶 `⛔ userData 監控：已放棄自動重連，需人工介入`
-那行（`telegram_daily_pnl_hour: 20`）—— 今晚才驗得到。
 
 實測時間軸（`log/as_terminal_max.log`，非推論）：
 
@@ -64,18 +116,19 @@
 
 **⚠️ 這是止血不是治本**：stream 仍然是死的。本次讓「它死了會被發現」且「數字是真的」。
 
-### 🔴 下次開工必做（依序）
+### 下次開工必做（依序）
 
-1. **收 0a 最後一格**：檢查 2026-08-16 20:00 那封每日摘要有沒有帶
-   `⛔ userData 監控：已放棄自動重連，需人工介入`。沒帶 ⇒ `reporting.py` 的接線有問題。
-   同時把實測時間表回寫 spec §8.2（現有數字低估，見上表）。
+1. ~~**收 0a 最後一格** + 回寫 spec §8.2~~ —— **2026-08-24 完成，見本檔最上方。**
 2. ~~**userData 根因**（開新 API key 重測）~~ —— **使用者 2026-08-16 裁決：不做。**
    ⇒ 根因調查到此打住，接受「stream 死著、watchdog 看著、成交統計走 REST」這個穩態。
    若日後要重啟調查：唯一剩下的可測假設仍是「這把 API key 在 Binance 端壞掉」，
    做法是後台開新 key（Enable Reading + Enable Futures + 白名單加當前 IP）用同一套探針重測；
    **已否決的假設完整清單見 `tasks/notes.md` 的 2026-08-15 條**（含 08-14 那輪）。
-3. `notify_daily_pnl` 其餘欄位（`total_pnl` / `total_equity` / 持倉 dict）同樣無型別守衛
-   —— verifier 帶出的同型缺口，見 `tasks/notes.md` 2026-08-16 條。
+3. ~~`notify_daily_pnl` 其餘欄位（`total_pnl` / `total_equity` / 持倉 dict）同樣無型別守衛~~
+   —— **2026-08-24 完成**（入口統一 coerce，8 條 mutation 全殺），見本檔最上方 3-1。
+
+**⇒ 非 GCE 的 TODO 已全清。剩下的只有 TODO 6（GCE 固定 IP，使用者本次明確排除）
+與 backlog。**
 
 ### 📋 backlog（本次認列未做，詳見 spec §8.1 / §8.2）
 - watchdog 用牆鐘量靜默時長與退避 → 應改 `time.monotonic()`（需另開注入點，不能共用現有 `clock`）。
