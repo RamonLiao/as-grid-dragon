@@ -21,6 +21,24 @@
 **未動（使用者指示排除）**：TODO 6 GCE 固定 IP。
 **已由使用者裁決關閉**：0c userData 根因調查。
 
+### ✅ 本次追加：TUI 孤兒 bot（使用者選 A：bounded，TDD → verifier）
+
+清完 TODO 後查 08-14 那個「行程沒重啟卻跑策略初始化」的形態（結論：**不是 bug**，
+`[MAX] 初始化完成` 是按一次「啟動交易」印一次），**過程中撞到真問題**：
+
+- `start_trading()` 逾時 → `self.bot = None` 但 thread 還活著 ⇒ **孤兒 bot：會掛單、
+  永遠停不掉、Ctrl+C 也不 graceful stop**。觸發面不是理論值——今天 `08:38`~`08:39`
+  有整整一分鐘 DNS 失敗，足以吃掉那 20 秒等待。
+- `stop_trading()` 的 `join(timeout=5)` 後不看 `is_alive()` ⇒ 兩個 bot 同時撤單/掛單。
+- （L5 檢查抓到）`main_menu` 的 `valid_choices` 也 gate 在 `_trading_active` 上
+  ⇒ 孤兒狀態下**使用者按不到停止**，只修前兩條等於修了一條走不到的路徑。
+- （verifier 帶出）六處「設定即時套用」同樣 gate 在它上面 ⇒ 靜默不套用。
+
+修法：唯一真相來源改成 `bot_thread.is_alive()`，`_trading_active` 降級成純顯示旗標；
+新增 `_bot_alive()` / `_release_bot_if_dead()` / `_push_config_to_bot()`。
+**714 passed / 1 skipped**（基線 685，+29）。詳見 `tasks/notes.md` 2026-08-24 條。
+教訓 → lessons 通則 8（假字串斷言）、通則 9（旗標語意變更是全檔級改動）。
+
 #### 3-1 `notify_daily_pnl` 入口統一 coerce（`grid_engine/notifier.py`）
 verifier 在 0b 帶出的同型缺口：watchdog 那行守住了，其餘欄位沒守。這次照 notes 的
 建議「在入口統一 coerce，而不是一個欄位補一次」：

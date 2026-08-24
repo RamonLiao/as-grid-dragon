@@ -1,5 +1,57 @@
 # Notes
 
+## 2026-08-24 TUI 孤兒 bot：`self.bot = None` 是放棄控制權，不是重置 UI 狀態
+
+**起點**：查 08-14 那個「行程沒重啟卻跑策略初始化」的形態時撞到的（形態本身無害，見上一條）。
+
+**缺陷**（`as_terminal_max.py`，三個，同一個根因）
+1. `start_trading()` 等 `bot.state.running` ~20 秒逾時 → `self.bot = None`，但 thread 還活著。
+   而 `bot.py` 的 `state.running = True` 設在 `_init_exchange` / `_check_hedge_mode` /
+   `acquire_listen_key` **之後** ⇒ 逾時只代表初始化慢，那個 bot 接下來一定會開始掛單。
+   參照一丟，`stop_trading` 與 `_handle_shutdown` 都認不得它（兩者都以 `self.bot` 為入口守衛）
+   ⇒ **孤兒 bot：會下單、永遠停不掉、Ctrl+C 也不 graceful stop**。
+   **觸發面不是理論值**：`08:38:05`~`08:39:11` 的 log 有整整一分鐘 DNS 失敗
+   （`nodename nor servname provided`），足以吃掉那 20 秒。
+2. `stop_trading()` 的 `join(timeout=5)` 後不看 `is_alive()` ⇒ 舊 bot 還在送單時就清參照，
+   使用者可以立刻再啟動第二個 ⇒ **同一帳戶兩個 bot 同時撤單/掛單**。
+3. （L5 檢查抓到）`main_menu` 的 `valid_choices` 只在 `_trading_active` 為真時才加 `"s"`
+   ⇒ 孤兒狀態下**使用者按不到停止**。只修 1、2 等於修了一條使用者走不到的路徑。
+
+**修法**：唯一真相來源改成 `bot_thread.is_alive()`，`_trading_active` 降級成純顯示旗標。
+- `_bot_alive()`：是否還有活著的 bot thread。
+- `_release_bot_if_dead()`：**thread 確認已死才放參照**，回傳是否放掉。
+- `_push_config_to_bot()`：設定即時套用的守衛改看 `self.bot`（verifier 帶出的六處，
+  孤兒狀態下原本會靜默不套用——使用者看到「已保存」卻沒套用，bot 仍拿舊 config 下單）。
+- `start_trading` 入口守衛改看 `_bot_alive()`；**thread 已死則先清殘留參照**
+  （否則 bot 自己初始化失敗後 `run_bot_thread` 的 finally 只清 `_trading_active`、
+  `self.bot` 留著 ⇒ 永遠無法再啟動。這是修這題最容易自己開的新洞）。
+- `main_menu` 的 `stoppable = _trading_active or _bot_alive()` 貫穿顯示 / `valid_choices` /
+  `choice == "s"` / `choice == "0"` 退出前停止；另加孤兒橫幅（**刻意不讀 `bot.state`**，
+  孤兒可能還在初始化，運行時間/浮盈都還沒意義）。
+
+**刻意偏離**：對話裡說停止逾時要發 Telegram 告警，實作沒做——卡住的正是 `bot_loop`，
+從那條路徑發告警會跟著卡死。改成 `logger.error` + console 提示可重試。
+
+**驗證**：TDD 先紅（19 條裡 6 條實作前紅）、11 條自跑 mutation + verifier 兩輪自選 5+N 條、
+6 條 monkey test（join 前後翻面的 race、`is_alive()` 恆真的卡死 bot、bot 有但 thread 沒有、
+bot 沒有但 thread 活著的歷史遺留孤兒）。
+
+**教訓已寫進 lessons 通則 8（假字串斷言）與通則 9（旗標語意變更是全檔級改動）。**
+
+**verifier 三輪**：
+- R1 `ACCEPT WITH FINDINGS` → 帶出六處「設定即時套用」仍綁 `_trading_active`
+  （實作者實際找到 **6** 處，比 R1 列的 5 處多一個：檔尾 config 重新載入那處）。全修，
+  抽出 `_push_config_to_bot()`。
+- R2 `ACCEPT WITH FINDINGS` → 一條 mutation **存活**（`manage_symbols` 橫幅守衛零覆蓋）
+  + `toggle_symbol:995` 的重啟提示同型未修。兩條全修，補 4 條測試，
+  **重跑 R2 那條存活 mutation 現在會紅**。
+- R3 **`ACCEPT`**：4 條 mutation 全紅（第一條就是 R2 那條存活的）、4 條新測試逐條做過
+  假斷言審查（含確認 `toggle_symbol` 測試沒走 early return——先斷言 `cfg.enabled is False`
+  證明真的執行到被測分支）、`_trading_active` 全檔 21 個讀取點掃過確認無誤用。
+- 累計 mutation：實作者 14 條 + verifier 三輪自選 ≥12 條，除 R2 那條當場存活外全紅。
+  **714 passed / 1 skipped**（基線 685，+29）。
+
+
 ## 2026-08-24 「行程沒重啟卻跑了策略初始化」形態——不是 bug，但旁邊有一個真的
 
 progress.md 從 2026-08-14 掛著的未解形態（`21:21:10` 出現 `[MAX] 初始化完成` +
