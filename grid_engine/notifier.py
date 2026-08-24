@@ -3,6 +3,8 @@ Telegram 通知模組
 透過 Telegram Bot API 發送交易通知
 """
 
+import re
+
 import aiohttp
 from datetime import datetime
 from .utils import logger
@@ -13,6 +15,9 @@ class TelegramNotifier:
 
     TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
+    #: Telegram 單則訊息硬上限。超過 API 直接回 400，整封訊息等於沒送到。
+    TELEGRAM_MAX_CHARS = 4096
+
     def __init__(self, bot_token: str = "", chat_id: str = "", switch_on: bool = True):
         self.bot_token = bot_token
         self.chat_id = chat_id
@@ -22,10 +27,25 @@ class TelegramNotifier:
     def enabled(self) -> bool:
         return bool(self.bot_token and self.chat_id) and self.switch_on
 
+    @classmethod
+    def _truncate(cls, message: str) -> str:
+        """訊息超過 Telegram 4096 字元硬上限時截斷，寧可少一段也不要整封掉。
+
+        截斷會把 HTML 標籤切成半個（`<b` 或開了沒關的 `<b>`），Telegram 兩種
+        都會回 400「can't parse entities」⇒ 截斷版一律**把標籤整個拿掉**，
+        只保留純文字（`&lt;` 這類實體本來就合法，留著）。送達 > 排版。
+        """
+        if len(message) <= cls.TELEGRAM_MAX_CHARS:
+            return message
+        suffix = "\n…（訊息過長已截斷）"
+        body = re.sub(r"<[^>]*>|<[^>]*$", "", message)
+        return body[: cls.TELEGRAM_MAX_CHARS - len(suffix)] + suffix
+
     async def send(self, message: str) -> bool:
         """發送 Telegram 訊息，失敗不拋異常"""
         if not self.enabled:
             return False
+        message = self._truncate(str(message))
         try:
             url = self.TELEGRAM_API.format(token=self.bot_token)
             payload = {
@@ -108,30 +128,73 @@ class TelegramNotifier:
         )
         await self.send(msg)
 
+    #: 持倉行上限。Telegram 單則訊息 4096 字元，超過整封摘要發不出去。
+    MAX_POSITION_LINES = 20
+
+    @staticmethod
+    def _coerce_num(value, default: float = 0.0) -> float:
+        """把摘要欄位強制轉成可格式化的有限浮點數。
+
+        硬性要求是「每日摘要不得發不出去」（見 tasks/notes.md 2026-08-16）。
+        任一欄位型別錯就讓整封掉光是不可接受的，因此這裡降級成
+        fallback 值而不拋。`__float__` 可以拋任意例外 ⇒ `except Exception`。
+        NaN / inf 不會拋但會印出 `+nan` / `inf`，一律視同無效值。
+        """
+        try:
+            n = float(value)
+        except Exception:
+            return default
+        if n != n or n in (float("inf"), float("-inf")):
+            return default
+        return n
+
+    @staticmethod
+    def _escape(text) -> str:
+        """parse_mode=HTML 下任何非數值字串都要跳脫，否則 `<` 會讓 Telegram 回 400。"""
+        return (
+            str(text)
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
     async def notify_daily_pnl(self, pnl_data: dict):
         """每日損益摘要"""
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        total_pnl = pnl_data.get("total_pnl", 0)
-        total_equity = pnl_data.get("total_equity", 0)
-        margin_usage = pnl_data.get("margin_usage", 0)
-        total_profit = pnl_data.get("total_profit", 0)
+        if not isinstance(pnl_data, dict):
+            pnl_data = {}
+        total_pnl = self._coerce_num(pnl_data.get("total_pnl"))
+        total_equity = self._coerce_num(pnl_data.get("total_equity"))
+        margin_usage = self._coerce_num(pnl_data.get("margin_usage"))
+        total_profit = self._coerce_num(pnl_data.get("total_profit"))
         positions = pnl_data.get("positions", {})
-        running_hours = pnl_data.get("running_hours", 0)
+        running_hours = self._coerce_num(pnl_data.get("running_hours"))
 
         icon = "📈" if total_pnl >= 0 else "📉"
         pos_lines = []
+        omitted = 0
+        if not isinstance(positions, dict):
+            positions = {}
         for sym, pos in positions.items():
-            coin = sym.split("/")[0]
+            if len(pos_lines) >= self.MAX_POSITION_LINES:
+                omitted = len(positions) - len(pos_lines)
+                break
+            coin = self._escape(str(sym).split("/")[0])
             if not isinstance(pos, dict):
                 # 相容舊格式：純數量
-                pos_lines.append(f"  {coin}: {pos}")
+                pos_lines.append(f"  {coin}: {self._escape(pos)}")
                 continue
             sides = []
-            if pos.get("long", 0) > 0:
-                sides.append(f"L:{pos['long']}")
-            if pos.get("short", 0) > 0:
-                sides.append(f"S:{pos['short']}")
-            pos_lines.append(f"  {coin}: {', '.join(sides)} | PnL: {pos.get('pnl', 0):+.2f}")
+            long_qty = self._coerce_num(pos.get("long"))
+            short_qty = self._coerce_num(pos.get("short"))
+            if long_qty > 0:
+                sides.append(f"L:{long_qty:g}")
+            if short_qty > 0:
+                sides.append(f"S:{short_qty:g}")
+            pnl = self._coerce_num(pos.get("pnl"))
+            pos_lines.append(f"  {coin}: {', '.join(sides)} | PnL: {pnl:+.2f}")
+        if omitted > 0:
+            pos_lines.append(f"  …另有 {omitted} 個標的未列")
         pos_text = "\n".join(pos_lines) or "  (無持倉)"
 
         watchdog_line = self._format_watchdog_line(pnl_data.get("watchdog"))

@@ -40,6 +40,29 @@ class DailyReporter:
             logger.warning(f"[reporter] watchdog 狀態讀取失敗，摘要跳過該行: {e}")
             return None
 
+    def _collect_positions(self) -> dict:
+        """組持倉快照。單一標的的狀態壞掉（屬性缺失、數值型別錯）只能讓那一個
+        標的消失，不得讓整封每日摘要發不出去——run() 的外層 except 是 sleep(60)
+        後重算 target，那會直接把當天的摘要跳掉一整天（靜默漏送）。
+        """
+        positions = {}
+        try:
+            symbols = self.state.symbols.items()
+        except Exception as e:
+            logger.warning(f"[reporter] 讀取 symbols 失敗，摘要以無持倉帶出: {e}")
+            return positions
+        for sym, sym_state in symbols:
+            try:
+                if sym_state.long_position > 0 or sym_state.short_position > 0:
+                    positions[sym] = {
+                        "long": sym_state.long_position,
+                        "short": sym_state.short_position,
+                        "pnl": sym_state.unrealized_pnl,
+                    }
+            except Exception as e:
+                logger.warning(f"[reporter] 標的 {sym} 持倉讀取失敗，該標的跳過: {e}")
+        return positions
+
     async def run(self):
         """每日 telegram_daily_pnl_hour (Asia/Taipei, UTC+8) 整點發送損益摘要"""
         while not self._stop_event.is_set():
@@ -57,18 +80,14 @@ class DailyReporter:
                 if self._stop_event.is_set():
                     break
 
-                positions = {}
-                for sym, sym_state in self.state.symbols.items():
-                    if sym_state.long_position > 0 or sym_state.short_position > 0:
-                        positions[sym] = {
-                            "long": sym_state.long_position,
-                            "short": sym_state.short_position,
-                            "pnl": sym_state.unrealized_pnl,
-                        }
+                positions = self._collect_positions()
 
                 running_hours = 0
-                if self.state.start_time:
-                    running_hours = (datetime.now() - self.state.start_time).total_seconds() / 3600
+                try:
+                    if self.state.start_time:
+                        running_hours = (datetime.now() - self.state.start_time).total_seconds() / 3600
+                except Exception as e:
+                    logger.warning(f"[reporter] 運行時數計算失敗，以 0 帶入: {e}")
 
                 pnl_data = {
                     "total_pnl": self.state.total_unrealized_pnl,

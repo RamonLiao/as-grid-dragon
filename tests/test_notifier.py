@@ -457,6 +457,177 @@ class TestNotifierMonkey:
         assert notifier.send.call_count == len(cases)
 
     @pytest.mark.asyncio
+    async def test_daily_pnl_scalar_fields_wrong_typed_still_send(self):
+        """M1 同型缺口：total_pnl / total_equity / margin_usage / total_profit /
+        running_hours 值型別錯時，摘要仍必須發得出去，數字降級成 0。
+
+        紅在：把 _coerce_num 拿掉（欄位改回 pnl_data.get(...)）後，f-string
+        的 :+.2f / :.1% 會 TypeError 往外炸，notifier.send 根本不會被呼叫。
+        """
+        class HostileNumber:
+            def __float__(self):
+                raise KeyError("boom")
+
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        garbage_values = ["abc", None, [], {}, object(), HostileNumber(),
+                          float("nan"), float("inf"), float("-inf")]
+        fields = ["total_pnl", "total_equity", "margin_usage",
+                  "total_profit", "running_hours"]
+        calls = 0
+        for field in fields:
+            for bad in garbage_values:
+                await notifier.notify_daily_pnl({
+                    "total_pnl": 1.0, "total_equity": 100.0,
+                    "margin_usage": 0.5, "total_profit": 2.0,
+                    "positions": {}, "running_hours": 1,
+                    field: bad,
+                })
+                calls += 1
+                msg = notifier.send.call_args[0][0]
+                assert "每日損益摘要" in msg
+                assert "nan" not in msg and "inf" not in msg
+        assert notifier.send.call_count == calls
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_bad_field_falls_back_to_zero_not_some_other_constant(self):
+        """fallback 必須是 0（不是隨便一個常數）—— 逐欄位斷言字面值，
+        _coerce_num 的 default 被改成別的數字時要紅。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({
+            "total_pnl": "x", "total_equity": "x", "margin_usage": "x",
+            "total_profit": "x", "running_hours": "x", "positions": {},
+        })
+        msg = notifier.send.call_args[0][0]
+        assert "帳戶權益: 0.00 USDC" in msg
+        assert "保證金使用率: 0.0%" in msg
+        assert "未實現 PnL: <b>+0.00</b>" in msg
+        assert "累計已實現: +0.00" in msg
+        assert "運行: 0.0 小時" in msg
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_positions_garbage_shapes_still_send(self):
+        """positions 本身不是 dict、或倉位欄位型別錯，摘要仍要發得出去。
+
+        紅在：拿掉 positions 的 isinstance 守衛 → 'not a dict'.items() AttributeError；
+        拿掉 long/short 的 _coerce_num → 'abc' > 0 TypeError。
+        """
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        bad_positions = [
+            "not a dict",
+            123,
+            [{"long": 1}],
+            None,
+            {"BNB/USDC:USDC": {"long": "abc", "short": None, "pnl": "x"}},
+            {"BNB/USDC:USDC": {"long": float("nan"), "short": float("inf"), "pnl": float("nan")}},
+            {None: {"long": 1, "short": 0, "pnl": 1.0}},
+            {12345: 3.0},
+        ]
+        for positions in bad_positions:
+            await notifier.notify_daily_pnl({
+                "total_pnl": 1.0, "total_equity": 100.0,
+                "positions": positions, "running_hours": 1,
+            })
+            msg = notifier.send.call_args[0][0]
+            assert "每日損益摘要" in msg
+        assert notifier.send.call_count == len(bad_positions)
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_position_symbol_html_is_escaped(self):
+        """parse_mode=HTML：標的名稱裡的 < > & 必須跳脫，否則 Telegram 回 400，
+        整封摘要發不出去。紅在：拿掉 _escape。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        await notifier.notify_daily_pnl({
+            "total_pnl": 1.0, "total_equity": 100.0, "running_hours": 1,
+            "positions": {"<b>&evil": {"long": 1, "short": 0, "pnl": 1.0}},
+        })
+        msg = notifier.send.call_args[0][0]
+        assert "&lt;b&gt;&amp;evil" in msg
+        assert "<b>&evil" not in msg
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_caps_position_lines(self):
+        """持倉數量爆掉時要截斷 —— Telegram 單則 4096 字元，超過整封發不出去。
+
+        紅在：拿掉 MAX_POSITION_LINES 迴圈上限 → 200 行全印，訊息超過 4096。
+        """
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        positions = {
+            f"SYM{i}/USDC:USDC": {"long": 1.0, "short": 1.0, "pnl": -1.0}
+            for i in range(200)
+        }
+        await notifier.notify_daily_pnl({
+            "total_pnl": 1.0, "total_equity": 100.0,
+            "positions": positions, "running_hours": 1,
+        })
+        msg = notifier.send.call_args[0][0]
+        assert len(msg) < 4096
+        assert "另有 180 個標的未列" in msg
+
+    @pytest.mark.asyncio
+    async def test_daily_pnl_non_dict_payload_still_sends(self):
+        """pnl_data 整包不是 dict（上游回傳 None／list）時也不得炸。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        for payload in [None, [], "oops", 42]:
+            await notifier.notify_daily_pnl(payload)
+        assert notifier.send.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_send_truncates_over_telegram_limit(self):
+        """訊息超過 4096 字元時 send() 必須自己截斷 —— Telegram 會直接回 400，
+        整封等於沒送到。紅在：拿掉 _truncate。"""
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        sent = {}
+
+        class FakeResp:
+            status = 200
+
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+            async def text(self_inner):
+                return ""
+
+        class FakeSession:
+            async def __aenter__(self_inner):
+                return self_inner
+
+            async def __aexit__(self_inner, *a):
+                return False
+
+            def post(self_inner, url, json=None, timeout=None):
+                sent["text"] = json["text"]
+                return FakeResp()
+
+        with patch("grid_engine.notifier.aiohttp.ClientSession", lambda: FakeSession()):
+            ok = await notifier.send("<b>" + "x" * 10000 + "</b>")
+        assert ok is True
+        assert len(sent["text"]) <= TelegramNotifier.TELEGRAM_MAX_CHARS
+        assert "訊息過長已截斷" in sent["text"]
+
+    def test_truncate_drops_html_tags_so_telegram_can_parse(self):
+        """截斷版一律拿掉 HTML 標籤：切一半的 `<b` 與開了沒關的 `<b>` 都會讓
+        Telegram 回 400。紅在：_truncate 改成單純切片不拿掉標籤。"""
+        long_msg = "<b>標題</b>\n" + "".join(f"<b>{i}</b>行內容內容內容\n" for i in range(600))
+        out = TelegramNotifier._truncate(long_msg)
+        assert len(out) <= TelegramNotifier.TELEGRAM_MAX_CHARS
+        assert "<" not in out and ">" not in out
+        assert "標題" in out
+
+    def test_truncate_leaves_short_message_untouched(self):
+        """沒超過上限就一個字都不能動。"""
+        msg = "<b>每日損益摘要</b>\n帳戶權益: 94.49 USDC"
+        assert TelegramNotifier._truncate(msg) == msg
+
+    @pytest.mark.asyncio
     async def test_daily_pnl_with_negative_values(self):
         """負數值正常處理"""
         notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
