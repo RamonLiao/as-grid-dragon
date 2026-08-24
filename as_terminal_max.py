@@ -81,7 +81,10 @@ class MainMenu:
     def _handle_shutdown(self, signum, frame):
         """Graceful shutdown on SIGTERM/SIGINT"""
         console.print(f"\n[yellow]收到信號 {signum}，正在關閉...[/]")
-        if self._trading_active and self.bot and self.bot_loop and self.bot_loop.is_running():
+        # 守衛看的是 bot 參照，不是 _trading_active——start_trading 逾時路徑會把
+        # _trading_active 留在 False，但那個 bot 還在跑，不 stop 就等於掛單與
+        # listenKey 都不收（見 tests/test_tui_bot_lifecycle.py）
+        if self.bot and self.bot_loop and self.bot_loop.is_running():
             future = asyncio.run_coroutine_threadsafe(self.bot.stop(), self.bot_loop)
             try:
                 future.result(timeout=10)
@@ -121,6 +124,12 @@ class MainMenu:
         while True:
             self.show_banner()
 
+            if self.bot and not self._trading_active:
+                # 孤兒狀態：bot 可能還在初始化，state 的運行時間/浮盈都還沒意義，
+                # 只報「它還在」與怎麼收掉它。
+                console.print("[bold yellow]● bot 仍在運行（啟動未確認／停止未完成）"
+                              "——請用「s」停止[/]\n")
+
             if self._trading_active and self.bot:
                 console.print("[bold green]● 交易運行中[/]", end="  ")
                 if self.bot.state.start_time:
@@ -136,11 +145,14 @@ class MainMenu:
 
             console.print("[bold]請選擇操作:[/]\n")
 
+            stoppable = self._trading_active or self._bot_alive()
             if self._trading_active:
                 console.print("  [cyan]1[/] 查看交易面板")
                 console.print("  [cyan]s[/] [red]停止交易[/]")
             else:
                 console.print("  [cyan]1[/] 開始交易")
+                if stoppable:
+                    console.print("  [cyan]s[/] [red]停止交易（bot 仍在運行）[/]")
 
             console.print("  [cyan]2[/] 管理交易對")
             console.print("  [cyan]3[/] 回測/優化")
@@ -156,13 +168,13 @@ class MainMenu:
             valid_choices = ["0", "1", "2", "3", "4", "5", "6", "7"]
             if COIN_SELECTION_AVAILABLE:
                 valid_choices.append("8")
-            if self._trading_active:
+            if stoppable:
                 valid_choices.append("s")
 
             choice = Prompt.ask("選擇", choices=valid_choices, default="1")
 
             if choice == "0":
-                if self._trading_active:
+                if stoppable:
                     if Confirm.ask("[yellow]交易運行中，確定要退出嗎？[/]"):
                         self.stop_trading()
                         break
@@ -173,7 +185,7 @@ class MainMenu:
                     self.view_trading_panel()
                 else:
                     self.start_trading()
-            elif choice == "s" and self._trading_active:
+            elif choice == "s" and stoppable:
                 self.stop_trading()
             elif choice == "2":
                 self.manage_symbols()
@@ -587,8 +599,7 @@ class MainMenu:
         self.config.save()
         console.print("[green]MAX 增強設定已保存[/]")
 
-        if self._trading_active and self.bot:
-            self.bot.config = self.config
+        if self._push_config_to_bot():
             console.print("[cyan]✓ 配置已即時套用[/]")
 
         Prompt.ask("按 Enter 繼續")
@@ -728,8 +739,7 @@ class MainMenu:
         self.config.save()
         console.print("\n[green]學習模組設定已保存[/]")
 
-        if self._trading_active and self.bot:
-            self.bot.config = self.config
+        if self._push_config_to_bot():
             console.print("[cyan]✓ 配置已即時套用[/]")
 
         Prompt.ask("按 Enter 繼續")
@@ -776,8 +786,7 @@ class MainMenu:
             self.config.save()
             console.print("[green]風控設定已保存[/]")
 
-            if self._trading_active and self.bot:
-                self.bot.config = self.config
+            if self._push_config_to_bot():
                 console.print("[cyan]✓ 配置已即時套用[/]")
 
         Prompt.ask("按 Enter 繼續")
@@ -787,7 +796,7 @@ class MainMenu:
             self.show_banner()
             console.print("[bold]交易對管理[/]\n")
 
-            if self._trading_active:
+            if self.bot:
                 console.print("[dim yellow]● 交易運行中 - 修改參數會即時套用[/]\n")
 
             if self.config.symbols:
@@ -932,8 +941,7 @@ class MainMenu:
         self.config.save()
         console.print("[green]已更新[/]")
 
-        if self._trading_active and self.bot:
-            self.bot.config = self.config
+        if self._push_config_to_bot():
             console.print("[cyan]✓ 配置已即時套用到運行中的交易[/]")
 
         Prompt.ask("按 Enter 繼續")
@@ -984,7 +992,9 @@ class MainMenu:
         status = "啟用" if cfg.enabled else "停用"
         console.print(f"[green]{key} 已{status}[/]")
 
-        if self._trading_active:
+        # 守衛看 self.bot：孤兒狀態下那個 bot 一樣跑著舊的啟用/停用狀態，
+        # 一樣需要重啟才生效——這個提示不能因為 _trading_active 是 False 就消失。
+        if self.bot:
             console.print("[yellow]注意: 交易對啟用/停用需要重啟交易才能生效[/]")
 
         Prompt.ask("按 Enter 繼續")
@@ -1083,8 +1093,7 @@ class MainMenu:
             console.print(f"\n[green]已加入 {len(added)} 個交易對: {', '.join(added)}[/]")
             console.print("[dim]可到「管理交易對」調整參數[/]")
 
-            if self._trading_active and self.bot:
-                self.bot.config = self.config
+            if self._push_config_to_bot():
                 console.print("[cyan]✓ 配置已即時套用[/]")
                 console.print("[yellow]注意: 新交易對需要重啟交易才能生效[/]")
 
@@ -1226,10 +1235,17 @@ class MainMenu:
             Prompt.ask("按 Enter 繼續")
             return
 
-        if self._trading_active:
-            console.print("[yellow]交易已在運行中[/]")
+        # 真相來源是「thread 是否還活著」，不是 _trading_active：停止逾時與啟動逾時
+        # 兩條路徑都會把 _trading_active 留在 False，而舊 bot 還在送單。用它當守衛
+        # 等於允許同一帳戶上出現兩個 MaxGridBot 同時撤單/掛單。
+        if self.bot_thread and self.bot_thread.is_alive():
+            console.print("[yellow]交易已在運行中（或前一次停止尚未完成）[/]")
             Prompt.ask("按 Enter 繼續")
             return
+
+        # thread 已死 ⇒ 殘留參照清掉。bot 自己初始化失敗時 run_bot_thread 的 finally
+        # 只會清 _trading_active，self.bot 會留著，不清就再也啟動不了。
+        self._release_bot_if_dead()
 
         console.print("[bold]啟動 MAX 網格交易...[/]\n")
 
@@ -1271,33 +1287,79 @@ class MainMenu:
                 if self.bot.state.running:
                     self._trading_active = True
                     console.print("[bold green]✓ 交易已在背景啟動！[/]\n")
+                elif self._release_bot_if_dead():
+                    console.print("[red]Bot 啟動超時且已結束，請檢查網絡連接[/]")
                 else:
-                    console.print("[red]Bot 啟動超時，請檢查網絡連接[/]")
-                    self.bot = None
+                    # 逾時 ≠ bot 不存在。state.running 是在 _init_exchange /
+                    # _check_hedge_mode / acquire_listen_key 之後才設 True，逾時只代表
+                    # 初始化慢（例如 DNS 掛掉），這個 bot 接下來一定會開始掛單。
+                    logger.warning("[TUI] Bot 啟動逾時但 thread 仍在運行，保留參照以便停止")
+                    console.print("[yellow]Bot 仍在初始化中（網路慢？）——參照已保留[/]")
+                    console.print("[dim]確定不要它時請用「s」停止交易，不要直接再啟動[/]")
             else:
                 console.print("[red]Bot 啟動失敗，請檢查日誌[/]")
-                self.bot = None
+                self._release_bot_if_dead()
 
         Prompt.ask("按 Enter 繼續")
 
+    def _push_config_to_bot(self) -> bool:
+        """把最新 config 推給還在運行的 bot；回傳是否推成功。
+
+        守衛看 `self.bot` 而不是 `_trading_active`：孤兒狀態（啟動逾時／停止未完成，
+        `_trading_active` 為 False 但 bot 還在跑）下，舊守衛會**靜默跳過**——
+        使用者看到「已保存」卻沒有「已即時套用」，而 bot 仍拿舊 config 在真錢上下單。
+        """
+        if not self.bot:
+            return False
+        self.bot.config = self.config
+        return True
+
+    def _bot_alive(self) -> bool:
+        """是否還有一個活著的 bot thread（不論 _trading_active 是什麼）。
+
+        停止逾時與啟動逾時兩條路徑都會把 `_trading_active` 留在 False，
+        而 bot 還在送單。選單若只看 `_trading_active`，那個狀態下「s 停止交易」
+        根本不會出現在 valid_choices 裡 ⇒ 使用者按不到停止。
+        """
+        return bool(self.bot_thread and self.bot_thread.is_alive())
+
+    def _release_bot_if_dead(self) -> bool:
+        """thread 確認已死才放掉 bot 參照；回傳是否真的放掉了。
+
+        `self.bot = None` 讀起來像「重置 UI 狀態」，實際語意是**放棄對一個可能
+        還在真錢帳戶上下單的物件的唯一控制權**——`stop_trading` 與 `_handle_shutdown`
+        都以 `self.bot` 為入口，參照一丟該 bot 就變成停不掉的孤兒。
+        """
+        if self.bot_thread and self.bot_thread.is_alive():
+            return False
+        self.bot = None
+        self.bot_thread = None
+        self.bot_loop = None
+        self._trading_active = False
+        return True
+
     def stop_trading(self):
         """停止背景交易"""
-        if not self._trading_active or not self.bot:
+        alive = bool(self.bot_thread and self.bot_thread.is_alive())
+        if self.bot is None and not alive:
             console.print("[yellow]沒有運行中的交易[/]")
             return
 
         console.print("[bold yellow]正在停止交易...[/]")
 
-        if self.bot_loop and self.bot_loop.is_running():
+        if self.bot and self.bot_loop and self.bot_loop.is_running():
             asyncio.run_coroutine_threadsafe(self.bot.stop(), self.bot_loop)
 
-        if self.bot_thread and self.bot_thread.is_alive():
+        if self.bot_thread:
             self.bot_thread.join(timeout=5)
 
-        self._trading_active = False
-        self.bot = None
-        self.bot_thread = None
-        self.bot_loop = None
+        if not self._release_bot_if_dead():
+            # 這裡刻意不發 Telegram：卡住的正是 bot_loop，告警本身會跟著卡死。
+            logger.error("[TUI] 停止交易逾時：bot thread 仍在運行，參照保留不放手")
+            console.print("[bold red]⚠ 停止未完成：bot 仍在運行[/]")
+            console.print("[dim]可以再按一次「s」重試停止；在它真正結束前無法啟動新交易[/]")
+            Prompt.ask("按 Enter 繼續")
+            return
 
         console.print("[green]✓ 交易已停止[/]")
         Prompt.ask("按 Enter 繼續")
@@ -1340,8 +1402,7 @@ class MainMenu:
         if not self.config.api_secret and old_api_secret:
             self.config.api_secret = old_api_secret
 
-        if self._trading_active and self.bot:
-            self.bot.config = self.config
+        if self._push_config_to_bot():
             console.print("[green]✓ 配置已重新載入[/]")
 
 
