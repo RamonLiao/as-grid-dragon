@@ -22,6 +22,7 @@ from .enhancements import (
 )
 from .config import GlobalConfig, SymbolConfig
 from .state import GlobalState, SymbolState
+from . import clock
 from .notifier import TelegramNotifier
 from .context import ExchangeContext
 from .locks import SymbolLocks
@@ -533,6 +534,10 @@ class MaxGridBot:
                     state.best_bid = bid
                     state.best_ask = ask
                     state.latest_price = (bid + ask) / 2
+
+                    # 與 bid/ask 同一個同步 block 蓋章：本區塊內無 await，
+                    # 時戳與價格不可能分家。
+                    state.quote_at = clock.now()
 
                     self.leading_indicator.update_spread(ccxt_symbol, bid, ask)
 
