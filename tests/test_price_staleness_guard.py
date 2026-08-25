@@ -379,7 +379,8 @@ def test_stale_quote_line_present_when_nonzero():
 def test_stale_quote_line_survives_garbage_counts():
     """型別錯不得讓整封摘要發不出去——降級成不帶數字，訊號本身不能掉。"""
     line = TelegramNotifier._format_stale_quote_line({"total": "abc", "symbols": None})
-    assert isinstance(line, str)
+    assert "價格快照過期" in line      # 訊號本身不能掉
+    assert line != ""
 
 
 def test_reporter_collects_stale_counts():
