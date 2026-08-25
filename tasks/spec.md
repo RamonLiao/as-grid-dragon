@@ -25,7 +25,13 @@ ticker 留下的殘值 `best_bid`/`best_ask`，而 `_grid_step` 的 `bot.py:405`
 ## Security / Safety constraints
 - 守衛唯一副作用是「不下單」與「寫 log / 計數」。不得撤單、改倉、發 REST 請求。
 - 不得改寫 `best_bid` / `best_ask` / `latest_price`——只讀不寫。
-- `max_price_age_sec = 0`（關閉）必須讓行為完全回到改動前，作為生產緊急逃生門。
+- 守衛的時鐘用 `clock.guard_now()`（守衛專用牆鐘），不得與可被 backtester
+  替換的 `clock.now()` 共用——共用會讓「一邊實盤一邊回測」全面停單（設計 §4.2）。
+- `max_price_age_sec = 0`（關閉）= **不再擋單**；風控上移與 `quote_age` 量測仍然
+  生效，兩者皆不消費快照價格（設計 §5；原本寫「完全回到改動前」不準確）。
+  該逃生門**目前無 UI 入口**，要動得手改 `config/*.json` 並重啟。
+- 每日摘要「無此行」**不等於**「價格是新鮮的」——feed 整條斷掉時根本沒人呼叫
+  `_grid_step`，計數不會動；偵測 feed 全斷是 watchdog 的職責，不是本守衛的。
 - 不得影響止盈單路徑與 `sync_service` 的 REST 同步。
 
 ## 可判定驗收準則

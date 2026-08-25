@@ -426,3 +426,51 @@ maxDD：ETHUSDC 舊 0.1162% vs 新 0.3326%；BNBUSDC 舊 0.0949% vs 新 0.2267%�
 **判讀**：fee 修正後 return **方向仍相反**（舊賺新虧，兩組區間皆然），只是虧損量級縮小（fee 減半後虧得少一點，符合預期，但方向不變）。這證實了先前 FAIL 的主因**不是** fee 對齊 bug，而是既有判讀成立的撮合語意差異（同根 high/low vs 追價 settle-then-decide）——修正後結論更穩固，#9 Phase 2 裁決（接受新引擎為基準）維持不變，無需回頭修正該裁決。
 
 全套回歸：`uv run pytest tests/ -q` → 294 passed（unchanged）。
+
+---
+
+## 價格時效守衛：security review + verifier findings 修復（2026-08-25）
+
+### 1. 守衛不能共用 `clock.now()`（High，本輪最重要）
+
+live bot 跑在 TUI 同一個行程的 daemon thread（`as_terminal_max.py:1265`），而同一個
+TUI 主執行緒提供「執行回測 / 參數優化」選單。`backtest/backtester.py:715` 每根 K 線
+`clock.set_clock(lambda: epoch)` 替換模組級全域 `_now_fn`。守衛若用 `clock.now()`
+量快照年齡，「一邊實盤一邊點回測」就會讓 `quote_age` 變成巨大負數 ⇒ `age < 0`
+對每個 symbol 每個 tick 觸發 ⇒ **全面停止下單（含成交後的止盈補單），持倉繼續累積**，
+唯一訊號是每 symbol 每小時一筆 throttled warning。
+
+守衛上線**之前**，同樣的時鐘替換只讓 ATR/funding 計時器軟偏移，不會停止下單——
+是本次改動把「軟偏移」變成「硬停機」，屬本 branch 引入的回歸。
+
+**why 這樣修**：守衛量的是「訊息實際抵達本機的**牆鐘**時間」，`now()` 是可被回測
+換掉的**情境時鐘**。兩個不同的物理量，原設計混為一談是分類錯誤；分開不是繞路，
+是修正分類。`clock.py` 增設 `guard_now()`/`set_guard_clock()`/`reset_guard_clock()`，
+`now()` 家族語意與既有呼叫端全部不動。守衛三處（蓋章、比較、節流）必須一致。
+
+**通則**：時間量測要先問「這是情境時間還是牆鐘時間」，再決定用哪個時鐘。凡是量
+「外部訊息什麼時候到我這裡」的，一律牆鐘，不可注入。
+
+### 2. 每日摘要不得宣稱日粒度
+
+`stale_quote_counts` 全 repo 無重置點，文案卻寫「今日 N 次」⇒ 跑 30 天會每天報同一個
+越滾越大的數字。改成「累計 N 次（自啟動）」。**刻意不做 snapshot-diff 造日增量**：
+這套引擎重啟頻繁，reporter 自造的「今日」會隨重啟歸零，比誠實累計更誤導。
+措辭誠實 > 假裝有日粒度。
+
+### 3. `max_price_age_sec = 0` 不等於「完全回到改動前」
+
+準確語意：**關閉守衛 = 不再擋單；風控上移（§4.3.1）與 `quote_age` 量測仍然生效，
+兩者皆不消費快照價格**。spec §5 已修訂。另：該逃生門**目前沒有 UI 入口**
+（`as_terminal_max.py` 與 `web/` 皆無），要動得手改 `config/*.json` 並重啟——
+新增 UI 入口列 backlog。
+
+### 4. 寫死一句避免誤讀（重要）
+
+**「每日摘要看到『無此行』不等於『價格是新鮮的』——偵測 feed 整條斷掉是 watchdog
+的職責，不是本守衛的。」**
+
+守衛只在 `adjust_grid` 被呼叫時判定，而 `adjust_grid` 的兩個入口是 bookTicker 與
+userData。bookTicker 全斷時根本沒人呼叫 `_grid_step` ⇒ 計數不會動；userData 自
+2026-07-12 死著 ⇒ 第二條路也不觸發。最嚴重的形態恰恰是這個計數看不見的形態。
+那一行量的是「有人來敲門、但手上的價格太舊」。

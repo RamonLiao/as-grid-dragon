@@ -73,10 +73,37 @@ state.quote_at = clock.now()
 
 該 block 內無 `await` ⇒ 時戳與價格不可能分家。
 
-### 4.2 時鐘來源
+### 4.2 時鐘來源（2026-08-25 修訂，security review Finding 1）
 
-用 `grid_engine/clock.py` 的 `now()`（可注入，回測相容），**不用 `time.monotonic()`**。
+用 `grid_engine/clock.py` 的 **`guard_now()`**（守衛專用牆鐘），**不用 `now()`**，
+也不用 `time.monotonic()`。
 
+**原設計錯誤**：原本寫「用 `clock.now()`（可注入，回測相容）」。但 `now()` 是
+**情境時鐘**——`backtest/backtester.py:715` 每根 K 線都 `clock.set_clock(lambda: epoch)`
+替換模組級全域 `_now_fn`，整個回測期間都是歷史 epoch。而 live bot 與回測跑在
+**同一個行程**（`as_terminal_max.py:1265` 的 daemon thread，TUI 主執行緒同時提供
+「執行回測 / 參數優化」選單）。
+
+⇒ 使用者一邊實盤一邊點回測時：`quote_at` 是牆鐘蓋的、`now()` 回歷史 epoch ⇒
+`quote_age` 是巨大負數 ⇒ `age < 0` 那支條件對**每個 symbol、每個 tick** 觸發 ⇒
+**全面停止下單，連成交後的止盈補單都停**（`_handle_order_update` → `adjust_grid`
+同樣經過 gate），而持倉繼續累積；唯一訊號是每 symbol 每小時一筆 throttled warning。
+本守衛上線前，同樣的時鐘替換只讓 ATR/funding 計時器軟偏移，**不會停止下單**。
+
+**修訂後的規則**：守衛量的是「訊息**實際抵達本機的牆鐘時間**」，`now()` 量的是
+「情境時間」。這是兩個**不同的物理量**，原設計把它們混為一談是分類錯誤；分開不是
+繞路，是修正分類。`clock.py` 因此增設**不被 backtester 替換**的
+`guard_now()` / `set_guard_clock()` / `reset_guard_clock()`（後兩者僅供測試注入）。
+`now()` / `set_clock()` / `reset_clock()` 的語意與既有呼叫端**一律不動**
+（`reporting.py` / `enhancements.py` / `sync_service.py` / watchdog 保持現狀，
+呼應 §2 non-goal「不改 watchdog 的牆鐘」）。
+
+守衛的**三處**必須一致用 `guard_now()`，否則就是另一種混用：
+1. `_handle_ticker` 的 `quote_at` 蓋章；
+2. gate 的 `quote_age` 比較；
+3. `_note_stale_quote` 的節流計時。
+
+牆鐘（而非 monotonic）的取捨不變：
 牆鐘風險已被 gate 的形狀吸收，這是明列的已知取捨：
 
 - 時鐘往後跳 → `age` 變大 → 擋單（**安全側**）。
@@ -87,7 +114,7 @@ state.quote_at = clock.now()
 放在 `_grid_step` 頂端，**緊接現有的 `price <= 0: return` 之後**（同一形狀）：
 
 ```python
-age = clock.now() - sym_state.quote_at
+age = clock.guard_now() - sym_state.quote_at
 if sym_state.quote_at <= 0 or age < 0 or age > self.config.max_price_age_sec:
     self._note_stale_quote(ccxt_symbol, age)
     return
@@ -169,8 +196,44 @@ repo 裡沒有任何地方記錄 ticker 抵達時間 ⇒ **門檻無法從現有
 - 守衛的唯一副作用是「**不下單**」與「寫 log / 計數」。**不得**具備撤單、改倉、
   發 REST 請求的能力。
 - 守衛不得改變 `best_bid` / `best_ask` / `latest_price` 的值——只讀不寫。
-- `max_price_age_sec = 0`（關閉）必須讓行為**完全回到改動前**，作為生產上的緊急逃生門。
 - 守衛不得影響止盈單路徑與 `sync_service` 的 REST 同步。
+- 守衛的時鐘不得與可被回測替換的 `clock.now()` 共用（見 §4.2）。
+
+#### `max_price_age_sec = 0` 的準確語意（2026-08-25 修訂，verifier Finding 4）
+
+原文寫「必須讓行為**完全回到改動前**」。嚴格說**不成立**，§5 這句與 §4.3.1 互相打架。
+準確描述是：
+
+> **關閉守衛 = 不再擋單；風控上移與 `quote_age` 量測仍然生效，兩者皆不消費快照價格。**
+
+具體而言，即使 `max_price_age_sec = 0`：
+
+- (a) `check_and_reduce_positions` 已被**無條件**移到 DGT/bandit 之前（§4.3.1），
+  不隨開關回位。語意中性已實查：它只讀 `long_position`/`short_position`/
+  `position_threshold`（= `initial_quantity * threshold_multiplier`），而 DGT 只動
+  邊界、bandit 只寫 `grid_spacing`/`take_profit_spacing`/`gamma`，都不碰那兩個值；
+  且移動後仍在 `order_blocked = is_blocked(...)` 之前，相對順序不變。
+- (b) `quote_age` 仍會計算並寫進 decision log（§4.6 刻意如此：最想觀察門檻是否
+  合理的時候，正是守衛被關掉的時候）。
+
+兩者都**不消費快照價格**，所以逃生門仍然守得住它真正該守的東西：不會有任何一張
+單因為守衛而被擋。
+
+**逃生門目前沒有 UI 入口**（2026-08-25 實查：`max_price_age_sec` 在
+`as_terminal_max.py` 與 `web/` 全 repo 皆無編輯入口）。實務上要動它必須手改
+`config/*.json` 並重啟引擎。不要以為有按鈕可按。新增 UI 入口列入 backlog，
+不在本輪範圍。
+
+#### 「無此行」不是健康訊號（2026-08-25 補，verifier Finding 5）
+
+**每日摘要看到『無此行』不等於『價格是新鮮的』——偵測 feed 整條斷掉是 watchdog
+的職責，不是本守衛的。**
+
+推導：守衛只在 `adjust_grid` 被呼叫時才判定，而 `adjust_grid` 的兩個入口是
+bookTicker 與 userData。bookTicker **全斷**時根本沒人呼叫 `_grid_step` ⇒ 計數
+不會動；而 userData 自 2026-07-12 死著 ⇒ 第二條路也不觸發。⇒ 最嚴重的形態
+（feed 整條斷）恰恰是這個計數**看不見**的形態。摘要那一行量的是「有人來敲門、
+但手上的價格太舊」，不是「價格新鮮」。
 
 ## 6. `backtest/tick_sim.py`
 
