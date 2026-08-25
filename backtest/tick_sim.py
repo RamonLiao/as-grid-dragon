@@ -195,6 +195,11 @@ def run_tick_sim(events: pd.DataFrame, cfg: TickSimConfig) -> TickSimResult:
             fund_i += 1
 
         # ---- (d) 決策 gate（鏡射 live _handle_ticker→adjust_grid→_grid_step）----
+        # 註：live 端的 _grid_step 另有「價格時效守衛」（快照年齡 > config
+        # max_price_age_sec 就跳過本次調整），本模擬是逐 tick 餵資料、年齡恆為 0
+        # ⇒ 該 gate 在回測中恆通過，故此處不需鏡射。做 live/backtest fidelity
+        # 比對時，這是一個已知且刻意的差異，不是 bug。
+        # 設計出處：docs/superpowers/specs/2026-08-24-price-staleness-guard-design.md §6
         long_pos = book.qty("long")
         short_pos = book.qty("short")
         gates = {}

@@ -1,6 +1,126 @@
 # Progress
 
-## Current Task（2026-08-24 12:10 更新）
+## Current Task（2026-08-25 更新）：價格時效守衛 8 tasks 全數完成（worktree branch，**尚未 merge、尚未重啟**）
+
+### 🟡 狀態：branch 完成，commit 完成 ≠ 生產生效
+
+- Work 在 git worktree `as-grid-dragon-staleness`，branch `feat/price-staleness-guard`
+  （base `12cdb89`）。**主目錄 `../as-grid-dragon` 全程未動**，生產引擎跑的仍是
+  merge 前的舊碼——這份改動**還沒 merge 進 main，也還沒讓引擎重啟過**，
+  不生效。下次開工的第一件事是決定 merge 時機與重啟排程，不是預設它已上線。
+- branch 上 **10 個 commits**（`12cdb89..8cbd74e`），diff vs main：**11 檔、692 增、9 刪**。
+- 最終全套：**743 passed / 2 skipped**。worktree 基線 **713 passed / 2 skipped**
+  ⇒ 淨增 **30 個測試**。
+  - ⚠️ 計畫文件寫的基線是「主工作目錄」的 714 passed / 1 skipped，**不是這個 worktree
+    的數字**——worktree 沒有 gitignore 的 `config/`，`tests/web/test_config_store.py:117`
+    多一個 skip（`no real config`），另有一個既有 pass 因此少掉。本報告一律以
+    worktree 713/2 為基準，避免日後對不上。
+  - Task 7 本身（本次）只加註解，跑完仍是 743 passed / 2 skipped，未變動。
+
+### 這 8 個 task 做了什麼
+
+1. **T1**（`02c7d9f`）：`SymbolState` 加 `quote_at` 時戳欄位，`_handle_ticker` 與
+   bid/ask 同一個 block 蓋章。
+2. **T2**（`85a2ffa`）：`GlobalConfig.max_price_age_sec`，`0` 是關閉守衛的逃生門。
+3. **T3**（`85a2ffa..eab6ee3`，含 fix round）：`_grid_step` 加時效 gate + 節流告警
+   `_note_stale_quote`。**這一步發現了整份設計最重要的一個錯誤，見下方「設計錯誤」**。
+4. **T4**（`68af178..6da4d9f`）：既有測試補 `quote_at` 蓋章（gate 上線的連帶紅修正，
+   `git diff -- grid_engine/` 全程為空，只動測試）。
+5. **T5**（`6da4d9f..caeec78`）：每日摘要帶「價格快照過期」計數（0 次不出這行）。
+6. **T6**（`caeec78..8cbd74e`）：decision log 加 `quote_age` 欄位，讓 5 秒門檻
+   日後能用實測收緊（見下方「待辦」）。
+7. **T7**（本次）：`backtest/tick_sim.py` 加註解說明「回測逐 tick 餵資料，快照年齡
+   恆為 0，gate 恆通過，是刻意差異不是 bug」；本完成報告。**只加註解，不改邏輯**——
+   `git diff --stat -- backtest/tick_sim.py` = `1 file changed, 5 insertions(+)`，
+   無刪除、無其他檔案。
+8. **T8**：尚未執行（本次任務只到 T7；merge/收尾流程留給下一步）。
+
+### 🔴 設計錯誤（實作期間發現，已修，已修訂 spec 留痕）
+
+T3 review（opus）發現：原設計檢查「gate 之後還有什麼吃 price」時，只找到 DGT 與
+bandit 兩個消費端，**漏了 `risk_monitor.check_and_reduce_positions`**。
+實查 `risk_monitor.py:66-107`：這個函式**完全不消費價格**——判斷只用兩個持倉量與
+`position_threshold`，下的是 price 參數字面為 `0` 的市價單。把它關在守衛後面，
+等於在「ticker 斷線、userData 仍活著、掛單持續成交、雙邊持倉往上爬」這個
+**最需要風控的情境**下關掉風控（60 秒冷卻的減倉整個斷線期間不觸發）。
+
+**已修**：`check_and_reduce_positions` 上移到 gate 之前（commit `eab6ee3`）。
+**已修訂 spec** `docs/superpowers/specs/2026-08-24-price-staleness-guard-design.md`
+§4.3.1 留痕。
+
+**通則（下次判斷同類問題時直接用，不要重新推導）**：
+判斷某一格該不該被時效 gate 擋住，準則是**它消不消費 `price`**，
+不是它在 `_grid_step` 裡的**位置**。不消費價格的副作用（例如市價風控平倉）
+必須留在 gate 之前，就算它目前寫在 gate 之後的程式碼區塊裡。
+
+### ⚠️ 觸發面校準（照抄 spec，不得美化）
+
+> 生產上 userData stream 自 2026-07-12 起是死的 ⇒ `_handle_order_update` 那條路徑
+> 目前幾乎不觸發。本守衛守的是兩種形態：(1) userData 復活之後；
+> (2) bookTicker 單邊卡住但 userData 活著。**log 裡沒有這兩種形態的實證**，
+> 優先度排序是推測性的。
+
+**這份改動不得被描述成「修掉了一個已觀測到的生產事故」**——它防的是還沒被
+log 證實發生過的兩種形態，是預防性工程，不是事後修復。
+
+### 待辦：5 秒門檻的收緊
+
+`max_price_age_sec` 預設 5 秒是猜測值。T6 已讓每筆 decision log 的紀錄帶
+`quote_age`（實測值，秒）。做法：**至少累積一週真實分佈**後，用實測數字判斷
+5 秒是過寬還是過窄，再調整 config（不要憑感覺改）。
+
+### Review 戰績（各輪 findings 計數）
+
+| Task | Reviewer | Verdict | Critical | Important | Minor |
+|---|---|---|---|---|---|
+| T1 | sonnet | Approved | 0 | 0 | 2（deferred） |
+| T2 | sonnet | Approved | 0 | 0 | 1（deferred，行為正確，非缺陷） |
+| T3 | opus | Approved（fix round 1 後） | 0 | 2（已修） | 3（2 併入本輪修、1 deferred） |
+| T4 | sonnet | Approved（fix round 1 後） | 0 | 1（已修） | 0 |
+| T5 | sonnet | Needs fixes → Approved（fix round 1 後） | 0 | 1（已修，見下方假綠） | 1（deferred） |
+| T6 | sonnet | Approved | 0 | 0 | 1（deferred） |
+
+### Deferred minors（待 triage，共 5 條，尚未修）
+
+1. T1：`test_price_staleness_guard.py` module docstring 承載整體設計論述，對單檔略顯外溢。
+2. T1：只有單次 ticker 的案例，缺「第二次 ticker 覆蓋 `quote_at`」的測試。
+3. T3：`_last_stale_log_at` 在 symbol 恢復後未清除 ⇒ 恢復後 20 分鐘內再次過期不會
+   log（1 小時節流窗口內），只有計數會動。每日摘要是這個情境唯一看得到的表面。
+4. T5：`_get_stale_quote_summary` 算出並傳遞 `symbols` 明細，但
+   `_format_stale_quote_line` 目前只讀 `total` ⇒ `symbols` 是未使用資料
+   （符合 brief 指定的介面形狀，非偏離）。
+5. T6：`_log_decision` docstring 帶了設計論述（「5 秒門檻是猜測值…」），
+   對一個機械式 I/O helper 略顯外溢；無害，符合該檔既有習慣。
+
+### 實作期間發現：計畫本身寫錯的測試（假綠 / 空斷言）
+
+至少兩處是**計畫文件自己寫錯**，不是實作者手滑，細節見 `tasks/notes.md`
+2026-08-25 條：
+1. **T3**：計畫給的測試 helper `_seed_fresh_quote` 會經過真的
+   `_handle_ticker`→`adjust_grid`，播種時就已下單並污染 `last_order_times`；
+   而下單冷卻用的是真牆鐘，`fake_clock` 推不動它 ⇒ 一個測試假紅、一個測試
+   會**因為冷卻而不是因為守衛**通過（假綠，mutation 殺不掉）。
+2. **T5**：計畫寫的斷言是 `assert isinstance(line, str)`——回傳告警行或空字串
+   都會通過，測不出「有過期不能不出現字」這個 spec 要求的訊號。
+
+兩者的抓法不同：#1 是 controller 在 pre-flight scan 階段人工追值域邏輯抓到，
+先於任何實作/review；#2 是外部 task reviewer（sonnet）在 review 階段抓到，
+implementer 當下是照計畫轉錄程式碼、沒有自己發現。
+
+### Mutation 實跑摘要（各 task 報告有完整清單，這裡只列代表性的）
+
+- T3：opus reviewer 把 gate 整段刪掉重跑 → 18 個測試中 6 個轉紅，且每個都是
+  「真的下了單」（如 `assert 2 == 0`）而非被冷卻擋下 ⇒ 確認無假綠。
+- T3 fix round：`test_stale_quote_still_runs_risk_reduction` 先紅
+  （把 risk_monitor 呼叫搬回 gate 下游 → `assert 0 == 1`）。
+- T5 fix round：把 `_format_stale_quote_line` 的 except 分支改成 `return ""`
+  （spec 明文禁止的行為）→ 新斷言轉紅：`AssertionError: assert '價格快照過期' in ''`。
+- T6：`if max_age > 0:` 外層守衛拿掉、`quote_age` hoist 出 `if` 後的「守衛關閉
+  仍記錄」測試 → `assert 0.0 == 999.0`（999.0 是實測值，非注入常數）。
+
+---
+
+## 先前狀態（2026-08-24 12:10）
 
 ### 🟢 狀態：本次任務全部完成並已推送；**生產引擎已跑新碼**
 

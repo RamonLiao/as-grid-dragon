@@ -1,5 +1,75 @@
 # Notes
 
+## 2026-08-25 價格時效守衛：三條值得留給未來的結論
+
+（branch `feat/price-staleness-guard`，worktree `as-grid-dragon-staleness`，
+尚未 merge、尚未重啟——狀態細節見 `tasks/progress.md`「Current Task」。）
+
+### 1. 判斷「該不該被 gate 擋」的準則：消不消費 price，不是它寫在哪個位置
+
+T3 review（opus）發現原設計漏掉 `risk_monitor.check_and_reduce_positions`——
+它被放在 `_grid_step` 裡 gate 之後的區塊，直覺上「看起來」該一起被擋，但它完全
+不讀 `best_bid` / `best_ask`，下的是市價單（price 參數字面 `0`）。關在守衛後面的
+實際後果：在「ticker 斷線、userData 仍活著、掛單持續成交、雙邊持倉往上爬」這個
+**最需要風控的情境**下，60 秒冷卻的緊急減倉整個斷線期間不會觸發——守衛反而
+關掉了風控。
+
+**為什麼會漏**：計畫作者當時是用「這段程式碼物理上在 `_grid_step` 的哪個位置」
+來判斷該不該包進 `if age <= max_age:`，而不是回頭問「它到底有沒有用到那個
+可能過期的價格」。這是一個容易重演的思考捷徑——「靠近下單邏輯的東西都該被
+擋」聽起來合理，但守衛的契約是保護「用不可信的價格做決策」，不是保護
+「所有跟下單同一個函式裡的東西」。
+
+**下次判斷同類問題直接用這條**：先問「這段程式碼讀了 `price` 嗎？」，
+答案是否定的話就不該被 gate 擋，就算它物理上寫在 gate 區塊裡面。
+已寫死進 spec §4.3.1，避免下次又要重新推導一次。
+
+### 2. 5 秒門檻是猜測值，靠 decision log 的 `quote_age` 一週後收緊——來龍去脈
+
+spec 一開始就承認 `max_price_age_sec` 預設 5 秒沒有實測依據（`logs/decisions.jsonl`
+在守衛上線前完全不知道「快照有多舊」這件事，因為 `SymbolState` 原本沒有時間欄位）。
+T6 的動機不是「順手加個欄位」，是這條門檻**目前唯一的驗證手段就是等真實流量跑過**：
+T6 把 `quote_age`（實測秒數）從 gate 判斷邏輯裡 hoist 出來、無論守衛開關與否都寫進
+`_log_decision`，讓正常運作時「快照通常有多舊」有真實分佈可查。
+**下一步的具體動作**：branch merge 且引擎重啟跑滿一週後，讀
+`logs/decisions.jsonl` 的 `quote_age` 分佈，用實測數字判斷 5 秒是過寬還是過窄，
+再調整 `max_price_age_sec`——不要憑感覺調，這正是這條欄位存在的理由。
+
+### 3. 實作期間發現：計畫自己寫的兩個測試是假綠/空斷言，且都只有外部 review 抓到
+
+**#1（T3）**：計畫給的測試 helper `_seed_fresh_quote` 直接呼叫真的
+`_handle_ticker`，而 `_handle_ticker` 尾端會呼叫 `adjust_grid` ⇒ 播種階段就已經
+下過單、寫入 `bot.last_order_times`。開倉路徑的 10 秒冷卻與 `_grid_cooldown_passed`
+用的都是**真實牆鐘 `time.time()`**，測試裡的 `fake_clock` 完全推不動它。連鎖後果：
+`test_fresh_quote_places_orders` 因冷卻未過而 `await_count == 0`，斷言 `> 0`
+直接失敗（假紅）；`test_stale_quote_places_no_orders` 則是**因為冷卻、不是因為
+守衛**而通過（假綠，mutation 也殺不掉）。第一版藥方（只在
+`_prime_for_ordering` 加 `bot.last_order_times.clear()`）也不夠——計畫的呼叫順序是
+`_prime_for_ordering()` → `_seed_fresh_quote()` → `adjust_grid()`，清除發生在
+播種**之前**，播種又會把 dict 重新填滿。正確修法是兩處一起改：
+`_seed_fresh_quote` 播種期間用 `try/finally` mock 掉 `bot.adjust_grid`
+（`quote_at` 在 `adjust_grid` 被 await **之前**就蓋好，mock 不影響蓋章），
+`_prime_for_ordering` 仍保留清空 `last_order_times`（處理同一測試內呼叫兩次
+`adjust_grid` 的案例）。
+
+**#2（T5）**：計畫寫的斷言是 `assert isinstance(line, str)`——回傳一行真的告警文字
+或回傳空字串都會通過型別檢查，測不出 spec 要求的訊號（「型別錯可以不帶數字，
+但『有過期』這件事不能沒有訊號」）。日後如果有人把 except 分支改成
+`return ""`（spec 明文禁止的行為），這個測試會照樣綠燈，且原本跑的三條 mutation
+都殺不到這個缺口。修法：改成釘住訊號內容本身
+（`assert "價格快照過期" in line` + `assert line != ""`），並補一條新 mutation
+（把 except 分支改成 `return ""`）證明新斷言真的有牙齒——實跑轉紅：
+`AssertionError: assert '價格快照過期' in ''`。
+
+**為什麼只有外部 review 抓得到**：#1 是 controller 在派工前的 pre-flight scan
+階段，人工追值域邏輯（冷卻用的是哪個時鐘、fake_clock 蓋不蓋得到）才抓到的，
+發生在任何 implementer 動手之前。#2 是外部 task reviewer（sonnet）在 review
+階段抓到的——implementer 當下是照計畫文本原樣轉錄程式碼，沒有自己發現斷言太弱。
+兩者共通點：**implementer 自己不會抓到，因為它是照著計畫（一份帶著錯誤前提的
+文件）在做事**，測試看起來「符合計畫描述」就會被判定完成。這正是 dev-rules
+講的「內部 reviewer 會繼承作者框架含錯誤前提，外部 reviewer 只看 code 實際
+做什麼」——這裡的「作者」指計畫本身，不是 implementer。
+
 ## 2026-08-24 TUI 孤兒 bot：`self.bot = None` 是放棄控制權，不是重置 UI 狀態
 
 **起點**：查 08-14 那個「行程沒重啟卻跑策略初始化」的形態時撞到的（形態本身無害，見上一條）。
