@@ -198,6 +198,7 @@ class TelegramNotifier:
         pos_text = "\n".join(pos_lines) or "  (無持倉)"
 
         watchdog_line = self._format_watchdog_line(pnl_data.get("watchdog"))
+        stale_line = self._format_stale_quote_line(pnl_data.get("stale_quotes"))
 
         msg = (
             f"{icon} <b>每日損益摘要</b>\n"
@@ -208,6 +209,7 @@ class TelegramNotifier:
             f"累計已實現: {total_profit:+.2f}\n"
             f"運行: {running_hours:.1f} 小時\n"
             f"{watchdog_line}"
+            f"{stale_line}"
             f"\n<b>持倉概況:</b>\n{pos_text}"
         )
         await self.send(msg)
@@ -244,6 +246,29 @@ class TelegramNotifier:
         if state == "healthy":
             return "✅ userData 監控：正常\n"
         return ""
+
+    @staticmethod
+    def _format_stale_quote_line(stale) -> str:
+        """價格快照過期計數那一行。
+
+        安全要求同 _format_watchdog_line：文案是這裡自己定義的常數，不把外部
+        資料未跳脫插進 HTML 訊息（parse_mode=HTML）。計數為 0 或格式不符時
+        整行省略——正常狀態不加噪音。
+
+        為什麼這行必須存在：_last_stale_log_at（Task 3）不會在 symbol 恢復
+        正常後被清除，1 小時節流窗口內第二次過期不會產生新 log，只有這個
+        計數會動——每日摘要是那個情境唯一的可見表面。
+        """
+        if not isinstance(stale, dict):
+            return ""
+        try:
+            total = int(stale.get("total", 0))
+        except Exception:
+            # 型別錯不得讓整封摘要發不出去，但「有過期」這個訊號不能掉
+            return "⚠️ <b>價格快照過期</b>：計數異常，請查 log\n"
+        if total <= 0:
+            return ""
+        return f"⚠️ <b>價格快照過期</b>：今日 {total} 次跳過網格調整\n"
 
     async def notify_risk_alert(self, alert: str):
         """風控警報"""

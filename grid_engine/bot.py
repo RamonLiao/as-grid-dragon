@@ -107,6 +107,7 @@ class MaxGridBot:
         self.reporter = DailyReporter(
             config=self.config, state=self.state,
             notifier=self.notifier, stop_event=self._stop_event,
+            stale_quote_source=self,
         )
         # REST 同步組件（建構順序硬約束：需要 RiskMonitor 實例）
         self.sync_service = SyncService(

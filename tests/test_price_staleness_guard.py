@@ -355,3 +355,120 @@ async def test_stale_log_message_distinguishes_scenario(bot, fake_clock, caplog)
 
     # 三種文案彼此不同
     assert len({never_msg, rewind_msg, expired_msg}) == 3
+
+
+from grid_engine.notifier import TelegramNotifier
+from grid_engine.reporting import DailyReporter
+
+
+def test_stale_quote_line_omitted_when_zero():
+    """計數為 0 不出這一行——正常狀態不加噪音。"""
+    assert TelegramNotifier._format_stale_quote_line({"total": 0, "symbols": {}}) == ""
+    assert TelegramNotifier._format_stale_quote_line(None) == ""
+    assert TelegramNotifier._format_stale_quote_line("not a dict") == ""
+
+
+def test_stale_quote_line_present_when_nonzero():
+    line = TelegramNotifier._format_stale_quote_line(
+        {"total": 42, "symbols": {"XRP/USDC:USDC": 42}})
+    assert "價格快照過期" in line
+    assert "42" in line
+    assert line.endswith("\n")
+
+
+def test_stale_quote_line_survives_garbage_counts():
+    """型別錯不得讓整封摘要發不出去——降級成不帶數字，訊號本身不能掉。"""
+    line = TelegramNotifier._format_stale_quote_line({"total": "abc", "symbols": None})
+    assert isinstance(line, str)
+
+
+def test_reporter_collects_stale_counts():
+    class _Src:
+        stale_quote_counts = {"XRP/USDC:USDC": 3, "BNB/USDC:USDC": 4}
+
+    import asyncio as _a
+    r = DailyReporter(GlobalConfig(), None, None, _a.Event(), stale_quote_source=_Src())
+    assert r._get_stale_quote_summary() == {
+        "total": 7, "symbols": {"XRP/USDC:USDC": 3, "BNB/USDC:USDC": 4}}
+
+
+def test_reporter_stale_counts_failure_is_swallowed():
+    """取不到就不顯示那行，絕不能讓每日摘要發不出去（沿用 watchdog 那行的硬性要求）。"""
+    class _Boom:
+        @property
+        def stale_quote_counts(self):
+            raise RuntimeError("boom")
+
+    import asyncio as _a
+    r = DailyReporter(GlobalConfig(), None, None, _a.Event(), stale_quote_source=_Boom())
+    assert r._get_stale_quote_summary() is None
+
+
+class TestStaleQuoteReachesTelegram:
+    """紅在：reporting.py 的 pnl_data 少帶 "stale_quotes" 這個 key（接線斷掉）。"""
+
+    @staticmethod
+    async def _run_once(stale_source, notifier):
+        import asyncio as _a
+        import types
+        from unittest.mock import AsyncMock, patch
+
+        stop_event = _a.Event()
+        config = types.SimpleNamespace(telegram_daily_pnl_hour=20)
+        sym_state = types.SimpleNamespace(long_position=0.5, short_position=0.0,
+                                          unrealized_pnl=1.5)
+        state = types.SimpleNamespace(
+            symbols={"BNB/USDC:USDC": sym_state},
+            start_time=None,
+            total_unrealized_pnl=1.5,
+            total_equity=94.49,
+            margin_usage=0.193,
+            total_profit=12.3,
+        )
+        reporter = DailyReporter(config=config, state=state, notifier=notifier,
+                                 stop_event=stop_event,
+                                 stale_quote_source=stale_source)
+
+        calls = {"n": 0}
+
+        async def fake_sleep(_seconds):
+            calls["n"] += 1
+            if calls["n"] >= 2:      # 第一輪送出摘要後才收工
+                stop_event.set()
+
+        with patch("grid_engine.reporting.asyncio.sleep",
+                   AsyncMock(side_effect=fake_sleep)):
+            await _a.wait_for(reporter.run(), timeout=5)
+
+    def test_stale_count_reaches_the_telegram_message(self):
+        import asyncio as _a
+        from unittest.mock import AsyncMock
+
+        class _Src:
+            stale_quote_counts = {"BNB/USDC:USDC": 17}
+
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        _a.run(self._run_once(_Src(), notifier))
+
+        notifier.send.assert_called_once()
+        msg = notifier.send.call_args[0][0]
+        assert "價格快照過期" in msg
+        assert "17" in msg
+        assert "94.49" in msg          # 既有欄位不得因新增那行而掉
+
+    def test_zero_stale_count_leaves_summary_clean(self):
+        """0 次時整封摘要不得出現那一行——正常狀態不加噪音。"""
+        import asyncio as _a
+        from unittest.mock import AsyncMock
+
+        class _Src:
+            stale_quote_counts = {}
+
+        notifier = TelegramNotifier(bot_token="123:ABC", chat_id="456")
+        notifier.send = AsyncMock(return_value=True)
+        _a.run(self._run_once(_Src(), notifier))
+
+        msg = notifier.send.call_args[0][0]
+        assert "每日損益摘要" in msg
+        assert "價格快照過期" not in msg

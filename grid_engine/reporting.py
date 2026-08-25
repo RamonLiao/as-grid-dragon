@@ -9,12 +9,14 @@ _WATCHDOG_VALID_STATES = ("healthy", "degraded", "given_up")
 
 
 class DailyReporter:
-    def __init__(self, config, state, notifier, stop_event: asyncio.Event, watchdog=None):
+    def __init__(self, config, state, notifier, stop_event: asyncio.Event, watchdog=None,
+                 stale_quote_source=None):
         self.config = config
         self.state = state
         self.notifier = notifier
         self._stop_event = stop_event
         self.watchdog = watchdog
+        self.stale_quote_source = stale_quote_source
 
     def _get_watchdog_status(self):
         """讀取 watchdog 狀態供每日摘要顯示。
@@ -38,6 +40,27 @@ class DailyReporter:
             }
         except Exception as e:
             logger.warning(f"[reporter] watchdog 狀態讀取失敗，摘要跳過該行: {e}")
+            return None
+
+    def _get_stale_quote_summary(self):
+        """讀取價格快照過期計數供每日摘要顯示。
+
+        硬性要求同 _get_watchdog_status：任何例外都在這裡吞掉降級成「不顯示該行」
+        （回傳 None），不得往外冒泡把整封摘要弄掉。只讀，不重置計數。
+
+        為什麼這行必須存在：_last_stale_log_at（Task 3）只在 1 小時節流窗口內
+        壓抑重複 log，且不會在 symbol 恢復正常後被清除——「過期 → 恢復 →
+        再過期」的第二段在窗口內不會產生新 log，只有計數會動。每日摘要是
+        那個情境唯一的可見表面。
+        """
+        if self.stale_quote_source is None:
+            return None
+        try:
+            counts = dict(self.stale_quote_source.stale_quote_counts)
+            total = sum(int(v) for v in counts.values())
+            return {"total": total, "symbols": counts}
+        except Exception as e:
+            logger.warning(f"[reporter] 價格過期計數讀取失敗，摘要跳過該行: {e}")
             return None
 
     def _collect_positions(self) -> dict:
@@ -97,6 +120,7 @@ class DailyReporter:
                     "positions": positions,
                     "running_hours": running_hours,
                     "watchdog": self._get_watchdog_status(),
+                    "stale_quotes": self._get_stale_quote_summary(),
                 }
                 await self.notifier.notify_daily_pnl(pnl_data)
             except asyncio.CancelledError:
