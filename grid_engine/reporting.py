@@ -52,16 +52,31 @@ class DailyReporter:
         壓抑重複 log，且不會在 symbol 恢復正常後被清除——「過期 → 恢復 →
         再過期」的第二段在窗口內不會產生新 log，只有計數會動。每日摘要是
         那個情境唯一的可見表面。
+
+        同時帶出 last_stale_seconds_ago：counts 只會累計、永不重置，長時間
+        運行的引擎一旦發生過一次過期，這個數字就永久存在且凍結，操作者無法
+        再用「這行出現」當事件訊號。加這個欄位讓摘要能顯示「最近一次 X 小時
+        前」，把「今天有事」跟「上個月出過事」分開——讀 _last_stale_at
+        （guard_now() 時戳，與 stale_quote_counts 同來源、同 symbol 集合），
+        失敗一樣降級成不帶這個欄位，不得讓整行、更不得讓整封摘要消失。
         """
         if self.stale_quote_source is None:
             return None
         try:
             counts = dict(self.stale_quote_source.stale_quote_counts)
             total = sum(int(v) for v in counts.values())
-            return {"total": total, "symbols": counts}
+            summary = {"total": total, "symbols": counts, "last_stale_seconds_ago": None}
         except Exception as e:
             logger.warning(f"[reporter] 價格過期計數讀取失敗，摘要跳過該行: {e}")
             return None
+        try:
+            last_at_map = dict(getattr(self.stale_quote_source, "_last_stale_at", {}) or {})
+            if last_at_map:
+                most_recent = max(last_at_map.values())
+                summary["last_stale_seconds_ago"] = max(0.0, clock.guard_now() - most_recent)
+        except Exception as e:
+            logger.warning(f"[reporter] 價格過期最近時戳讀取失敗，摘要略過該欄位: {e}")
+        return summary
 
     def _collect_positions(self) -> dict:
         """組持倉快照。單一標的的狀態壞掉（屬性缺失、數值型別錯）只能讓那一個

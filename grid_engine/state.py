@@ -15,7 +15,8 @@ class SymbolState:
     latest_price: float = 0
     best_bid: float = 0
     best_ask: float = 0
-    # 最近一次 bookTicker 抵達的本機時戳（clock.now()，epoch 秒）。
+    # 最近一次 bookTicker 抵達的本機時戳（clock.guard_now()，epoch 秒；
+    # 刻意不是 now()，見 clock.guard_now() docstring）。
     # 0 = 從未收過報價。下單前的時效判定讀這個欄位，見 bot._grid_step。
     quote_at: float = 0
     long_position: float = 0

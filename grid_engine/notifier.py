@@ -268,6 +268,12 @@ class TelegramNotifier:
         為什麼這行必須存在：_last_stale_log_at（Task 3）不會在 symbol 恢復
         正常後被清除，1 小時節流窗口內第二次過期不會產生新 log，只有這個
         計數會動——每日摘要是那個情境唯一的可見表面。
+
+        「最近一次 X 前」補的是計數本身補不了的洞：累計數字只會長不會降，
+        長時間運行的引擎出過一次事後這行就永久存在、數字凍結，操作者無法
+        再用「這行出現」當事件訊號。時戳讓「今天有事」跟「上個月出過事」
+        分得開。缺這個欄位（型別錯、None、舊呼叫端未帶）就整段省略，只降級
+        不報錯——不能因為這個附加資訊讓「有過期」這個主訊號本身變得更脆弱。
         """
         if not isinstance(stale, dict):
             return ""
@@ -278,7 +284,18 @@ class TelegramNotifier:
             return "⚠️ <b>價格快照過期</b>：計數異常，請查 log\n"
         if total <= 0:
             return ""
-        return f"⚠️ <b>價格快照過期</b>：累計 {total} 次跳過網格調整（自啟動）\n"
+        last_part = ""
+        try:
+            last_seconds = stale.get("last_stale_seconds_ago")
+            if last_seconds is not None:
+                last_seconds = float(last_seconds)
+                if last_seconds < 3600:
+                    last_part = f"，最近一次 {last_seconds / 60:.0f} 分鐘前"
+                else:
+                    last_part = f"，最近一次 {last_seconds / 3600:.1f} 小時前"
+        except Exception:
+            last_part = ""  # 附加資訊，讀不到就不帶，不影響主訊號
+        return f"⚠️ <b>價格快照過期</b>：累計 {total} 次跳過網格調整（自啟動）{last_part}\n"
 
     async def notify_risk_alert(self, alert: str):
         """風控警報"""

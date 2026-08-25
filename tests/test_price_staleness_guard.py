@@ -305,6 +305,31 @@ async def test_stale_events_are_counted_and_log_is_throttled(bot, fake_clock, ca
 
 
 @pytest.mark.asyncio
+async def test_last_stale_at_updates_on_every_stale_event_not_just_logged_ones(bot, fake_clock):
+    """_last_stale_at 要與計數並列、每次過期都動，不能被 log 節流閘住。
+
+    這裡在同一個節流窗口內連續兩次過期（第二次不會產生新 log，見
+    test_stale_events_are_counted_and_log_is_throttled），驗證時戳仍然跟著
+    guard_now() 前進到第二次那一刻——不是停在第一次、也不是完全沒被寫入。
+    若把寫入點誤搬進 `if now - last >= STALE_QUOTE_LOG_SECONDS:` 節流分支內，
+    這條會紅：時戳會凍結在第一次事件、量不出「第二次過期」，這行測試存在的
+    意義就落空了。
+    """
+    bot.config.max_price_age_sec = 5.0
+    _prime_for_ordering(bot)
+    await _seed_fresh_quote(bot)
+    fake_clock(600.0)
+    await bot.adjust_grid(SYMBOL)
+    first_ts = bot._last_stale_at[SYMBOL]
+
+    fake_clock(10.0)  # 遠小於 STALE_QUOTE_LOG_SECONDS，第二次不會產生新 log
+    await bot.adjust_grid(SYMBOL)
+    second_ts = bot._last_stale_at[SYMBOL]
+
+    assert second_ts == pytest.approx(first_ts + 10.0)
+
+
+@pytest.mark.asyncio
 async def test_stale_quote_still_runs_risk_reduction(bot, fake_clock):
     """守衛的契約是「不要用不可信的價格下單」，不是「價格過期就全面停擺」。
 
@@ -472,6 +497,44 @@ def test_stale_quote_line_survives_garbage_counts():
     assert line != ""
 
 
+def test_stale_quote_line_shows_hours_since_last_event():
+    """有 last_stale_seconds_ago 時要帶出「最近一次 X 小時前」，這是操作者用來
+    分辨「今天有事」與「上個月出過事」的唯一線索——只有累計數字做不到。
+    """
+    line = TelegramNotifier._format_stale_quote_line(
+        {"total": 42, "symbols": {}, "last_stale_seconds_ago": 7200.0})
+    assert "最近一次" in line
+    assert "2.0 小時前" in line
+
+
+def test_stale_quote_line_shows_minutes_for_recent_event():
+    """一小時內的事件用分鐘顯示，不要印「0.1 小時前」這種不直覺的數字。"""
+    line = TelegramNotifier._format_stale_quote_line(
+        {"total": 42, "symbols": {}, "last_stale_seconds_ago": 300.0})
+    assert "最近一次" in line
+    assert "分鐘前" in line
+    assert "小時前" not in line
+
+
+def test_stale_quote_line_omits_last_seen_when_missing():
+    """last_stale_seconds_ago 缺席（None／舊呼叫端未帶）時，這行仍要正常出現，
+    只是不帶「最近一次」——不能因為附加資訊缺席就讓主訊號整行消失或報錯。
+    """
+    line = TelegramNotifier._format_stale_quote_line({"total": 42, "symbols": {}})
+    assert "價格快照過期" in line
+    assert "42" in line
+    assert "最近一次" not in line
+
+
+def test_stale_quote_line_survives_garbage_last_seen():
+    """last_stale_seconds_ago 型別錯（例如字串）不得讓整行掛掉，只降級成不帶它。"""
+    line = TelegramNotifier._format_stale_quote_line(
+        {"total": 42, "symbols": {}, "last_stale_seconds_ago": "abc"})
+    assert "價格快照過期" in line
+    assert "42" in line
+    assert "最近一次" not in line
+
+
 def test_reporter_collects_stale_counts():
     class _Src:
         stale_quote_counts = {"XRP/USDC:USDC": 3, "BNB/USDC:USDC": 4}
@@ -479,7 +542,57 @@ def test_reporter_collects_stale_counts():
     import asyncio as _a
     r = DailyReporter(GlobalConfig(), None, None, _a.Event(), stale_quote_source=_Src())
     assert r._get_stale_quote_summary() == {
-        "total": 7, "symbols": {"XRP/USDC:USDC": 3, "BNB/USDC:USDC": 4}}
+        "total": 7, "symbols": {"XRP/USDC:USDC": 3, "BNB/USDC:USDC": 4},
+        "last_stale_seconds_ago": None}
+
+
+def test_reporter_reports_most_recent_stale_timestamp(fake_clock):
+    """摘要要能分辨「今天」與「上個月」：帶出所有 symbol 中最近一次過期的秒數。
+
+    _Src 有兩個 symbol，各自的最近一次過期時戳不同——舊碼（沒讀 _last_stale_at
+    或讀錯 key）會讓這條紅在 last_stale_seconds_ago 不是 200.0（例如整個欄位是
+    None，或取到 500.0 那個較舊的時戳而非較新的 200.0）。
+    """
+    class _Src:
+        stale_quote_counts = {"XRP/USDC:USDC": 3, "BNB/USDC:USDC": 4}
+        _last_stale_at = {"XRP/USDC:USDC": 999_800.0, "BNB/USDC:USDC": 999_500.0}
+
+    import asyncio as _a
+    fake_clock(0)  # 錨定守衛時鐘於 1_000_000.0（見 fake_clock fixture）
+    r = DailyReporter(GlobalConfig(), None, None, _a.Event(), stale_quote_source=_Src())
+    summary = r._get_stale_quote_summary()
+    assert summary["last_stale_seconds_ago"] == pytest.approx(200.0)
+
+
+def test_reporter_stale_timestamp_missing_degrades_to_none():
+    """source 沒有 _last_stale_at 屬性（舊呼叫端／測試替身）不得讓整個摘要掛掉，
+    只降級成這個欄位是 None，total/symbols 仍要正常帶出。
+    """
+    class _Src:
+        stale_quote_counts = {"XRP/USDC:USDC": 3}
+
+    import asyncio as _a
+    r = DailyReporter(GlobalConfig(), None, None, _a.Event(), stale_quote_source=_Src())
+    summary = r._get_stale_quote_summary()
+    assert summary["total"] == 3
+    assert summary["last_stale_seconds_ago"] is None
+
+
+def test_reporter_stale_timestamp_failure_is_swallowed():
+    """讀時戳這步炸掉，只讓那個欄位掉，不得殃及 total/symbols 或讓摘要整封消失。"""
+    class _Src:
+        stale_quote_counts = {"XRP/USDC:USDC": 3}
+
+        @property
+        def _last_stale_at(self):
+            raise RuntimeError("boom")
+
+    import asyncio as _a
+    r = DailyReporter(GlobalConfig(), None, None, _a.Event(), stale_quote_source=_Src())
+    summary = r._get_stale_quote_summary()
+    assert summary is not None
+    assert summary["total"] == 3
+    assert summary["last_stale_seconds_ago"] is None
 
 
 def test_reporter_stale_counts_failure_is_swallowed():

@@ -142,6 +142,10 @@ class MaxGridBot:
         # 價格快照過期事件：計數給每日摘要，時戳給 log 節流
         self.stale_quote_counts: Dict[str, int] = {}
         self._last_stale_log_at: Dict[str, float] = {}
+        # 每個 symbol 最近一次過期事件的 guard_now() 時戳，供每日摘要顯示
+        # 「最近一次 X 小時前」——與 stale_quote_counts 並列維護，每次過期
+        # 事件都更新（不受 log 節流影響），見 _note_stale_quote。
+        self._last_stale_at: Dict[str, float] = {}
 
         # MAX 增強模組
         self.glft_controller = GLFTController()
@@ -355,10 +359,20 @@ class MaxGridBot:
         三種擋單情境的文案要能一眼分辨：quote_at <= 0（從未收過報價）時裸印
         age 會是 clock.now() 那個量級的數字（~1.7e9s），毫無意義；age < 0
         （時鐘後跳）同理。只有「正常過期」才適合印 age。
+
+        「從未收過報價」分支目前在生產不可達：latest_price 與 quote_at 只在
+        `_handle_ticker` 同一處被寫入，別無他處，故 quote_at == 0 必然蘊含
+        latest_price == 0，而上游 `_grid_step` 的 `if price <= 0: return` 會
+        先行 return，走不到這裡。保留為防禦，是一個 tripwire：若日後出現
+        第二個 latest_price 的寫入端（例如 REST 價格 fallback），這個分支
+        就會活起來。
         """
         self.stale_quote_counts[ccxt_symbol] = self.stale_quote_counts.get(ccxt_symbol, 0) + 1
         # 節流計時必須與蓋章／比較同一個時鐘（guard_now），否則又是一種混用
         now = clock.guard_now()
+        # 與計數並列、每次過期事件都更新（不受下方 log 節流影響）：
+        # 讓每日摘要能算出「最近一次 X 小時前」，而不是只有一個永遠不動的累計數字。
+        self._last_stale_at[ccxt_symbol] = now
         last = self._last_stale_log_at.get(ccxt_symbol, 0.0)
         # 時鐘倒退時 last 會落在未來 ⇒ 重新錨定，否則節流會凍結到永遠不 log
         if last > now:
