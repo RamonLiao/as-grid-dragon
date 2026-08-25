@@ -13,7 +13,7 @@ def test_decision_log_writes_one_json_line(tmp_path):
     bot._decision_log_path = str(logf)
     sc = bot.config.symbols["XRP/USDC:USDC"]
     _state(bot, latest_price=2.5, long_position=10, short_position=0,
-           buy_long_orders=0, sell_long_orders=0, quote_at=clock.now())
+           buy_long_orders=0, sell_long_orders=0, quote_at=clock.guard_now())
     import asyncio
     asyncio.run(bot._grid_step("XRP/USDC:USDC", sc))
     lines = logf.read_text().strip().splitlines()
@@ -33,7 +33,7 @@ def test_decision_log_disabled_when_no_path(tmp_path):
     bot = _make_bot()
     sc = bot.config.symbols["XRP/USDC:USDC"]
     _state(bot, latest_price=2.5, long_position=10, short_position=0,
-           buy_long_orders=0, sell_long_orders=0, quote_at=clock.now())
+           buy_long_orders=0, sell_long_orders=0, quote_at=clock.guard_now())
     import asyncio
     # 無 _decision_log_path 屬性 → 不應拋
     asyncio.run(bot._grid_step("XRP/USDC:USDC", sc))
@@ -49,7 +49,7 @@ def test_decision_log_io_failure_does_not_break_trading(tmp_path):
     bot._decision_log_path = str(bad)
     sc = bot.config.symbols["XRP/USDC:USDC"]
     _state(bot, latest_price=2.5, long_position=10, short_position=0,
-           buy_long_orders=0, sell_long_orders=0, quote_at=clock.now())
+           buy_long_orders=0, sell_long_orders=0, quote_at=clock.guard_now())
     import asyncio
     asyncio.run(bot._grid_step("XRP/USDC:USDC", sc))  # 不應拋
     assert bot.order_executor.place_order.await_count >= 1

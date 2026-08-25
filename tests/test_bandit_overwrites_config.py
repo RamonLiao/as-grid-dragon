@@ -59,7 +59,7 @@ def _make_bot(bandit_enabled: bool):
     st.latest_price = 2.5
     st.best_bid = 2.5
     st.best_ask = 2.5
-    st.quote_at = clock.now()  # 價格時效守衛：模擬「剛收到 ticker」
+    st.quote_at = clock.guard_now()  # 價格時效守衛：模擬「剛收到 ticker」
     st.long_position = 0
     st.short_position = 0
     return bot

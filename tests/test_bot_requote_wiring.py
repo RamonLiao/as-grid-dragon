@@ -56,7 +56,7 @@ async def test_decision_inputs_carry_factor(minimal_bot):
     sym_cfg = next(iter(minimal_bot.config.symbols.values()))
     state = minimal_bot.state.symbols[sym_cfg.ccxt_symbol]
     state.latest_price = 100.0
-    state.quote_at = clock.now()  # 價格時效守衛：模擬「剛收到 ticker」
+    state.quote_at = clock.guard_now()  # 價格時效守衛：模擬「剛收到 ticker」
     state.long_position = 1.0
     state.short_position = 0.0
     # buy_long_orders<=0 → _should_adjust_grid 無條件回 True（不靠 deviation 湊出 need_long）

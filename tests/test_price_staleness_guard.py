@@ -36,19 +36,24 @@ def _make_bot():
 def bot():
     b = _make_bot()
     yield b
-    clock.reset_clock()   # 絕不殘留 sim-clock 給後續測試
+    clock.reset_clock()        # 絕不殘留 sim-clock 給後續測試
+    clock.reset_guard_clock()  # 守衛時鐘同理
 
 
 @pytest.fixture
 def fake_clock():
-    """可推進的假時鐘。回傳 advance(seconds)。"""
+    """可推進的假守衛時鐘。回傳 advance(seconds)。
+
+    注入的是 set_guard_clock 而非 set_clock：守衛量的是牆鐘（guard_now），
+    clock.now() 是可被 backtester 替換的情境時鐘，兩者刻意分離。
+    """
     t = {"now": 1_000_000.0}
-    clock.set_clock(lambda: t["now"])
+    clock.set_guard_clock(lambda: t["now"])
 
     def advance(seconds):
         t["now"] += seconds
     yield advance
-    clock.reset_clock()
+    clock.reset_guard_clock()
 
 
 @pytest.mark.asyncio
@@ -63,7 +68,7 @@ async def test_handle_ticker_stamps_quote_at(bot, fake_clock):
 
     assert state.best_bid == 100.0
     assert state.best_ask == 100.2
-    assert state.quote_at == clock.now()
+    assert state.quote_at == clock.guard_now()
 
 
 from grid_engine.config import GlobalConfig as _GC
@@ -182,10 +187,10 @@ async def test_never_received_quote_is_blocked(bot, fake_clock):
     門檻必須設得比「現在的假時鐘值」還大：若不這麼做，quote_at=0 時
     age = now - 0 一定 > 一個小門檻，會被 age > max_age 那支條件連帶擋下，
     測不出 quote_at <= 0 這支專屬檢查是否存在（mutation 殺不掉——這就是
-    假紅/假綠的坑）。門檻從 clock.now() 動態導出，不寫死常數：若日後
+    假紅/假綠的坑）。門檻從 clock.guard_now() 動態導出，不寫死常數：若日後
     fake_clock fixture 的起始值改成真實 epoch（~1.7e9），這裡不會無聲失效。
     """
-    threshold = clock.now() + 1_000_000.0
+    threshold = clock.guard_now() + 1_000_000.0
     bot.config.max_price_age_sec = threshold
     state = _prime_for_ordering(bot)
     state.latest_price = 100.0          # 有價格但沒有時戳
@@ -194,7 +199,7 @@ async def test_never_received_quote_is_blocked(bot, fake_clock):
     # 前提斷言：確保門檻真的隔離出唯一能擋下本案例的條件——
     # 若這個 assert 本身失敗，代表 fake_clock 起始值已經漲到讓上面的
     # +1_000_000 緩衝不夠用，測試本身要先修，不能悄悄退回假紅。
-    assert clock.now() - 0 < threshold
+    assert clock.guard_now() - 0 < threshold
 
     await bot.adjust_grid(SYMBOL)
 
@@ -217,6 +222,36 @@ async def test_clock_rewind_blocks_then_self_heals(bot, fake_clock):
     bot.order_executor.place_order.reset_mock()
     await bot.adjust_grid(SYMBOL)
     assert bot.order_executor.place_order.await_count > 0
+
+
+@pytest.mark.asyncio
+async def test_guard_survives_backtest_clock_swap(bot):
+    """回歸：使用者一邊實盤、一邊在同一個 TUI 點回測，守衛不得因此全面停單。
+
+    live bot 跑在 TUI 同一個行程的 daemon thread（as_terminal_max.py:1265），
+    而 backtester 每根 K 線都 clock.set_clock(lambda: <歷史 epoch>)
+    （backtest/backtester.py:715）。若守衛用 clock.now() 量快照年齡，quote_at
+    是牆鐘蓋的、now() 卻是歷史 epoch ⇒ quote_age 變成巨大負數 ⇒ 「age < 0」
+    那支條件對每個 symbol、每個 tick 觸發，全面停止下單（連成交後的止盈補單
+    都停），而持倉繼續累積。
+
+    刻意不用 fake_clock：這條要測的正是「守衛的時鐘不是 clock.now()」，所以
+    守衛時鐘保持真實牆鐘（跟 live 一樣），只把情境時鐘換成歷史 epoch。
+    """
+    _prime_for_ordering(bot)
+    await _seed_fresh_quote(bot)              # 用真實牆鐘蓋章
+    bot.order_executor.place_order.reset_mock()
+
+    clock.set_clock(lambda: 1_600_000_000.0)  # 回測進行中：情境時鐘退回 2020
+    try:
+        await bot.adjust_grid(SYMBOL)
+    finally:
+        clock.reset_clock()
+
+    assert bot.order_executor.place_order.await_count > 0, (
+        "回測替換 clock.now() 不得讓實盤守衛擋單——守衛必須用 guard_now()"
+    )
+    assert bot.stale_quote_counts.get(SYMBOL, 0) == 0
 
 
 @pytest.mark.asyncio

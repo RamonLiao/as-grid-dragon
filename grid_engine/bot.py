@@ -357,7 +357,8 @@ class MaxGridBot:
         （時鐘後跳）同理。只有「正常過期」才適合印 age。
         """
         self.stale_quote_counts[ccxt_symbol] = self.stale_quote_counts.get(ccxt_symbol, 0) + 1
-        now = clock.now()
+        # 節流計時必須與蓋章／比較同一個時鐘（guard_now），否則又是一種混用
+        now = clock.guard_now()
         last = self._last_stale_log_at.get(ccxt_symbol, 0.0)
         # 時鐘倒退時 last 會落在未來 ⇒ 重新錨定，否則節流會凍結到永遠不 log
         if last > now:
@@ -394,7 +395,10 @@ class MaxGridBot:
         # 提前 return 語意安全：下方的 DGT check_and_reset 與 bandit 套用同樣吃 price，
         # 價格不可信時本來就不該跑；跳過不遺失狀態（下一筆 ticker 會補做）。
         max_age = self.config.max_price_age_sec
-        quote_age = clock.now() - sym_state.quote_at
+        # 用 guard_now() 而非 now()：now() 是情境時鐘，backtester 每根 K 線會把它
+        # 換成歷史 epoch，而 live bot 與回測跑在同一個行程 ⇒ 共用會讓 quote_age
+        # 變成巨大負數、全面停單。詳見 clock.guard_now() docstring。
+        quote_age = clock.guard_now() - sym_state.quote_at
         if max_age > 0:
             if sym_state.quote_at <= 0 or quote_age < 0 or quote_age > max_age:
                 self._note_stale_quote(ccxt_symbol, quote_age, sym_state.quote_at)
@@ -597,7 +601,7 @@ class MaxGridBot:
 
                     # 與 bid/ask 同一個同步 block 蓋章：本區塊內無 await，
                     # 時戳與價格不可能分家。
-                    state.quote_at = clock.now()
+                    state.quote_at = clock.guard_now()
 
                     self.leading_indicator.update_spread(ccxt_symbol, bid, ask)
 
