@@ -60,6 +60,8 @@ CustomExchange = type('CustomExchange', (ccxt.binance,), {
         super(type(self), self).fetch(url, method, headers or {}, body)
 })
 
+STALE_QUOTE_LOG_SECONDS = 3600.0  # 價格過期 log 節流間隔（秒），不洗版
+
 
 class MaxGridBot:
     """MAX 版本網格機器人 - 整合學術模型增強功能"""
@@ -135,6 +137,10 @@ class MaxGridBot:
         self.reporter.watchdog = self.userdata_watchdog
 
         self.last_order_times: Dict[str, float] = {}
+
+        # 價格快照過期事件：計數給每日摘要，時戳給 log 節流
+        self.stale_quote_counts: Dict[str, int] = {}
+        self._last_stale_log_at: Dict[str, float] = {}
 
         # MAX 增強模組
         self.glft_controller = GLFTController()
@@ -338,11 +344,44 @@ class MaxGridBot:
         async with lock:
             await self._grid_step(ccxt_symbol, sym_config)
 
+    def _note_stale_quote(self, ccxt_symbol: str, age: float) -> None:
+        """記錄一次「快照過期而跳過調整」。
+
+        門檻設太小會讓網格靜默停擺，而「沒有儀器」正是 userData watchdog spec
+        要根除的形態，不得在這裡重演：計數每次都加（每日摘要讀它），log 走
+        節流免得洗版。本函式不得有下單/撤單/REST 副作用。
+        """
+        self.stale_quote_counts[ccxt_symbol] = self.stale_quote_counts.get(ccxt_symbol, 0) + 1
+        now = clock.now()
+        last = self._last_stale_log_at.get(ccxt_symbol, 0.0)
+        # 時鐘倒退時 last 會落在未來 ⇒ 重新錨定，否則節流會凍結到永遠不 log
+        if last > now:
+            last = 0.0
+        if now - last >= STALE_QUOTE_LOG_SECONDS:
+            self._last_stale_log_at[ccxt_symbol] = now
+            logger.warning(
+                f"[staleness] {ccxt_symbol} 價格快照過期 {age:.1f}s "
+                f"(門檻 {self.config.max_price_age_sec}s)，跳過網格調整；"
+                f"累計 {self.stale_quote_counts[ccxt_symbol]} 次"
+            )
+
     async def _grid_step(self, ccxt_symbol: str, sym_config: SymbolConfig):
         sym_state = self.state.symbols[ccxt_symbol]
         price = sym_state.latest_price
         if price <= 0:
             return
+
+        # 價格時效守衛：adjust_grid 有兩個呼叫端（_handle_ticker / _handle_order_update），
+        # 後者用的是上一次 ticker 留下的殘值 best_bid/best_ask，中間隔多久不受控，
+        # 而下方 place_order 會直接吃這兩個值。這一格是兩條路徑的共同咽喉。
+        # 提前 return 語意安全：下方的 DGT check_and_reset 與 bandit 套用同樣吃 price，
+        # 價格不可信時本來就不該跑；跳過不遺失狀態（下一筆 ticker 會補做）。
+        max_age = self.config.max_price_age_sec
+        if max_age > 0:
+            age = clock.now() - sym_state.quote_at
+            if sym_state.quote_at <= 0 or age < 0 or age > max_age:
+                self._note_stale_quote(ccxt_symbol, age)
+                return
 
         # === DGT 動態邊界管理 ===
         if self.config.dgt.enabled:
