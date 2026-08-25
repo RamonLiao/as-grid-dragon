@@ -454,6 +454,17 @@ def test_stale_quote_line_present_when_nonzero():
     assert line.endswith("\n")
 
 
+def test_stale_quote_line_does_not_claim_daily_granularity():
+    """措辭必須誠實：stale_quote_counts 全 repo 無重置點，那是自啟動累計。
+
+    寫「今日 N 次」會讓跑了 30 天的引擎每天報同一個越滾越大的數字，值班的人
+    無法分辨「今天有事」還是「上個月出過事」——比沒有這行更糟。
+    """
+    line = TelegramNotifier._format_stale_quote_line({"total": 42, "symbols": {}})
+    assert "今日" not in line
+    assert "累計" in line and "自啟動" in line
+
+
 def test_stale_quote_line_survives_garbage_counts():
     """型別錯不得讓整封摘要發不出去——降級成不帶數字，訊號本身不能掉。"""
     line = TelegramNotifier._format_stale_quote_line({"total": "abc", "symbols": None})

@@ -252,8 +252,18 @@ class TelegramNotifier:
         """價格快照過期計數那一行。
 
         安全要求同 _format_watchdog_line：文案是這裡自己定義的常數，不把外部
-        資料未跳脫插進 HTML 訊息（parse_mode=HTML）。計數為 0 或格式不符時
-        整行省略——正常狀態不加噪音。
+        資料未跳脫插進 HTML 訊息（parse_mode=HTML）。
+
+        兩種「省略」與一種「降級」要分清楚（行為，不是註解上的理想）：
+        - 不是 dict（含 None）⇒ 整行省略；
+        - 計數為 0 ⇒ 整行省略——正常狀態不加噪音；
+        - total 存在但轉不成 int ⇒ **不省略**，降級成不帶數字的告警行。
+          「有過期」這個訊號不能因為型別錯就掉。
+
+        數字是「自啟動累計」不是「今日」：stale_quote_counts 從 MaxGridBot
+        .__init__ 建立後全 repo 沒有任何重置點，措辭必須誠實。不做
+        snapshot-diff 造假的日增量——這套引擎重啟頻繁，reporter 自造的「今日」
+        會隨重啟歸零，比誠實累計更誤導。
 
         為什麼這行必須存在：_last_stale_log_at（Task 3）不會在 symbol 恢復
         正常後被清除，1 小時節流窗口內第二次過期不會產生新 log，只有這個
@@ -268,7 +278,7 @@ class TelegramNotifier:
             return "⚠️ <b>價格快照過期</b>：計數異常，請查 log\n"
         if total <= 0:
             return ""
-        return f"⚠️ <b>價格快照過期</b>：今日 {total} 次跳過網格調整\n"
+        return f"⚠️ <b>價格快照過期</b>：累計 {total} 次跳過網格調整（自啟動）\n"
 
     async def notify_risk_alert(self, alert: str):
         """風控警報"""
