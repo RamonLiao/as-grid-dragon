@@ -394,10 +394,10 @@ class MaxGridBot:
         # 提前 return 語意安全：下方的 DGT check_and_reset 與 bandit 套用同樣吃 price，
         # 價格不可信時本來就不該跑；跳過不遺失狀態（下一筆 ticker 會補做）。
         max_age = self.config.max_price_age_sec
+        quote_age = clock.now() - sym_state.quote_at
         if max_age > 0:
-            age = clock.now() - sym_state.quote_at
-            if sym_state.quote_at <= 0 or age < 0 or age > max_age:
-                self._note_stale_quote(ccxt_symbol, age, sym_state.quote_at)
+            if sym_state.quote_at <= 0 or quote_age < 0 or quote_age > max_age:
+                self._note_stale_quote(ccxt_symbol, quote_age, sym_state.quote_at)
                 return
 
         # === DGT 動態邊界管理 ===
@@ -480,7 +480,7 @@ class MaxGridBot:
             sym_state.last_grid_price_short = price
 
         if decision is not None:
-            self._log_decision(ccxt_symbol, inputs, decision)
+            self._log_decision(ccxt_symbol, inputs, decision, quote_age)
 
     async def _place_grid(self, ccxt_symbol: str, sym_config: SymbolConfig, side: str,
                           side_decision=None):
@@ -551,14 +551,20 @@ class MaxGridBot:
             sym_state.leading_spread_ratio = disp.get('leading_spread_ratio', sym_state.leading_spread_ratio)
             sym_state.leading_signals = disp.get('leading_signals', sym_state.leading_signals)
 
-    def _log_decision(self, ccxt_symbol: str, inputs, decision) -> None:
-        """落地一行 JSON（inputs + decision）。I/O 失敗只記 log 不拋，絕不中斷交易。"""
+    def _log_decision(self, ccxt_symbol: str, inputs, decision,
+                      quote_age: float = 0.0) -> None:
+        """落地一行 JSON（inputs + decision）。I/O 失敗只記 log 不拋，絕不中斷交易。
+
+        quote_age：本次決策當下的快照年齡（秒）。5 秒門檻是猜測值，這個欄位
+        累積出的實測分佈才是日後收緊/放寬門檻的依據。
+        """
         path = getattr(self, "_decision_log_path", None)
         if not path:
             return
         try:
             rec = {
                 "ts": time.time(),
+                "quote_age": quote_age,
                 "symbol": ccxt_symbol,
                 "inputs": dataclasses.asdict(inputs),
                 "decision": dataclasses.asdict(decision),

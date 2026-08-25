@@ -357,6 +357,49 @@ async def test_stale_log_message_distinguishes_scenario(bot, fake_clock, caplog)
     assert len({never_msg, rewind_msg, expired_msg}) == 3
 
 
+@pytest.mark.asyncio
+async def test_decision_log_carries_quote_age(bot, fake_clock, tmp_path):
+    """儀器：5 秒門檻是猜測值，要靠這個欄位的實測分佈日後收緊。"""
+    import json as _json
+    log_path = tmp_path / "decisions.jsonl"
+    bot._decision_log_path = str(log_path)
+    state = _prime_for_ordering(bot)
+    state.long_position = 1.0            # 有倉 → 走到 decide() 與 _log_decision
+    state.buy_long_orders = 0.0
+    await _seed_fresh_quote(bot)
+
+    fake_clock(2.0)
+    await bot.adjust_grid(SYMBOL)
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines, "決策未落檔"
+    rec = _json.loads(lines[-1])
+    assert rec["quote_age"] == pytest.approx(2.0)
+
+
+@pytest.mark.asyncio
+async def test_decision_log_quote_age_recorded_even_when_guard_disabled(bot, fake_clock, tmp_path):
+    """max_price_age_sec = 0 只關『擋單』，不得連『量測』也一起關掉——
+    否則正好在最想觀察門檻是否合理的時候（守衛已關）失去資料。
+    """
+    import json as _json
+    bot.config.max_price_age_sec = 0
+    log_path = tmp_path / "decisions.jsonl"
+    bot._decision_log_path = str(log_path)
+    state = _prime_for_ordering(bot)
+    state.long_position = 1.0
+    state.buy_long_orders = 0.0
+    await _seed_fresh_quote(bot)
+
+    fake_clock(999.0)   # 遠超預設 5 秒門檻，但守衛已關，不應擋單
+    await bot.adjust_grid(SYMBOL)
+
+    lines = log_path.read_text(encoding="utf-8").strip().splitlines()
+    assert lines, "決策未落檔"
+    rec = _json.loads(lines[-1])
+    assert rec["quote_age"] == pytest.approx(999.0)
+
+
 from grid_engine.notifier import TelegramNotifier
 from grid_engine.reporting import DailyReporter
 
