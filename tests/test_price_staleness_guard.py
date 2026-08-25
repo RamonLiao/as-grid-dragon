@@ -64,3 +64,29 @@ async def test_handle_ticker_stamps_quote_at(bot, fake_clock):
     assert state.best_bid == 100.0
     assert state.best_ask == 100.2
     assert state.quote_at == clock.now()
+
+
+from grid_engine.config import GlobalConfig as _GC
+
+
+def test_max_price_age_default_is_five():
+    assert _GC().max_price_age_sec == 5.0
+
+
+@pytest.mark.parametrize("bad", ["abc", None, -1, float("nan"), float("inf"), object()])
+def test_max_price_age_garbage_falls_back(bad):
+    """垃圾值不得流進 runtime loop——非法一律 fallback 5.0（config from_dict 正規化）。"""
+    cfg = _GC.from_dict({"max_price_age_sec": bad})
+    assert cfg.max_price_age_sec == 5.0
+
+
+def test_max_price_age_zero_is_legal_disable():
+    """0 是合法的「關閉守衛」值，不得被 fallback 吃掉——它是生產緊急逃生門。"""
+    cfg = _GC.from_dict({"max_price_age_sec": 0})
+    assert cfg.max_price_age_sec == 0.0
+
+
+def test_max_price_age_round_trips_through_to_dict():
+    cfg = _GC()
+    cfg.max_price_age_sec = 12.5
+    assert _GC.from_dict(cfg.to_dict()).max_price_age_sec == 12.5

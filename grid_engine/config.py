@@ -195,6 +195,7 @@ class GlobalConfig:
     sync_interval: float = 10.0
     position_adjust_cooldown: float = 5.0  # 有倉位時網格重掛最小間隔（秒），0 = 關閉
     requote_threshold_factor: float = 0.5  # 有倉位重掛閾值係數（0 < factor <= 10）
+    max_price_age_sec: float = 5.0       # 價格快照最大可用年齡（秒），0 = 關閉守衛
     symbols: Dict[str, SymbolConfig] = field(default_factory=dict)
     risk: RiskConfig = field(default_factory=RiskConfig)
     max_enhancement: MaxEnhancement = field(default_factory=MaxEnhancement)
@@ -224,6 +225,7 @@ class GlobalConfig:
             "sync_interval": self.sync_interval,
             "position_adjust_cooldown": self.position_adjust_cooldown,
             "requote_threshold_factor": self.requote_threshold_factor,
+            "max_price_age_sec": self.max_price_age_sec,
             "symbols": {k: v.to_dict() for k, v in self.symbols.items()},
             "risk": self.risk.to_dict(),
             "max_enhancement": self.max_enhancement.to_dict(),
@@ -268,6 +270,19 @@ class GlobalConfig:
         return cooldown if math.isfinite(cooldown) and cooldown >= 0 else 5.0
 
     @staticmethod
+    def _parse_max_price_age(value) -> float:
+        """正規化價格快照最大可用年齡（秒），非法/負值 fallback 到 5.0。
+
+        0 為合法值，語意是「關閉守衛」——它是生產上的緊急逃生門，
+        不得被 fallback 吃掉。
+        """
+        try:
+            age = float(value)
+        except (TypeError, ValueError):
+            return 5.0
+        return age if math.isfinite(age) and age >= 0 else 5.0
+
+    @staticmethod
     def _parse_bandit_state_max_age(value) -> Optional[int]:
         """正規化 bandit 狀態過期秒數；非正/非法/None → None（永不過期）。"""
         if value is None:
@@ -293,6 +308,8 @@ class GlobalConfig:
                 data.get("position_adjust_cooldown", 5.0)),
             requote_threshold_factor=_norm_requote_factor(
                 data.get("requote_threshold_factor", 0.5)),
+            max_price_age_sec=cls._parse_max_price_age(
+                data.get("max_price_age_sec", 5.0)),
             legacy_api_detected=False,
             telegram_bot_token=data.get("telegram_bot_token", ""),
             telegram_chat_id=data.get("telegram_chat_id", ""),
