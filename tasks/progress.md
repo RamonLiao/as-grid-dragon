@@ -1,8 +1,19 @@
 # Progress
 
-## Current Task（2026-08-25 更新）：價格時效守衛 8 tasks 全數完成（worktree branch，**尚未 merge、尚未重啟**）
+## Current Task（2026-08-25 17:25 更新）：價格時效守衛全數完成，**已 merge 並推上 origin；生產是否生效未確認**
 
-### 🟡 狀態：branch 完成，commit 完成 ≠ 生產生效
+### 🟡 狀態：已 merge + 已 push，但**生產是否跑到新碼無法確認**
+
+- `main == origin/main` @ `ea09993`（本次 16 commits，連同先前留著沒推的共推出 18 個）。
+- feature branch 與 worktree 已刪除；SDD review 產物（ledger／各輪報告／mutation 證據）
+  依使用者指示一併清除，結論已濃縮進 `tasks/notes.md` 最上方那則。
+- 工作區只剩既有的 ` M .gitignore`（與本次無關，使用者未指示處理）。
+- ⚠️ **重啟狀態不明**：引擎 pid 67585 啟動於 `2026-08-25 17:23:00`，而 fast-forward
+  merge 也在 `17:23` 前後完成。fast-forward **不產生 merge commit**，git 裡沒有可查的
+  merge 時刻 ⇒ 兩者先後**驗不出來**。Python 在 import 時載入模組，若行程早於檔案寫入
+  啟動，跑的就是舊碼。**下次開工第一件事：確認引擎已在 merge 之後重啟過。**
+  確認方式：`ps -o lstart= -p $(pgrep -f as_terminal_max | head -1)` 晚於 2026-08-25 17:25；
+  生效徵兆為 `config/trading_config_max.json` 下次存檔時出現 `max_price_age_sec`。
 
 - Work 在 git worktree `as-grid-dragon-staleness`，branch `feat/price-staleness-guard`
   （base `12cdb89`）。**主目錄 `../as-grid-dragon` 全程未動**，生產引擎跑的仍是
