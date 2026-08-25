@@ -1,3 +1,49 @@
+# 2026-08-24 價格時效守衛：review verdict 與 findings 計數（dev-rules 要求留痕）
+
+**最終 verdict：`Ship as-is`**（最終 whole-branch 外部輪 opus + scoped re-review 確認）。
+測試 **756 passed / 2 skipped**（worktree 基線 713/2，淨增 43）；15 commits；
+**尚未 merge、尚未重啟 ⇒ 尚未在生產生效**。
+
+## 各輪 findings 計數（C=blocker / B=should-fix / A=clean）
+
+| 輪次 | 對象 | 結果 |
+|---|---|---|
+| task review ×7 | Task 1-7 各一輪 | T1 A、T2 A、T3 C0/B2、T4 C0/B1、T5 C0/B1、T6 A、T7 A |
+| security-review (opus) | 整條 branch | **1 High + 1 Low** |
+| verifier (opus, fresh) | 整條 branch | ACCEPT WITH FINDINGS（9 條自選 mutation 全紅） |
+| 最終外部輪 (opus) | 整條 branch 15 commits | **Ship with follow-ups**：C0 / B0 / 4 Minor |
+| scoped re-review ×4 | 各 fix wave | 全部 all-addressed、零新增破壞 |
+
+## 這次最重要的三個發現（why 見 tasks/progress.md 對應段）
+
+1. **守衛本身可以變成新的風險來源。** 原設計把 `risk_monitor.check_and_reduce_positions`
+   關在 gate 後面，等於在「ticker 斷線但 userData 活著、掛單持續成交、雙邊持倉往上爬」
+   這個最需要風控的情境下關掉風控。通則：**判斷某一格該不該被 gate 擋，準則是
+   「消不消費 price」，不是「它在函式裡的位置」。**
+
+2. **可注入的全域時鐘在同行程多執行緒下是陷阱。** live bot 是 TUI 同行程的 daemon thread，
+   而 backtester 會把 `clock.now()` 換成歷史 epoch ⇒ 邊實盤邊點回測會讓守衛全面停單
+   （含成交後止盈補單）。改動前同樣的替換只造成 ATR/funding 偏移，**是這次把軟偏移
+   變成硬停機**。修法：守衛專用的 `clock.guard_now()`——它量的是「訊息抵達的牆鐘時間」，
+   與情境時鐘是不同的物理量，混用是分類錯誤。
+
+3. **比本守衛更該修的既有問題（backlog 最高優先）**：`sync_service.maybe_sync()`
+   **只**從 `_handle_ticker` 呼叫，無週期性 sync task ⇒ bookTicker 一斷，
+   REST 持倉同步／移動停損／保證金告警／訂單對帳**本來就全停**。
+   在該 failure mode 下本守衛根本不是瓶頸。應做 bookTicker liveness watchdog
+   或週期性 `maybe_sync` task。
+
+## backlog（本次產生，皆未做）
+
+- bookTicker liveness watchdog／週期性 `maybe_sync`（見上，優先度最高）
+- TUI 加 `max_price_age_sec` 編輯入口（目前逃生門得手改 config JSON + 重啟）
+- `clock._now_fn` 改 thread-local／contextvar（可順帶修掉既有 ATR/funding 偏移，
+  但改動 `clock.py` 對所有消費端的語意，本次刻意不做）
+- 一週後看 `logs/decisions.jsonl` 的 `quote_age` 分佈再定 5 秒門檻
+  （樣本稀疏：`_log_decision` 只在 requote 時刻寫）
+- `_get_stale_quote_summary` 的 per-symbol `symbols` 明細目前未被渲染（delete-or-render）
+- 既有 4 個測試以 5 秒門檻蓋章，對真實牆鐘有新耦合（慢機/斷點會冒無關的紅）
+
 # Notes
 
 ## 2026-08-25 價格時效守衛：三條值得留給未來的結論
