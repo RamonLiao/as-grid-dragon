@@ -33,7 +33,7 @@ def test_decision_log_disabled_when_no_path(tmp_path):
     bot = _make_bot()
     sc = bot.config.symbols["XRP/USDC:USDC"]
     _state(bot, latest_price=2.5, long_position=10, short_position=0,
-           buy_long_orders=0, sell_long_orders=0)
+           buy_long_orders=0, sell_long_orders=0, quote_at=clock.now())
     import asyncio
     # 無 _decision_log_path 屬性 → 不應拋
     asyncio.run(bot._grid_step("XRP/USDC:USDC", sc))
