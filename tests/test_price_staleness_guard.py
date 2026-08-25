@@ -179,16 +179,22 @@ async def test_order_update_path_with_stale_residual_is_blocked(bot, fake_clock)
 async def test_never_received_quote_is_blocked(bot, fake_clock):
     """quote_at == 0（從未收過 ticker）不得被當成「年齡 = now」而放行。
 
-    門檻刻意設得比 fake_clock 起始值（1_000_000）還大：若不這麼做，
-    quote_at=0 時 age = now - 0 一定 > 預設門檻 5.0，會被 age > max_age
-    那支條件連帶擋下，測不出 quote_at <= 0 這支專屬檢查是否存在
-    （mutation 殺不掉——這就是假紅/假綠的坑）。
+    門檻必須設得比「現在的假時鐘值」還大：若不這麼做，quote_at=0 時
+    age = now - 0 一定 > 一個小門檻，會被 age > max_age 那支條件連帶擋下，
+    測不出 quote_at <= 0 這支專屬檢查是否存在（mutation 殺不掉——這就是
+    假紅/假綠的坑）。門檻從 clock.now() 動態導出，不寫死常數：若日後
+    fake_clock fixture 的起始值改成真實 epoch（~1.7e9），這裡不會無聲失效。
     """
-    bot.config.max_price_age_sec = 2_000_000.0
+    threshold = clock.now() + 1_000_000.0
+    bot.config.max_price_age_sec = threshold
     state = _prime_for_ordering(bot)
     state.latest_price = 100.0          # 有價格但沒有時戳
     state.best_bid = state.best_ask = 100.0
     assert state.quote_at == 0
+    # 前提斷言：確保門檻真的隔離出唯一能擋下本案例的條件——
+    # 若這個 assert 本身失敗，代表 fake_clock 起始值已經漲到讓上面的
+    # +1_000_000 緩衝不夠用，測試本身要先修，不能悄悄退回假紅。
+    assert clock.now() - 0 < threshold
 
     await bot.adjust_grid(SYMBOL)
 
@@ -261,3 +267,91 @@ async def test_stale_events_are_counted_and_log_is_throttled(bot, fake_clock, ca
     assert bot.stale_quote_counts[SYMBOL] == 5
     hits = [r for r in caplog.records if "價格快照過期" in r.getMessage()]
     assert len(hits) == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_quote_still_runs_risk_reduction(bot, fake_clock):
+    """守衛的契約是「不要用不可信的價格下單」，不是「價格過期就全面停擺」。
+
+    check_and_reduce_positions 下的是市價單（price 參數字面上是 0），完全不消費
+    _grid_step 的 price/quote_at；把它關在 gate 後面，等於在 ticker 斷線、userData
+    仍活、雙邊持倉往上爬——最需要風控的情境——關掉風控。gate 只該擋 place_order。
+    """
+    bot.config.max_price_age_sec = 5.0
+    _prime_for_ordering(bot)
+    await _seed_fresh_quote(bot)
+    bot.risk_monitor.check_and_reduce_positions = AsyncMock()
+
+    fake_clock(600.0)
+    await bot.adjust_grid(SYMBOL)
+
+    assert bot.order_executor.place_order.await_count == 0
+    assert bot.risk_monitor.check_and_reduce_positions.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_stale_log_resumes_after_throttle_window(bot, fake_clock, caplog):
+    """節流窗口過後，告警必須恢復——不是「第一次之後永遠靜音」。
+
+    只釘「窗口內至多一次」測不出這個 regression：把節流條件改成 `if last == 0.0:`
+    （只在從未 log 過時 log 一次，之後永遠不再 log）一樣能讓「至多一次」那半通過。
+    這條測窗口過後的第二次 log 有沒有真的發生。
+    """
+    from grid_engine.bot import STALE_QUOTE_LOG_SECONDS
+    import logging
+    bot.config.max_price_age_sec = 5.0
+    _prime_for_ordering(bot)
+    await _seed_fresh_quote(bot)
+    fake_clock(600.0)
+
+    with caplog.at_level(logging.WARNING):
+        await bot.adjust_grid(SYMBOL)
+        fake_clock(STALE_QUOTE_LOG_SECONDS + 1)
+        await bot.adjust_grid(SYMBOL)
+
+    hits = [r for r in caplog.records if "價格快照過期" in r.getMessage()]
+    assert len(hits) == 2
+
+
+@pytest.mark.asyncio
+async def test_stale_log_message_distinguishes_scenario(bot, fake_clock, caplog):
+    """三種擋單情境的告警文案必須能一眼分辨，不能一律印 age（從未收過報價時
+    age = now - 0 ≈ 1.7e9；時鐘後跳時 age 是負數，兩者對值班的人都無意義）。
+    """
+    import logging
+    bot.config.max_price_age_sec = 5.0
+
+    # 情境一：從未收過報價（quote_at == 0）
+    state = _prime_for_ordering(bot)
+    state.latest_price = 100.0
+    with caplog.at_level(logging.WARNING):
+        await bot.adjust_grid(SYMBOL)
+    never_msg = caplog.records[-1].getMessage()
+    assert "從未" in never_msg
+    assert "1755" not in never_msg and "1787" not in never_msg and "1000000.0" not in never_msg
+
+    caplog.clear()
+
+    # 情境二：時鐘後跳（age < 0）
+    _prime_for_ordering(bot)
+    await _seed_fresh_quote(bot)
+    fake_clock(-3600.0)
+    with caplog.at_level(logging.WARNING):
+        await bot.adjust_grid(SYMBOL)
+    rewind_msg = caplog.records[-1].getMessage()
+    assert "後跳" in rewind_msg or "倒退" in rewind_msg
+
+    caplog.clear()
+    fake_clock(3600.0)  # 校正回原本時間軸，避免污染後續狀態
+
+    # 情境三：正常過期（age > max_age）
+    _prime_for_ordering(bot)
+    await _seed_fresh_quote(bot)
+    fake_clock(600.0)
+    with caplog.at_level(logging.WARNING):
+        await bot.adjust_grid(SYMBOL)
+    expired_msg = caplog.records[-1].getMessage()
+    assert "600.0s" in expired_msg
+
+    # 三種文案彼此不同
+    assert len({never_msg, rewind_msg, expired_msg}) == 3

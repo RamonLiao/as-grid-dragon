@@ -344,12 +344,16 @@ class MaxGridBot:
         async with lock:
             await self._grid_step(ccxt_symbol, sym_config)
 
-    def _note_stale_quote(self, ccxt_symbol: str, age: float) -> None:
+    def _note_stale_quote(self, ccxt_symbol: str, age: float, quote_at: float) -> None:
         """記錄一次「快照過期而跳過調整」。
 
         門檻設太小會讓網格靜默停擺，而「沒有儀器」正是 userData watchdog spec
         要根除的形態，不得在這裡重演：計數每次都加（每日摘要讀它），log 走
         節流免得洗版。本函式不得有下單/撤單/REST 副作用。
+
+        三種擋單情境的文案要能一眼分辨：quote_at <= 0（從未收過報價）時裸印
+        age 會是 clock.now() 那個量級的數字（~1.7e9s），毫無意義；age < 0
+        （時鐘後跳）同理。只有「正常過期」才適合印 age。
         """
         self.stale_quote_counts[ccxt_symbol] = self.stale_quote_counts.get(ccxt_symbol, 0) + 1
         now = clock.now()
@@ -359,8 +363,14 @@ class MaxGridBot:
             last = 0.0
         if now - last >= STALE_QUOTE_LOG_SECONDS:
             self._last_stale_log_at[ccxt_symbol] = now
+            if quote_at <= 0:
+                reason = "從未收過報價"
+            elif age < 0:
+                reason = f"時鐘後跳 {age:.1f}s"
+            else:
+                reason = f"過期 {age:.1f}s"
             logger.warning(
-                f"[staleness] {ccxt_symbol} 價格快照過期 {age:.1f}s "
+                f"[staleness] {ccxt_symbol} 價格快照{reason} "
                 f"(門檻 {self.config.max_price_age_sec}s)，跳過網格調整；"
                 f"累計 {self.stale_quote_counts[ccxt_symbol]} 次"
             )
@@ -371,6 +381,12 @@ class MaxGridBot:
         if price <= 0:
             return
 
+        # 緊急減倉必須在守衛之前：check_and_reduce_positions 下的是市價單
+        # （price 參數字面上是 0），不消費這裡的 price/quote_at。守衛的契約是
+        # 「不要用不可信的價格下單」，不是「價格過期就全面停擺」——擋在守衛後面
+        # 等於在最需要風控的情境（ticker 斷線但持倉繼續累積）關掉風控。
+        await self.risk_monitor.check_and_reduce_positions(sym_config, sym_state)
+
         # 價格時效守衛：adjust_grid 有兩個呼叫端（_handle_ticker / _handle_order_update），
         # 後者用的是上一次 ticker 留下的殘值 best_bid/best_ask，中間隔多久不受控，
         # 而下方 place_order 會直接吃這兩個值。這一格是兩條路徑的共同咽喉。
@@ -380,7 +396,7 @@ class MaxGridBot:
         if max_age > 0:
             age = clock.now() - sym_state.quote_at
             if sym_state.quote_at <= 0 or age < 0 or age > max_age:
-                self._note_stale_quote(ccxt_symbol, age)
+                self._note_stale_quote(ccxt_symbol, age, sym_state.quote_at)
                 return
 
         # === DGT 動態邊界管理 ===
@@ -409,8 +425,6 @@ class MaxGridBot:
         # 即時更新面板顯示用的動態間距（無倉位時也要刷新）
         sym_state.dynamic_take_profit = sym_config.take_profit_spacing
         sym_state.dynamic_grid_spacing = sym_config.grid_spacing
-
-        await self.risk_monitor.check_and_reduce_positions(sym_config, sym_state)
 
         # 封鎖期內開倉單必被跳過，無倉位分支撤了單也補不回來 — 直接不動作
         order_blocked = self.order_executor.is_blocked(ccxt_symbol)
