@@ -101,6 +101,29 @@ per-symbol lock 已在外層（`bot.py:335-338`）。
 ——**兩者都吃 `price`**，價格不可信時本來就不該跑。跳過不遺失狀態（下一筆 ticker
 會補做）。
 
+#### 4.3.1 例外：緊急減倉必須在 gate 之前（2026-08-24 修訂，Task 3 review 發現）
+
+**原設計錯誤**：只檢查了 DGT 與 bandit，漏了 `risk_monitor.check_and_reduce_positions`
+（原本落在 gate 下游）。
+
+`risk_monitor.py:66-107` 實查結果：該函式**完全不消費價格**——觸發判斷只用
+`sym_state.long_position` / `sym_state.short_position` / `sym_config.position_threshold`，
+且下的是 `place_order(ccxt_symbol, 'sell', 0, qty, True, 'long', 'market')`，
+**price 參數字面上是 `0`，市價單**。
+
+⇒ 把它關在守衛後面是**方向錯誤的**：守衛的契約是「不要用不可信的價格下單」，
+而市價平倉不消費那個價格。實際後果是在「ticker 斷線、userData 仍活著、掛單持續
+成交、雙邊持倉往上爬」這個**最需要風控的情境**下關掉風控（60 秒冷卻的減倉在整個
+斷線期間永不觸發）。
+
+**修訂後的規則**：`check_and_reduce_positions` 上移到 `if price <= 0: return` 之後、
+gate 之前。搬移的語意安全性已檢查：它讀的三個值都不被 DGT / bandit 觸碰（那兩者
+動的是 `grid_spacing` / `gamma` / 邊界）。
+
+**通則（寫死在此，避免重演）**：判斷「這一格該不該被時效 gate 擋住」的準則
+**不是「它在 `_grid_step` 裡的位置」，而是「它消不消費 `price`」**。不消費價格的
+副作用（市價風控平倉）必須留在 gate 之前。
+
 ### 4.4 config
 
 `GlobalConfig` 新增：
