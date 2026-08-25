@@ -7,6 +7,7 @@ import pytest
 from grid_engine.bot import MaxGridBot
 from grid_engine.config import GlobalConfig, SymbolConfig
 from grid_engine.decision import decide as real_decide
+from grid_engine import clock
 
 SYMBOL = "XRP/USDC:USDC"
 
@@ -55,6 +56,7 @@ async def test_decision_inputs_carry_factor(minimal_bot):
     sym_cfg = next(iter(minimal_bot.config.symbols.values()))
     state = minimal_bot.state.symbols[sym_cfg.ccxt_symbol]
     state.latest_price = 100.0
+    state.quote_at = clock.now()  # 價格時效守衛：模擬「剛收到 ticker」
     state.long_position = 1.0
     state.short_position = 0.0
     # buy_long_orders<=0 → _should_adjust_grid 無條件回 True（不靠 deviation 湊出 need_long）

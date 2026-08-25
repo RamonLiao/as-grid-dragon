@@ -33,6 +33,7 @@ from unittest.mock import AsyncMock
 from grid_engine.bot import MaxGridBot
 from grid_engine.config import GlobalConfig, SymbolConfig
 from grid_engine.enhancements import MaxEnhancement
+from grid_engine import clock
 
 SYMBOL = "XRP/USDC:USDC"
 
@@ -58,6 +59,7 @@ def _make_bot(bandit_enabled: bool):
     st.latest_price = 2.5
     st.best_bid = 2.5
     st.best_ask = 2.5
+    st.quote_at = clock.now()  # 價格時效守衛：模擬「剛收到 ticker」
     st.long_position = 0
     st.short_position = 0
     return bot

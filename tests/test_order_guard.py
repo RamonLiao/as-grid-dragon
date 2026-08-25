@@ -23,6 +23,7 @@ from grid_engine.bot import (
     ORDER_CIRCUIT_COOLDOWN,
 )
 from grid_engine.config import GlobalConfig, SymbolConfig
+from grid_engine import clock
 
 SYM = "BNB/USDC:USDC"
 
@@ -52,6 +53,7 @@ def _make_trading_bot(cooldown=5.0):
     st.latest_price = 600.0
     st.best_bid = 599.9
     st.best_ask = 600.1
+    st.quote_at = clock.now()  # 價格時效守衛：模擬「剛收到 ticker」
     st.long_position = 1.0
     st.short_position = 1.0
     bot._place_grid = AsyncMock()
