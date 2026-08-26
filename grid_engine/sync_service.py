@@ -3,6 +3,7 @@
 鎖序不變式：_sync_lock（本 service 持有）→ symbol lock（共享 SymbolLocks），單向。
 """
 import asyncio
+from dataclasses import dataclass
 import math
 from time import time as _time
 from typing import Optional
@@ -37,6 +38,30 @@ TRADE_STATS_SINCE_MARGIN_MS = 5_000
 TRADE_STATS_MAX_PAGES_PER_SYNC = 10
 
 
+@dataclass(frozen=True)
+class SyncOutcome:
+    """一輪 sync_all 的逐項成敗。
+
+    為什麼要回報而不是靠例外：五個子項各自吞例外（歷史決定，見各方法 docstring），
+    呼叫端那一層幾乎永遠看不到例外 ⇒ 「REST 全掛」在今天的表現是面板數字凍結、
+    風控拿著過期持倉繼續跑、沒有人被通知。這個回傳值是那條靜默路徑唯一的出口。
+
+    critical_ok 只看持倉與帳戶：前者是風控判斷的輸入，後者是保證金告警的輸入。
+    掛單數只影響顯示與 requote 計數，funding 與成交統計是遙測——把它們納入告警
+    會被偶發 REST 抖動洗版，而它們失敗不影響交易安全。
+    """
+    positions_ok: bool = True
+    orders_ok: bool = True
+    account_ok: bool = True
+    funding_ok: bool = True
+    trade_stats_ok: bool = True
+    skipped: bool = False
+
+    @property
+    def critical_ok(self) -> bool:
+        return self.positions_ok and self.account_ok
+
+
 class SyncService:
     def __init__(self, gateway, ctx, config, state, locks, notifier, risk_monitor, tasks,
                  start_time_ms: Optional[int] = None):
@@ -61,23 +86,29 @@ class SyncService:
         self._last_trade_since: dict = {}   # 每 symbol 的分頁游標，跨輪持續推進（見 Critical-1 修復）
         self._last_trade_stats_at = 0.0
 
-    async def sync_all(self):
+    async def sync_all(self) -> SyncOutcome:
         if self._sync_lock.locked():
-            return
+            return SyncOutcome(skipped=True)
         async with self._sync_lock:
-            await self._sync_positions()
-            await self._sync_orders()
-            await self._sync_account()
-            await self._sync_funding_rates()
-            await self._sync_trade_stats()
+            positions_ok = await self._sync_positions()
+            orders_ok = await self._sync_orders()
+            account_ok = await self._sync_account()
+            funding_ok = await self._sync_funding_rates()
+            trade_stats_ok = await self._sync_trade_stats()
+        return SyncOutcome(
+            positions_ok=positions_ok, orders_ok=orders_ok, account_ok=account_ok,
+            funding_ok=funding_ok, trade_stats_ok=trade_stats_ok,
+        )
 
-    async def maybe_sync(self):
-        """ticker 高頻路徑的節流同步（原 _handle_ticker 尾端 gating 收編）"""
+    async def maybe_sync(self) -> Optional[SyncOutcome]:
+        """節流同步。回 None 表示本輪未達門檻（不算成功也不算失敗）。"""
         if _time() - self.last_sync_time > self.config.sync_interval:
-            await self.sync_all()
+            outcome = await self.sync_all()
             self.last_sync_time = _time()
+            return outcome
+        return None
 
-    async def _sync_funding_rates(self):
+    async def _sync_funding_rates(self) -> bool:
         """同步所有交易對的 funding rate。
 
         逐 symbol try/except（與 _sync_orders 同構）：這個方法排在 sync_all() 裡
@@ -88,8 +119,9 @@ class SyncService:
         ——那句話當時是假的（見 dual-review C1）。
         """
         if not self.ctx.funding_manager:
-            return
+            return True
 
+        ok = True
         for sym_config in self.config.symbols.values():
             if not sym_config.enabled:
                 continue
@@ -100,13 +132,15 @@ class SyncService:
                     sym_state.current_funding_rate = rate
             except Exception as e:
                 logger.error(f"同步 {sym_config.ccxt_symbol} funding rate 失敗: {e}")
+                ok = False
+        return ok
 
-    async def _sync_positions(self):
+    async def _sync_positions(self) -> bool:
         try:
             positions = await self.gateway.call(self.ctx.exchange.fetch_positions, params={'type': 'future'})
         except Exception as e:
             logger.error(f"同步持倉失敗: {e}")
-            return
+            return False
 
         agg = {s: [0.0, 0.0, 0.0] for s in self.state.symbols}  # long, short, upnl
         for pos in positions:
@@ -128,8 +162,10 @@ class SyncService:
                 st.long_position = long_pos
                 st.short_position = short_pos
                 st.unrealized_pnl = upnl
+        return True
 
-    async def _sync_orders(self):
+    async def _sync_orders(self) -> bool:
+        ok = True
         for sym_config in self.config.symbols.values():
             if not sym_config.enabled:
                 continue
@@ -160,8 +196,10 @@ class SyncService:
                         state.buy_short_orders, state.sell_short_orders = counts
             except Exception as e:
                 logger.error(f"同步 {symbol} 掛單失敗: {e}")
+                ok = False
+        return ok
 
-    async def _sync_account(self):
+    async def _sync_account(self) -> bool:
         try:
             balance = await self.gateway.call(self.ctx.exchange.fetch_balance, {'type': 'future'})
 
@@ -201,10 +239,12 @@ class SyncService:
                 task.add_done_callback(lambda t: t in self.tasks and self.tasks.remove(t))
 
             await self.risk_monitor.check_trailing_stop()
+            return True
         except Exception as e:
             logger.error(f"同步帳戶失敗: {e}")
+            return False
 
-    async def _sync_trade_stats(self):
+    async def _sync_trade_stats(self) -> bool:
         """成交次數/已實現盈虧的**唯一** writer。
 
         userData handler 曾經是唯一 writer，而該路徑 2026-07-12 起靜默死亡一個月，
@@ -226,10 +266,11 @@ class SyncService:
         非嚴格等價，但實務影響小（BNBUSDC 常見單量 0.02，很少發生部分成交拆單）。
         """
         if clock.now() - self._last_trade_stats_at < TRADE_STATS_INTERVAL:
-            return
+            return True
 
         try:
             await self._sync_trade_stats_body()
+            return True
         except Exception as e:
             # 兄弟方法（_sync_positions/_sync_orders/_sync_account/_sync_funding_rates）
             # 各自都有整段/逐 symbol 的 try/except（_sync_funding_rates 的那道是
@@ -241,6 +282,7 @@ class SyncService:
             # 已經處理絕大多數失敗，這層是最後一道保險，不改變內層「整批丟棄/
             # 單筆跳過」的既有語意。
             logger.error(f"同步成交統計失敗（外層保險，不應常態觸發）: {e}")
+            return False
         finally:
             # 節流時間戳必須在 finally 推進：放在 body 最後一行時，body 拋例外
             # （正是這層保險要接的那種）會讓時間戳永不前進 ⇒ 之後每一次 sync_all()
