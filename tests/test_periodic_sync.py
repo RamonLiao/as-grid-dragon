@@ -194,3 +194,17 @@ def test_alert_text_contains_no_external_data(sync, notified):
     for _ in range(SYNC_FAILURE_THRESHOLD):
         sync._evaluate(SyncOutcome(positions_ok=False))
     assert "<" not in notified[0] and ">" not in notified[0]
+
+
+def test_threshold_literal_fires_on_third_not_second(sync, notified):
+    """釘住門檻值本身（生產參數，不是實作細節）：故意寫死次數 2 / 3，
+    不引用 SYNC_FAILURE_THRESHOLD——迴圈次數綁常數的測試對常數的值不敏感，
+    常數被手滑改成 2 或 5 時全部照樣綠燈（見 review Important）。這條測試
+    改常數就該紅：它驗的是「3」這個字面值本身。
+    """
+    sync._evaluate(SyncOutcome(positions_ok=False))
+    sync._evaluate(SyncOutcome(positions_ok=False))
+    assert notified == []
+
+    sync._evaluate(SyncOutcome(positions_ok=False))
+    assert len(notified) == 1
