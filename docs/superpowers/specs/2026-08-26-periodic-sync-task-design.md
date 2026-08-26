@@ -51,6 +51,12 @@ bookTicker 一停推送（WS 靜默失效、交易所端斷流、網路分區）
   只進 log，不進 Telegram（notifier 已有 `_redact`，但本設計採更嚴格作法：
   Telegram 只送「哪一項失敗、連續幾次」，不送例外原文）。
 - 本改動不新增任何檔案寫入、不觸碰 config 存檔路徑。
+- **資金安全（2026-08-26 dual-review C1 新增，見 §10 的修訂 10）**：REST 同步的
+  `fetch → apply` 窗口內，state 可能已被 WS handler 改過（handler 不取 symbol
+  lock），把 REST 舊快照無條件蓋回去會讓 `_grid_step` 走錯分岔（撤掉剛掛好的網格
+  並重新開倉）或讓網格靜默漏掛。約束：`_sync_positions` / `_sync_orders` 必須在
+  fetch 前抓 `SymbolState.ws_seq`、apply 時在 symbol lock 內比對，不一致就丟棄該
+  **symbol** 的快照。鎖序不變式 `_sync_lock → symbol lock` 維持單向不變。
 
 ## 5. 設計
 
@@ -76,7 +82,7 @@ while not self._stop_event.is_set():
         slept = True
         if self._stop_event.is_set():
             break
-        self._evaluate(await self.sync_all())        # 修訂：不再經過 maybe_sync
+        await self.sync_once()                       # 修訂 7（B5）：= sync_all() + _evaluate()
     except asyncio.CancelledError:
         break
     except Exception as e:
@@ -84,7 +90,7 @@ while not self._stop_event.is_set():
         self._evaluate(None, loop_error=True)
         if not slept:                                # 修訂：I3 的忙迴圈防禦
             try:
-                await asyncio.sleep(MIN_SYNC_INTERVAL)
+                await asyncio.sleep(SYNC_INTERVAL_FALLBACK)
             except asyncio.CancelledError:
                 break
 ```
@@ -173,12 +179,14 @@ class SyncOutcome:
   `maybe_sync` 這一處。**2026-08-26 修訂**：`maybe_sync` 已刪除，這條約束仍然
   成立且更重要——`_time` 現在只剩 `TRADE_STATS_INTERVAL`（見 Ruling 6 的 backlog）
   與 `start_time_ms` 預設值在用。
-- `_loop_interval()`：`config.sync_interval` 非數／NaN／`<= 0` → 用 **1.0 秒**
+- `_loop_interval()`：`config.sync_interval` 非數／NaN／**`±inf`**／`<= 0` → 用
+  `SYNC_INTERVAL_FALLBACK` = **10.0 秒**（= `GlobalConfig.sync_interval` 的預設值）
   fallback 並記一次 warning（**2026-08-26 修訂**：它必須是 total function，
   `except Exception`——`self.config` 為 None 時的 `AttributeError` 會讓
-  `await asyncio.sleep(self._loop_interval())` 整句沒被執行，見 §10 的 I3）。
-  不夾的話 `sleep(0)` 會變成忙迴圈打爆 REST 配額；夾到下限而不是 fallback 預設值，
-  是因為使用者刻意調小是合法意圖，只有非法值才需要糾正。
+  `await asyncio.sleep(self._loop_interval())` 整句沒被執行，見 §10 的 I3；
+  fallback 值與常數名見 §10 的修訂 6，`inf` 見修訂 8）。
+  不糾正的話 `sleep(0)` 會變成忙迴圈打爆 REST 配額、`sleep(inf)` 會讓同步整條
+  停擺；只糾正非法值、不夾合法小值，是因為使用者刻意調小是合法意圖。
 
 ### 5.6 每日摘要多一行
 
@@ -188,7 +196,9 @@ class SyncOutcome:
 **2026-08-26 修訂**：加一段**心跳**，優先於下列所有分支：
 `last_sync_age`（= `guard_now() - last_sync_time`，由 `_get_sync_status` 一併帶出，
 formatter 是 staticmethod、不得讀全域狀態，故門檻用的 `sync_interval` 也一起帶）
-超過 `max(60, 6 * sync_interval)` ⇒ 無條件印停擺警告；`None`（從未同步過）與
+超過 `min(max(60, 6 * sync_interval), 3600)` ⇒ 無條件印停擺警告（天花板見 §10
+的修訂 8：`sync_interval` 被設成巨大但有限的值時，沒有天花板的門檻大到永不告警
+= 停擺偵測被一個設定值靜默關掉）；`None`（從未同步過）與
 負值（牆鐘回跳，沿用 `bot._note_stale_quote` 的既有態度）各有專屬告警文案，
 一律不省略。另：欄位型別壞掉（如 `consecutive_failures=None`）改成印保守文案，
 不再讓整行消失（`int(None)` 走 `except → return ""` 等於降級告警被靜默吞掉）。
@@ -345,6 +355,94 @@ REST 呼叫，`rest_gateway` 本來就是單 worker 排隊，多等沒有好處�
   close_symbol_positions` 會送市價平倉單）。今天沒事只是因為 `bot.stop()` 剛好
   還會 `task.cancel()`——那是巧合不是設計。
 
-**未修訂、明確留到 backlog（Ruling 6）**：`_sync_trade_stats()` 的節流仍用
+~~**未修訂、明確留到 backlog（Ruling 6）**：`_sync_trade_stats()` 的節流仍用
 `clock.now()`（情境時鐘）而非 `guard_now()`。既有問題、非本 branch 引入，修它
-要動 `tests/test_trade_stats_sync.py` 的 frozen_clock fixture。
+要動 `tests/test_trade_stats_sync.py` 的 frozen_clock fixture。~~
+**已於下方修訂 9 撤銷這個 backlog 決定，本 branch 一併修掉。**
+
+### 2026-08-26（第二輪）— dual-review 的 fix wave
+
+以下修訂由 branch `feat/periodic-sync-task` 的 dual-review（C1 / B2–B5 / M6–M12）
+觸發，處理方式同上：偏離逐條留痕，不偷改。
+
+**修訂 6（M7）—— §5.5 非法 config 的 fallback 從 1.0s 改成 10.0s，常數改名。**
+
+- 影響段落：§5.1（loop 骨架的補睡）、§5.5。
+- 被撤回的原設計：`MIN_SYNC_INTERVAL = 1.0`，非法 `sync_interval` 一律退到 1 秒。
+- 為什麼撤回：那是「config 已經壞掉」的情境下**把 REST 頻率拉高 10 倍**。
+  `RestGateway` 是單 worker、與 `place_order` 共用同一條 queue ⇒ 同步風暴會延遲
+  下單，還可能吃到 Binance 的權重限制。壞掉的設定應該退回**預設行為**，不是退回
+  最激進的行為。新值 = `GlobalConfig.sync_interval` 的預設值（10.0），由
+  `test_fallback_equals_config_default` 釘住兩者相等。
+- 常數同時改名 `MIN_SYNC_INTERVAL` → `SYNC_INTERVAL_FALLBACK`：它從來就不是
+  「最小值」（合法的小值不會被夾），舊名字與語意不符。
+
+**修訂 7（B5）—— §5.1/§5.2 新增 `sync_once()`，`run()` 與 `bot.run()` 都只呼叫它。**
+
+- 被撤回的原設計：`run()` 寫 `self._evaluate(await self.sync_all())`，而
+  `bot.run()` 的啟動同步（修訂 2 加的那行）從模組外呼叫私有 `_evaluate()`。
+- 為什麼撤回：「一輪同步的結果必須被評估」這條不變式散落在兩個檔案，任何一邊
+  漏掉就是一整輪不計數而且靜默；跨模組呼叫私有方法也讓 `_evaluate` 的簽章
+  事實上變成公開 API。`sync_all()` 維持純粹（只同步、只回報，既有並發測試直接
+  用它），評估收在 `sync_once()` 一處。
+
+**修訂 8（B3）—— §5.5 `_loop_interval()` 必須擋 `±inf`；§5.6 停擺門檻加天花板。**
+
+- 被撤回的內容：`math.isnan(interval) or interval <= 0`（漏掉 `+inf`）；
+  心跳門檻 `max(60, 6 * sync_interval)`（沒有上限）。
+- 為什麼撤回：`sync_interval = inf` ⇒ `asyncio.sleep(inf)` 永遠不醒，`_stop_event`
+  也叫不醒它（`sleep` 不受 event 中斷），執行中改回正常值同樣救不回來（每輪才重讀
+  config，而這一輪不會結束）⇒ REST 同步整條停擺、降級狀態機一次都不會被推進 =
+  完全靜默，正是本 branch 要根除的形態。`notifier._format_sync_line` 對同一個量
+  特地擋了 `±inf`，同一份 diff 在 producer 端漏掉。
+  第二個洞在同一處：`sync_interval` 被設成巨大但**有限**的值（例如 86400）時，
+  `6 * interval` 讓停擺門檻大到永不告警——停擺偵測被一個設定值靜默關掉。
+- 新防禦：`not math.isfinite(interval) or interval <= 0`；門檻夾 `3600` 天花板
+  （`SYNC_STALE_CEILING_SEC`）。1 小時沒有任何一輪同步跑完，不管 interval 設多少
+  都是異常。
+
+**修訂 9（B4）—— 撤銷「Ruling 6 留 backlog」，`_sync_trade_stats` 的節流改
+`guard_now()`；本檔所有計時一律 `guard_now()`。**
+
+- 被撤回的內容：上一輪明文把它留在 backlog（理由是「既有問題、非本 branch 引入，
+  且要動測試 fixture」）。
+- 為什麼撤回：本 branch 花大篇幅論證 `last_sync_time` 必須用 `guard_now()`，理由是
+  「live bot 與 backtester 同行程，`set_clock()` 會把 `now()` 換成歷史 epoch」——
+  同一個理由對 `_last_trade_stats_at` 一字不差成立，把它留在 backlog 等於在同一個
+  檔案裡同時採用兩個互斥的 pattern（違反 dev-rules「衝突處理」）。實際後果：邊實盤
+  邊點回測時，回測期間差值為大負數 ⇒ 每輪 early-return ⇒ 成交統計/已實現盈虧靜默
+  凍結；回測結束 `reset_clock()` 後時間戳卡在歷史 epoch ⇒ 節流永久失效 ⇒ 每 10s
+  打一次 `fetch_my_trades`（`tests/test_trade_stats_sync.py` 明文警告過的「靜默變成
+  6 倍 API 權重」）。
+- 連帶：`tests/test_trade_stats_sync.py` 的 `frozen_clock` fixture 改注入
+  `set_guard_clock`；該檔既有斷言的語意不變（推進的仍然是「節流看到的那個時間」）。
+- 規約寫進 `sync_service.py` 檔頭：本檔所有計時／節流一律 `clock.guard_now()`。
+
+**修訂 10（C1）—— §4 安全約束新增：REST 的 fetch→apply 窗口必須有版本號守衛。**
+
+- 被撤回的內容：`sync_service.py` 檔頭原本宣稱兩條路徑「不會在同一個 symbol 上
+  交錯改狀態」。**那句話在移除 ticker driver 之後是錯的。**
+- 為什麼撤回：symbol lock 只保護 apply 的那一瞬間（鎖內無 await），不保護
+  `fetch → apply` 之間那一整趟 REST round-trip；而 WS handler
+  （`_handle_account_update` / `_handle_order_update`）根本不取 symbol lock。
+  改動前這件事不會發生純粹是因為 `sync_all()` 被 await 在 `_handle_ticker` 內、
+  ws_client 的 recv 迴圈一次只跑一個 handler ⇒ 那個 await 期間沒有任何 handler
+  能執行。搬成獨立 task 之後這個天然序列化消失了。
+  後果會動錢且靜默：成交後 WS 把 `long_position` 寫成 0.02，REST 舊快照蓋回 0 ⇒
+  `_grid_step` 走「無倉位」分支 ⇒ 撤掉剛掛好的網格 + 重新開一次倉；反方向則是
+  掛單計數被寫回非 0 ⇒ `_should_adjust_grid` 回 False ⇒ 該側網格靜默漏掛。
+- 新不變式：`SymbolState.ws_seq`（per-symbol 版本號）。WS handler 每次動持倉/掛單
+  計數就 `+1`（寫入之前遞增，部分寫入也算髒）；`_sync_positions` / `_sync_orders`
+  在 `gateway.call` **之前**抓一份，apply 時**在 symbol lock 內**比對，變了就丟棄
+  **該 symbol** 的快照（不是整輪）並記一行 log，下一輪自然補上。
+- 已考慮並否決：把 fetch 也放進 symbol lock —— 那會讓 `adjust_grid` 的
+  `if lock.locked(): return` 在每次 REST round-trip 期間丟掉所有 tick。
+
+**修訂 11（M6）—— `DailyReporter` 移除 `sync_source` ctor kwarg。**
+
+- 被撤回的內容：`DailyReporter.__init__(..., sync_source=None)`。
+- 為什麼撤回：生產端（`bot.py`）與全部測試都走後置指派（`reporter.sync_source =
+  ...`，與 `reporter.watchdog` 同一個 pattern），那個 kwarg 沒有任何呼叫端 =
+  兩個並存的注入方式，違反 dev-rules「兩個 pattern 互斥時選一個，不混用」。
+  選刪 kwarg 而不是把 `DailyReporter` 的建構搬到 `SyncService` 之後：後者為了
+  形式一致而新增一條硬性建構順序約束，收益為零。
