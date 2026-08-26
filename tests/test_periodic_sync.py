@@ -115,3 +115,82 @@ def test_module_time_helper_still_exists():
     """
     from grid_engine import sync_service
     assert callable(sync_service._time)
+
+
+from grid_engine.sync_service import SYNC_FAILURE_THRESHOLD
+
+
+@pytest.fixture
+def notified(sync):
+    """攔截告警文字。_notify 是同步方法（內部 create_task），直接換掉。"""
+    sent = []
+    sync._notify = lambda msg: sent.append(msg)
+    return sent
+
+
+def test_two_failures_do_not_alert(sync, notified):
+    for _ in range(SYNC_FAILURE_THRESHOLD - 1):
+        sync._evaluate(SyncOutcome(positions_ok=False))
+    assert notified == []
+    assert sync._degraded is False
+
+
+def test_third_failure_alerts_once(sync, notified):
+    for _ in range(SYNC_FAILURE_THRESHOLD):
+        sync._evaluate(SyncOutcome(positions_ok=False))
+    assert len(notified) == 1
+    assert "降級" in notified[0]
+    assert sync._degraded is True
+    assert sync._degraded_total == 1
+
+
+def test_degraded_does_not_repeat_alert(sync, notified):
+    for _ in range(SYNC_FAILURE_THRESHOLD + 5):
+        sync._evaluate(SyncOutcome(account_ok=False))
+    assert len(notified) == 1
+
+
+def test_recovery_alerts_once_and_resets(sync, notified):
+    for _ in range(SYNC_FAILURE_THRESHOLD):
+        sync._evaluate(SyncOutcome(positions_ok=False))
+    sync._evaluate(SyncOutcome())            # 全綠
+    assert len(notified) == 2
+    assert "恢復" in notified[1]
+    assert sync._degraded is False
+    assert sync._consecutive_failures == 0
+    sync._evaluate(SyncOutcome())            # 再全綠不得重發
+    assert len(notified) == 2
+
+
+def test_non_critical_failures_never_alert(sync, notified):
+    """掛單/funding/成交統計失敗只留 log，不進計數——它們失敗不影響交易安全。"""
+    for _ in range(10):
+        sync._evaluate(SyncOutcome(orders_ok=False, funding_ok=False, trade_stats_ok=False))
+    assert notified == []
+    assert sync._consecutive_failures == 0
+
+
+def test_none_and_skipped_do_not_move_counter(sync, notified):
+    """節流未過門檻(None)與 lock 佔用(skipped)不算成功也不算失敗。"""
+    sync._evaluate(SyncOutcome(positions_ok=False))
+    assert sync._consecutive_failures == 1
+    sync._evaluate(None)
+    sync._evaluate(SyncOutcome(skipped=True))
+    assert sync._consecutive_failures == 1   # 沒被推進，也沒被歸零
+    assert notified == []
+
+
+def test_loop_error_counts_as_failure(sync, notified):
+    """loop 級例外也算一次失敗——否則「sync_all 整條炸掉」會完全不計數。"""
+    for _ in range(SYNC_FAILURE_THRESHOLD):
+        sync._evaluate(None, loop_error=True)
+    assert len(notified) == 1
+
+
+def test_alert_text_contains_no_external_data(sync, notified):
+    """告警文案只用常數與數字：notifier 用 parse_mode=HTML，未跳脫的外部資料
+    會壞掉整封訊息，且例外原文可能帶憑證片段。
+    """
+    for _ in range(SYNC_FAILURE_THRESHOLD):
+        sync._evaluate(SyncOutcome(positions_ok=False))
+    assert "<" not in notified[0] and ">" not in notified[0]

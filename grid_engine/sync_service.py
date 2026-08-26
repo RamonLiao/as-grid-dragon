@@ -37,6 +37,10 @@ TRADE_STATS_SINCE_MARGIN_MS = 5_000
 # 超限就停、記 warning，下一輪從已推進的游標續拉（見 security-fix Medium-2）。
 TRADE_STATS_MAX_PAGES_PER_SYNC = 10
 
+# 關鍵項（持倉/帳戶）連續失敗幾輪才告警。3 輪 ≈ 30 秒（sync_interval 預設 10s）：
+# 短到能在一次保證金事件的時間尺度內發出，長到不會被單次 REST 抖動觸發。
+SYNC_FAILURE_THRESHOLD = 3
+
 
 @dataclass(frozen=True)
 class SyncOutcome:
@@ -85,6 +89,12 @@ class SyncService:
         self._last_trade_id: dict = {}
         self._last_trade_since: dict = {}   # 每 symbol 的分頁游標，跨輪持續推進（見 Critical-1 修復）
         self._last_trade_stats_at = 0.0
+        # 週期同步的降級狀態。這三個欄位是「同步有沒有在跑」的唯一儀器——
+        # 驅動源移到常駐 task 後，沒有 tick 可以當不在場證明了。
+        self._stop_event = asyncio.Event()
+        self._consecutive_failures = 0
+        self._degraded = False
+        self._degraded_total = 0    # 自啟動累計，供每日摘要用；永不重置
 
     async def sync_all(self) -> SyncOutcome:
         if self._sync_lock.locked():
@@ -112,6 +122,53 @@ class SyncService:
             self.last_sync_time = clock.guard_now()
             return outcome
         return None
+
+    def _evaluate(self, outcome: Optional[SyncOutcome], loop_error: bool = False):
+        """依一輪結果推進降級狀態並告警。
+
+        只看關鍵項（持倉=風控輸入、帳戶=保證金告警輸入）。None(節流未過) 與
+        skipped(lock 佔用) 既不算成功也不算失敗——把它們當成功會在高頻節流下
+        永遠歸零計數，當失敗則會在正常運作時誤報。
+        """
+        if loop_error:
+            failed = True
+        elif outcome is None or outcome.skipped:
+            return
+        else:
+            failed = not outcome.critical_ok
+
+        if failed:
+            self._consecutive_failures += 1
+            if self._consecutive_failures >= SYNC_FAILURE_THRESHOLD and not self._degraded:
+                self._degraded = True
+                self._degraded_total += 1
+                self._notify(
+                    f"⚠️ REST 同步降級：持倉/帳戶同步連續失敗 "
+                    f"{self._consecutive_failures} 次，風控輸入可能過期"
+                )
+            return
+
+        self._consecutive_failures = 0
+        if self._degraded:
+            self._degraded = False
+            self._notify("✅ REST 同步已恢復")
+
+    def _notify(self, message: str):
+        """告警送出。作法逐字沿用 userdata_watchdog.py 的 _notify：
+
+        存引用防止 task 在執行前被 GC；完成後自移除避免長跑累積；無 event loop
+        時只留 log（不退回 asyncio.run —— 那是純為了讓同步測試能跑而存在的
+        生產程式碼路徑，專案規則 9 禁止兩個 pattern 混用）。
+        """
+        if not self.notifier.enabled:
+            return
+        try:
+            asyncio.get_running_loop()
+            task = asyncio.create_task(self.notifier.send(message))
+            self.tasks.append(task)
+            task.add_done_callback(lambda t: t in self.tasks and self.tasks.remove(t))
+        except RuntimeError:
+            logger.warning(f"[sync] 無 event loop，通知未送出: {message}")
 
     async def _sync_funding_rates(self) -> bool:
         """同步所有交易對的 funding rate。
