@@ -49,20 +49,41 @@ def sync():
 
 
 @pytest.mark.asyncio
-async def test_notifier_send_raising_does_not_kill_loop(sync):
-    """告警自己炸掉不得殺 loop——通知是附屬品，同步才是主體。"""
+async def test_notifier_send_raising_does_not_propagate_into_evaluate(sync):
+    """`_notify()` 用 `asyncio.create_task` 把送信丟成背景 task，不 `await`
+    它——告警失敗必須是那個 detached task 自己的事，不能沿著呼叫鏈冒泡回
+    `_evaluate()`／`run()`。
+
+    這條測試原本（改版前）把 `sync_all` mock 成正常回傳一個失敗的
+    `SyncOutcome`（不拋例外），透過 `run()` 跑幾輪後只斷言
+    `sync._degraded is True`——但 `send()` 的例外從頭到尾發生在 `_notify`
+    `create_task` 出去的那個 task 裡，從未出現在 `run()` 的呼叫堆疊上；就算
+    把 `run()` 的 `except Exception`（`sync_service.py:212`）整段刪掉，這條
+    測試依然綠燈——它驗證的是「這裡不需要守衛」，不是「守衛有效」，等於一條
+    會執行的註解（review Important，2026-08-26）。
+
+    改版：直接呼叫 `_evaluate()`（略過 `run()`），逼它跨過門檻觸發
+    `_notify()` → `notifier.send()` 拋例外。真正的守衛對象是 `_notify` 內的
+    `create_task`（`sync_service.py:172`），不是 `run()` 的 `except Exception`
+    ——後者只是剛好也會接住任何例外，蓋掉這條測試真正該驗的訊號，所以改版
+    刻意繞過它。鑑別力：若把 `create_task` 換成直接 `await
+    self.notifier.send(message)`（連帶把 `_notify`/`_evaluate` 改成 async），
+    `send()` 的 `RuntimeError` 會在下面 for 迴圈內的 `_evaluate()` 呼叫處直接
+    冒出，測試會在該行掛掉（不是斷言失敗，是例外讓測試本身出錯）——已用這個
+    mutation 實際跑過一次驗證為紅，跑完已還原（見 task-7-report.md 附錄）。
+    """
     sync.notifier.bot_token = "t"
     sync.notifier.chat_id = "c"
     sync.notifier.send = AsyncMock(side_effect=RuntimeError("telegram down"))
-    sync.config.sync_interval = 0.01
-    sync.sync_all = AsyncMock(return_value=SyncOutcome(positions_ok=False))
 
-    task = asyncio.create_task(sync.run())
-    await asyncio.sleep(0.15)
-    sync.stop()
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
-    assert sync._degraded is True      # 狀態照樣推進
+    for _ in range(SYNC_FAILURE_THRESHOLD):
+        sync._evaluate(SyncOutcome(positions_ok=False))   # 不應該冒出例外
+
+    assert sync._degraded is True
+    assert sync._degraded_total == 1
+
+    await asyncio.sleep(0.01)   # 讓 create_task 出去的背景 task 真的跑到、真的丟出例外
+    sync.notifier.send.assert_awaited_once()   # 證明例外真的發生過，不是斷言了個沒發生的事
 
 
 @pytest.mark.asyncio
