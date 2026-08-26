@@ -597,6 +597,12 @@ class MaxGridBot:
             logger.error(f"決策日誌寫入失敗 {ccxt_symbol}: {e}")
 
     async def _handle_ticker(self, data: dict):
+        """處理 bookTicker 推送：更新報價、調整網格。
+
+        REST 同步刻意不在這裡驅動：綁在 WS 推送上會讓 bookTicker 一斷就全部
+        靜默停擺（見 docs/superpowers/specs/2026-08-26-periodic-sync-task-design.md）。
+        驅動源是 SyncService.run() 常駐 task，唯一。
+        """
         symbol_raw = data.get('s', '')
         bid = float(data.get('b', 0))
         ask = float(data.get('a', 0))
@@ -621,8 +627,6 @@ class MaxGridBot:
 
                     await self.adjust_grid(ccxt_symbol)
                 break
-
-        await self.sync_service.maybe_sync()
 
     async def _handle_account_update(self, data: dict):
         """處理 ACCOUNT_UPDATE 事件
@@ -797,6 +801,7 @@ class MaxGridBot:
             asyncio.create_task(self.ws_client.run()),
             asyncio.create_task(self.ws_client.keep_alive_loop()),
             asyncio.create_task(self.userdata_watchdog.run()),
+            asyncio.create_task(self.sync_service.run()),
         ])
         if self.notifier.enabled:
             self.tasks.append(asyncio.create_task(self.reporter.run()))
