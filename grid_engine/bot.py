@@ -115,6 +115,7 @@ class MaxGridBot:
             state=self.state, locks=self.locks, notifier=self.notifier,
             risk_monitor=self.risk_monitor, tasks=self.tasks,
             start_time_ms=int(time.time() * 1000),
+            stop_event=self._stop_event,
         )
         # reporter 建構在 sync_service 之前（它不需要 sync_service 才能建），
         # 故與 watchdog 同樣採後置指派，不動既有建構順序。
@@ -792,7 +793,10 @@ class MaxGridBot:
                 ):
                     self._bandit_last_saved_pulls = self.bandit_optimizer.total_pulls
 
-            await self.sync_service.sync_all()
+            # 回傳值必須餵進 _evaluate()：啟動當下 REST 就壞掉（key 被撤、IP 被擋）
+            # 是最該立刻知道的情境，丟掉回傳值等於這一輪完全不計數、還要再等
+            # 3 × sync_interval 才會有第一次計數（見最終 review M1 / Ruling 5）。
+            self.sync_service._evaluate(await self.sync_service.sync_all())
         except Exception as e:
             logger.error(f"[MAX] 初始化失敗: {e}")
             await self.notifier.notify_crash(f"初始化失敗: {e}")

@@ -1,6 +1,17 @@
 """REST 同步組件：持倉/掛單/帳戶/funding（#3 原子區語意原樣搬移）。
 
 鎖序不變式：_sync_lock（本 service 持有）→ symbol lock（共享 SymbolLocks），單向。
+
+⚠️ 這是一條會下單的路徑，不是唯讀的對帳路徑（2026-08-26 週期同步 branch 的
+最終 review 才被指出，spec/plan/七輪 task review 全沒提）：
+`_sync_account()` → `risk_monitor.check_trailing_stop()` → `close_symbol_positions()`
+會送市價平倉單。驅動源從 `_handle_ticker`（跑在 WS recv 迴圈內、與 `adjust_grid`
+天生序列化）改成本檔 `run()` 的獨立 task 之後，**這條下單路徑與 `adjust_grid`
+是真的並行的**。今天安全的理由只有一個：`close_symbol_positions()` 自己會取
+symbol lock，而上面那條鎖序不變式是單向的（`_sync_lock` → symbol lock，沒有
+反向持有），所以兩條路徑不會互卡、也不會在同一個 symbol 上交錯改狀態。
+這是靠既有紀律碰巧成立、不是被設計出來的——寫在這裡是為了讓下一個人在動
+`check_trailing_stop` 的鎖或加新的下單路徑時知道自己踩在什麼上面。
 """
 import asyncio
 from dataclasses import dataclass
@@ -30,9 +41,17 @@ TRADE_STATS_INTERVAL = 60.0     # 與 sync_interval(10s) 解耦，省 API 權重
 # 永久漏抓——同一個 dedup 判準，方向相反的盲點。未處理：同上，trade id 實務上
 # 不會亂跳，機率極低。
 TRADE_STATS_SINCE_MARGIN_MS = 5_000
-# 單一 symbol、單輪 _sync_trade_stats 允許跑的最大分頁頁數。無上限時，這段迴圈跑在
-# ws_client.py 的 recv 迴圈內（handler 例外冒泡=重連是這條路徑唯一的失敗語意，見
-# ws_client.py 檔頭 characterization 註解），停滯期間 ping/watchdog/recv 全部被卡住。
+# 單一 symbol、單輪 _sync_trade_stats 允許跑的最大分頁頁數。
+# 這個上限原本的理由是「這段迴圈 inline 跑在 ws_client 的 recv 迴圈內，停滯期間
+# ping/watchdog/recv 全部被卡住」——2026-08-26 移除 _handle_ticker 的同步呼叫後
+# 那條呼叫鏈已不存在，理由必須重新論證，否則這個生產參數會變成沒有出處的魔數：
+# 現在它擋的是「單輪同步無限期佔住 `_sync_lock`」。這段分頁迴圈跑在 `sync_all()`
+# 的 `async with self._sync_lock` 內；無上限時，一個持續回滿頁的 symbol 會讓這一輪
+# 永遠不結束 ⇒ 鎖永遠不釋放 ⇒ 後續每一輪 `sync_all()` 都走 early-return 回
+# `SyncOutcome(skipped=True)`，而 skipped **刻意不計數**（見 `_evaluate`）⇒ 持倉/
+# 帳戶/保證金告警全部停擺，且降級狀態機一次都不會被推進 = 完全靜默。這正是本
+# branch 要根除的形態，換了個入口重演。（每日摘要的心跳那行是這個情境的最後一道
+# 儀器：`last_sync_time` 只在 `sync_all()` 成功結束時蓋章，卡住就會超過門檻印警告。）
 # 10 頁 = 1 萬筆成交，遠超單輪同步週期(TRADE_STATS_INTERVAL=60s)內合理發生的成交量，
 # 超限就停、記 warning，下一輪從已推進的游標續拉（見 security-fix Medium-2）。
 TRADE_STATS_MAX_PAGES_PER_SYNC = 10
@@ -73,7 +92,7 @@ class SyncOutcome:
 
 class SyncService:
     def __init__(self, gateway, ctx, config, state, locks, notifier, risk_monitor, tasks,
-                 start_time_ms: Optional[int] = None):
+                 start_time_ms: Optional[int] = None, stop_event: Optional[asyncio.Event] = None):
         self.gateway = gateway
         self.ctx = ctx
         self.config = config
@@ -96,7 +115,14 @@ class SyncService:
         self._last_trade_stats_at = 0.0
         # 週期同步的降級狀態。這三個欄位是「同步有沒有在跑」的唯一儀器——
         # 驅動源移到常駐 task 後，沒有 tick 可以當不在場證明了。
-        self._stop_event = asyncio.Event()
+        # 停機事件吃 bot 的共享實例（與 ws_client / userdata_watchdog / reporter 同構）。
+        # 兩個選項之間選這個而不是「在 bot.stop() 補一句 sync_service.stop()」：
+        # 後者只讓 bot.stop() 這一條路徑停得下來，而 bot._stop_event 是全組件的停機
+        # 訊號、不只 bot.stop() 會 set 它——自造私有事件等於「set 了共享停機訊號，
+        # 這條**會下單**的 loop 卻照跑」（今天沒出事只是因為 bot.stop() 剛好還會
+        # task.cancel()，那是巧合不是設計）。給預設值是為了讓直接建構 SyncService
+        # 的測試與工具不必被迫餵一個 Event。
+        self._stop_event = stop_event if stop_event is not None else asyncio.Event()
         self._consecutive_failures = 0
         self._degraded = False
         self._degraded_total = 0    # 自啟動累計，供每日摘要用；永不重置
@@ -110,30 +136,34 @@ class SyncService:
             account_ok = await self._sync_account()
             funding_ok = await self._sync_funding_rates()
             trade_stats_ok = await self._sync_trade_stats()
+        # 心跳蓋章。放在這裡（而不是舊 maybe_sync 的節流分支裡）有兩個理由：
+        # (1) bot.run() 啟動時那次 sync_all() 也會蓋章 ⇒ 心跳從開機就正確；
+        # (2) skipped 的 early-return 走不到這行 ⇒ 「鎖被佔住、實際沒同步」不會
+        #     被誤蓋成一次成功的心跳。這個時戳是每日摘要「同步是不是停擺了」的
+        #     唯一來源（見 reporting._get_sync_status / notifier._format_sync_line）。
+        # 用 guard_now()（牆鐘）而非 now()（情境時鐘）：後者會被 backtester 換成
+        # 歷史 epoch，live 與回測同行程時會讓心跳年齡變成天文數字。
+        self.last_sync_time = clock.guard_now()
         return SyncOutcome(
             positions_ok=positions_ok, orders_ok=orders_ok, account_ok=account_ok,
             funding_ok=funding_ok, trade_stats_ok=trade_stats_ok,
         )
 
-    async def maybe_sync(self) -> Optional[SyncOutcome]:
-        """節流同步。回 None 表示本輪未達門檻（不算成功也不算失敗）。
-
-        計時用 guard_now()（牆鐘）而非 now()（情境時鐘）：後者會被 backtester
-        替換成歷史 epoch，live 與回測同行程時會讓節流判斷錯亂。
-        與價格時效守衛（bot.py:415）用同一個時鐘，語意一致。
-        """
-        if clock.guard_now() - self.last_sync_time > self.config.sync_interval:
-            outcome = await self.sync_all()
-            self.last_sync_time = clock.guard_now()
-            return outcome
-        return None
+    # `maybe_sync()` 已於 2026-08-26 刪除（spec §10 修訂紀錄）。移除 _handle_ticker
+    # 的呼叫後它只剩 run() 一個呼叫端，而 run() 的 asyncio.sleep 本身就是節流器；
+    # 兩者用的還是不同時鐘（sleep = event loop 的 monotonic，節流 = guard_now() 牆鐘），
+    # NTP slew 下 10s sleep 後牆鐘可能只走 9.995s ⇒ 該輪回 None、週期靜默變兩倍，
+    # 而 _evaluate(None) 刻意不計數 ⇒ 不留任何痕跡。第二把閘門不提供保護，只提供
+    # 失效模式，故整個移除，run() 直接呼叫 sync_all()。
 
     def _evaluate(self, outcome: Optional[SyncOutcome], loop_error: bool = False):
         """依一輪結果推進降級狀態並告警。
 
-        只看關鍵項（持倉=風控輸入、帳戶=保證金告警輸入）。None(節流未過) 與
-        skipped(lock 佔用) 既不算成功也不算失敗——把它們當成功會在高頻節流下
-        永遠歸零計數，當失敗則會在正常運作時誤報。
+        只看關鍵項（持倉=風控輸入、帳戶=保證金告警輸入）。skipped(lock 佔用)
+        既不算成功也不算失敗——當成功會讓「鎖被佔住、其實沒同步」洗掉計數，
+        當失敗則會在正常的並發 sync_all() 下誤報。
+        `outcome is None` 只剩 loop_error=True 那條路徑在用（保留 None 的容忍，
+        呼叫端傳 None 而忘了帶 loop_error 時維持「不動計數」的保守語意）。
         """
         if loop_error:
             failed = True
@@ -181,15 +211,26 @@ class SyncService:
         只糾正非法值（非數／NaN／<=0），不夾合法小值——使用者刻意調小
         （例如測試用的 0.01）是合法意圖，只有非法值才需要糾正到
         MIN_SYNC_INTERVAL fallback。
+
+        **本函式必須是 total function（任何輸入都回一個合法秒數，絕不拋例外）**：
+        它被 `run()` 用在 `await asyncio.sleep(self._loop_interval())` 這一整句裡，
+        求值失敗會讓 sleep 根本沒被執行，例外被 loop 的 `except Exception` 接住後
+        立刻進下一輪、再拋 ⇒ 100% CPU 忙迴圈 + 每輪一行 logger.error（實盤引擎會
+        以幾十萬行/秒寫 log）。原本只接 `(TypeError, ValueError)` 擋不住
+        `self.config` 為 None 或 `sync_interval` 屬性消失時的 `AttributeError`
+        （見最終 review I3），故放寬到 `except Exception`。
+        run() 那邊另有一道「本輪沒 sleep 到就補睡」的保險，兩道是刻意重疊的：
+        這裡是「不要製造沒有 sleep 的一輪」，那裡是「就算製造了也不能變忙迴圈」。
         """
         try:
             interval = float(self.config.sync_interval)
-        except (TypeError, ValueError):
-            logger.warning(f"[sync] sync_interval 非數值({self.config.sync_interval!r})，"
-                           f"夾到 {MIN_SYNC_INTERVAL}s")
+        except Exception as e:
+            logger.warning(f"[sync] sync_interval 讀取/轉換失敗({e})，"
+                           f"本輪改用 fallback {MIN_SYNC_INTERVAL}s")
             return MIN_SYNC_INTERVAL
         if math.isnan(interval) or interval <= 0:
-            logger.warning(f"[sync] sync_interval 非法({interval})，夾到 {MIN_SYNC_INTERVAL}s")
+            logger.warning(f"[sync] sync_interval 非法({interval})，"
+                           f"本輪改用 fallback {MIN_SYNC_INTERVAL}s")
             return MIN_SYNC_INTERVAL
         return interval
 
@@ -199,19 +240,33 @@ class SyncService:
         例外一律吞掉續跑：這個 task 一死，REST 同步完全消失（比改動前更糟），
         所以它不能有「因為某次同步炸了就退出」的分支。CancelledError 例外——
         那是 bot.stop() 的收尾訊號，必須讓它穿過去。
+
+        直接呼叫 `sync_all()`，不經節流：這個 sleep 就是節流器，再疊一把用不同
+        時鐘的閘門只會製造靜默漏拍（見上方 maybe_sync 的墓誌銘與 spec §10）。
+
+        `slept` 是 I3 的守衛：`await asyncio.sleep(...)` 求值失敗（例如
+        `self.config` 為 None）時，本輪連 sleep 都沒發生，直接 continue 會變成
+        100% CPU 的忙迴圈。任何走到 `except Exception` 而本輪未曾 sleep 的路徑，
+        都必須先補睡一次 fallback 才允許進下一輪。
         """
         while not self._stop_event.is_set():
+            slept = False
             try:
                 await asyncio.sleep(self._loop_interval())
+                slept = True
                 if self._stop_event.is_set():
                     break
-                outcome = await self.maybe_sync()
-                self._evaluate(outcome)
+                self._evaluate(await self.sync_all())
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"[sync] 週期同步失敗: {e}")
                 self._evaluate(None, loop_error=True)
+                if not slept:
+                    try:
+                        await asyncio.sleep(MIN_SYNC_INTERVAL)
+                    except asyncio.CancelledError:
+                        break
 
     def stop(self):
         self._stop_event.set()
@@ -220,11 +275,19 @@ class SyncService:
         """同步所有交易對的 funding rate。
 
         逐 symbol try/except（與 _sync_orders 同構）：這個方法排在 sync_all() 裡
-        `_sync_trade_stats` **之前**，例外冒泡走的是同一條致命路徑
-        （_handle_ticker → ws_client outer except = 強制重連 ⇒ 失敗持續發生時
-        變成每 5 秒重連一次的永久迴圈，decide() 停擺）。原本它完全沒有 try/except，
-        而 _sync_trade_stats 的外層保險註解卻宣稱「兄弟方法每一個都保證不拋例外」
-        ——那句話當時是假的（見 dual-review C1）。
+        `_sync_trade_stats` **之前**，例外從這裡冒泡會讓後面的子項整批不執行。
+        原本它完全沒有 try/except，而 _sync_trade_stats 的外層保險註解卻宣稱
+        「兄弟方法每一個都保證不拋例外」——那句話當時是假的（見 dual-review C1）。
+
+        失敗路徑已於 2026-08-26 改變（週期同步 branch）：例外原本走
+        `_handle_ticker → ws_client outer except = 強制重連`，失敗持續發生時會變成
+        每 5 秒重連一次的永久迴圈。那條呼叫鏈已不存在——現在例外冒到 `run()` 的
+        `except Exception`，被吞掉、記一行 log、算一次失敗計數後續跑，**不再觸發
+        WS 重連**。所以「別讓例外冒出去」的理由也換了：不是為了避免重連風暴，而是
+        為了讓「一個 symbol 的 funding 讀不到」只降級成 `funding_ok=False`
+        （非關鍵項、不進告警計數）、後面的 `_sync_trade_stats` 照跑，而不是讓
+        整輪 `sync_all()` 從中間斷掉——那會連 `last_sync_time` 的心跳蓋章都跳過，
+        把一次遙測失敗放大成「同步停擺」的誤報。
         """
         if not self.ctx.funding_manager:
             return True
@@ -383,12 +446,18 @@ class SyncService:
             # 兄弟方法（_sync_positions/_sync_orders/_sync_account/_sync_funding_rates）
             # 各自都有整段/逐 symbol 的 try/except（_sync_funding_rates 的那道是
             # dual-review C1 才補上的——在那之前這句註解是假的，例外從那個兄弟方法
-            # 仍然暢通）。例外冒泡的路徑：_handle_ticker → ws_client.py 的 outer
-            # except（檔頭 characterization 註解鎖定的語意：handler 例外=強制重連）
-            # ⇒ 若失敗持續發生，變成每 5 秒重連一次的永久迴圈，decide() 停擺，
-            # 手上還有實倉與掛單（見 security-fix Medium-1）。內層分頁 try/except
-            # 已經處理絕大多數失敗，這層是最後一道保險，不改變內層「整批丟棄/
-            # 單筆跳過」的既有語意。
+            # 仍然暢通）。
+            # 例外冒泡的路徑已於 2026-08-26 改變（週期同步 branch）：原本是
+            # _handle_ticker → ws_client.py 的 outer except（handler 例外=強制重連）
+            # ⇒ 失敗持續發生時變成每 5 秒重連一次的永久迴圈（見 security-fix
+            # Medium-1）。那條呼叫鏈已不存在。現在例外會冒過 sync_all() 的
+            # `async with self._sync_lock`（鎖會正常釋放，這點沒變）到 run() 的
+            # `except Exception`，被吞掉續跑——代價是**中斷本輪 sync_all()**：
+            # `last_sync_time` 不會蓋章、SyncOutcome 不會產生，這一輪只會被記成一次
+            # loop 級失敗（`_evaluate(None, loop_error=True)`）。這層保險存在的理由
+            # 因此變成：不要讓一個遙測項的例外把整輪同步的心跳與逐項成敗一起吃掉。
+            # 內層分頁 try/except 已經處理絕大多數失敗，這層是最後一道保險，不改變
+            # 內層「整批丟棄/單筆跳過」的既有語意。
             logger.error(f"同步成交統計失敗（外層保險，不應常態觸發）: {e}")
             return False
         finally:
@@ -516,10 +585,13 @@ class SyncService:
                         break
                     since = nxt
                     if page_count >= TRADE_STATS_MAX_PAGES_PER_SYNC:
-                        # 這段迴圈 inline 跑在 WS recv 迴圈內（呼叫鏈：ws_client.py
-                        # handler → bot.py maybe_sync → sync_all → 這裡）；無上限會讓
-                        # 單次同步吃光 recv/ping/watchdog 的時間片（見 security-fix
-                        # Medium-2）。已處理的 pending_n/pending_pnl/游標照常在迴圈
+                        # 舊理由（呼叫鏈 ws_client handler → bot.py maybe_sync →
+                        # sync_all → 這裡，無上限會吃光 recv/ping/watchdog 的時間片，
+                        # 見 security-fix Medium-2）已隨 2026-08-26 移除 ticker driver
+                        # 而失效。新理由見 TRADE_STATS_MAX_PAGES_PER_SYNC 的定義處：
+                        # 擋的是「單輪同步無限期佔住 _sync_lock ⇒ 之後每一輪都
+                        # skipped ⇒ 降級狀態機一次都不會被推進 = 完全靜默」。
+                        # 已處理的 pending_n/pending_pnl/游標照常在迴圈
                         # 外套用，下一輪從這裡推進到的 since 續拉，不漏不重。
                         logger.warning(
                             f"{symbol} 成交分頁達單輪上限 {TRADE_STATS_MAX_PAGES_PER_SYNC} "

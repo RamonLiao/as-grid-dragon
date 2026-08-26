@@ -5,7 +5,7 @@
 
 前 5 條對應 task brief（`test_concurrent_run_and_manual_sync_all` 依主 session
 裁定改寫：brief 原斷言 `any(skipped) or all(not skipped)` 對任何輸入恆真，
-換成真正守 lock 語意的三件事）。後 3 條是本輪額外想的極端情境。
+換成真正守 lock 語意的斷言；其中一條裝飾性斷言已於最終 review 的 fix wave 刪除）。後 3 條是本輪額外想的極端情境。
 """
 import asyncio
 from unittest.mock import AsyncMock
@@ -103,9 +103,14 @@ async def test_concurrent_run_and_manual_sync_all(sync):
     輸出、對任何結果恆真，等於一條會執行的註解——不符合「測試要 encode 為
     什麼這行為重要」的規則。這裡改成三件真正重要的事：(1) 五次並發呼叫全部
     正常回傳 SyncOutcome，不拋例外也不回 None；(2) 收尾時鎖未被持有，證明
-    early-return 路徑沒有忘記釋放或死鎖；(3) 被 skip 掉的那幾次 critical_ok
-    必須是 True——skipped 是「沒跑」不是「跑了但失敗」，_evaluate() 用
-    outcome.skipped 短路正是靠這個語意，這裡直接釘住來源。
+    early-return 路徑沒有忘記釋放或死鎖。
+
+    原本還有第三條 `all(r.critical_ok for r in skipped)`（主 session 的
+    pre-flight Ruling 3 要求加的），已於最終 review 的 fix wave 刪除：
+    `SyncOutcome(skipped=True)` 的關鍵欄位預設就是 True，那條對任何輸入恆真，
+    是裝飾性斷言。該語意由 test_periodic_sync.py 的
+    test_none_and_skipped_do_not_move_counter 守住（它驗的是 _evaluate 對
+    skipped 的處理，不是 dataclass 的預設值）。
     """
     sync.config.sync_interval = 0.01
     task = asyncio.create_task(sync.run())
@@ -116,8 +121,6 @@ async def test_concurrent_run_and_manual_sync_all(sync):
 
     assert not sync._sync_lock.locked()
     assert all(isinstance(r, SyncOutcome) for r in results)
-    skipped = [r for r in results if r.skipped]
-    assert all(r.critical_ok for r in skipped)
 
 
 @pytest.mark.asyncio
@@ -151,7 +154,7 @@ async def test_config_interval_changed_at_runtime(sync):
 # --- 以下 3 條是本輪額外想的極端情境，brief 未覆蓋 ---
 
 @pytest.mark.asyncio
-async def test_base_exception_in_maybe_sync_kills_loop(sync):
+async def test_base_exception_in_sync_all_kills_loop(sync):
     """`run()` 只接 `CancelledError` 與 `Exception`（docstring：「例外一律吞掉
     續跑」指的是 Exception），非 Exception 的 BaseException 不在傘下。這條
     釘死現況行為：BaseException 會讓 loop task 帶著例外收工，不是被吞掉續跑。
@@ -165,7 +168,7 @@ async def test_base_exception_in_maybe_sync_kills_loop(sync):
         pass
 
     sync.config.sync_interval = 0.01
-    sync.maybe_sync = AsyncMock(side_effect=Boom("not a subclass of Exception"))
+    sync.sync_all = AsyncMock(side_effect=Boom("not a subclass of Exception"))
 
     task = asyncio.create_task(sync.run())
     with pytest.raises(Boom):
@@ -175,10 +178,15 @@ async def test_base_exception_in_maybe_sync_kills_loop(sync):
 @pytest.mark.asyncio
 async def test_stop_during_inflight_sync_does_not_strand_lock(sync):
     """`stop()` 在 loop 正跑到 `sync_all()` 中途（`_sync_positions` 還沒
-    return）時被呼叫：`_stop_event` 只擋「下一輪要不要開始」，不切斷正在跑
-    的這一輪。這條守：in-flight 的同步必須跑完、`_sync_lock` 必須釋放、
-    loop 必須乾淨收尾——不能因為 stop 訊號跟 in-flight await 疊在一起就把
-    鎖卡死或讓 loop 卡住不退出。
+    return）時被呼叫時會怎樣。
+
+    這條是 **characterization（存檔現況）**，不是在守某個既有守衛——沒有任何
+    一行程式碼是為了「stop 撞上 in-flight sync」而寫的，現況是
+    `_stop_event` 只擋「下一輪要不要開始」、`async with self._sync_lock` 自己
+    保證釋放，兩者疊起來剛好得到這個行為。存檔的內容：in-flight 的同步會跑完、
+    `_sync_lock` 會釋放、loop 會乾淨收尾（無例外退出）。日後若有人改成「stop
+    要中斷 in-flight 那一輪」，這條會紅——那時該做的是重新裁決語意並改這條
+    測試，不是把它當成違反了什麼不變式。
     """
     started = asyncio.Event()
 

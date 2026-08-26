@@ -74,14 +74,6 @@ async def test_sync_all_reports_skipped_when_lock_held(sync):
     sync._sync_positions.assert_not_called()
 
 
-@pytest.mark.asyncio
-async def test_maybe_sync_returns_none_when_throttled(sync):
-    """節流未過門檻回 None——不算成功也不算失敗。"""
-    await sync.maybe_sync()                 # 第一次必過（last_sync_time=0）
-    second = await sync.maybe_sync()         # 立刻再來一次，門檻未過
-    assert second is None
-
-
 @pytest.fixture
 def fake_clock():
     """可推進的假守衛時鐘。注入 set_guard_clock 而非 set_clock：
@@ -98,15 +90,42 @@ def fake_clock():
     clock.reset_guard_clock()
 
 
-@pytest.mark.asyncio
-async def test_maybe_sync_throttle_uses_guard_clock(sync, fake_clock):
-    """節流以守衛時鐘計時：推進時間就該再同步一次。"""
-    first = await sync.maybe_sync()
-    assert first is not None
-    assert await sync.maybe_sync() is None          # 門檻未過
+def test_maybe_sync_is_gone(sync):
+    """`maybe_sync()` 已刪除（spec §10 修訂紀錄）：loop 的 sleep 已經是節流器，
+    第二把用不同時鐘的閘門只提供失效模式；移除 ticker driver 後它也沒有其他
+    呼叫端。這條擋「有人為了相容又把它加回來」——加回來就會有人去呼叫它。
+    """
+    assert not hasattr(sync, "maybe_sync")
 
-    fake_clock(sync.config.sync_interval + 1)
-    assert await sync.maybe_sync() is not None      # 過門檻
+
+@pytest.mark.asyncio
+async def test_sync_all_stamps_heartbeat(sync, fake_clock):
+    """`sync_all()` 成功結束才蓋章。這個時戳是每日摘要判斷「同步是不是整條
+    停擺」的唯一來源（notifier._format_sync_line 的心跳分支），蓋章沒發生
+    等於那道儀器永遠讀到 0。用 guard_now()（牆鐘）而非 now()（情境時鐘）。
+    """
+    assert sync.last_sync_time == 0
+    await sync.sync_all()
+    assert sync.last_sync_time == clock.guard_now()
+
+    fake_clock(123.0)
+    await sync.sync_all()
+    assert sync.last_sync_time == clock.guard_now()
+
+
+@pytest.mark.asyncio
+async def test_skipped_sync_all_does_not_stamp_heartbeat(sync, fake_clock):
+    """鎖被佔住的 early-return 不得蓋章：那一輪根本沒同步，蓋了就是把
+    「卡住」偽裝成「剛同步過」，心跳儀器直接失效。
+    """
+    fake_clock(0)                       # 進假時鐘，確保 last_sync_time 可辨識
+    await sync.sync_all()
+    stamped = sync.last_sync_time
+    fake_clock(600.0)
+    async with sync._sync_lock:
+        outcome = await sync.sync_all()
+    assert outcome.skipped is True
+    assert sync.last_sync_time == stamped
 
 
 def test_module_time_helper_still_exists():
@@ -171,7 +190,9 @@ def test_non_critical_failures_never_alert(sync, notified):
 
 
 def test_none_and_skipped_do_not_move_counter(sync, notified):
-    """節流未過門檻(None)與 lock 佔用(skipped)不算成功也不算失敗。"""
+    """None（呼叫端沒帶 loop_error 的保守路徑）與 lock 佔用(skipped) 都不算
+    成功也不算失敗。skipped 尤其重要：把「鎖被佔住、其實沒同步」算成一次
+    成功，會讓卡死的那一輪反而把失敗計數清零。"""
     sync._evaluate(SyncOutcome(positions_ok=False))
     assert sync._consecutive_failures == 1
     sync._evaluate(None)
@@ -274,3 +295,59 @@ def test_loop_interval_clamps_illegal_values(sync, bad):
 def test_loop_interval_respects_legal_small_value(sync):
     sync.config.sync_interval = 2.5
     assert sync._loop_interval() == 2.5
+
+
+class _BrokenConfig:
+    """`self.config` 壞掉的最小重現：屬性存取直接拋 AttributeError。
+
+    生產上等價於 config 物件被換掉／欄位被移除；重點是那個例外**不是**
+    TypeError/ValueError，原版 `_loop_interval` 的 except 接不到它。
+    """
+    @property
+    def sync_interval(self):
+        raise AttributeError("sync_interval 不見了")
+
+
+@pytest.mark.asyncio
+async def test_broken_config_does_not_busy_loop(sync):
+    """config 壞掉時 loop 不得變成沒有 sleep 的忙迴圈（review I3）。
+
+    `await asyncio.sleep(self._loop_interval())` 整句在 try 內：`_loop_interval()`
+    求值失敗 ⇒ sleep 根本沒被執行 ⇒ 例外被 loop 的 except Exception 接住 ⇒
+    立刻下一輪 ⇒ 再拋 ⇒ 100% CPU、每輪一行 logger.error（實盤會以幾十萬行/秒
+    寫 log）。
+
+    鑑別力：`_loop_interval` 的 `except Exception` 縮回 `(TypeError, ValueError)`
+    時，AttributeError 逃出去，這個 0.3 秒窗口內會累積上萬次迭代，下面的
+    `<= 2` 立刻紅。有限窗口內斷言迭代次數上限，是「沒有 sleep 的一輪」唯一
+    測得到的可觀測後果。
+    """
+    sync.config = _BrokenConfig()
+    task = asyncio.create_task(sync.run())
+    await asyncio.sleep(0.3)
+    sync.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    # 每輪至少睡 MIN_SYNC_INTERVAL(1.0s) ⇒ 0.3s 內最多推進一次計數
+    assert sync._consecutive_failures <= 2
+
+
+@pytest.mark.asyncio
+async def test_loop_interval_raising_does_not_busy_loop(sync):
+    """同上，但直接讓 `_loop_interval()` 拋例外——守的是 run() 裡那道
+    「本輪沒 sleep 到就補睡 MIN_SYNC_INTERVAL」的保險本身。
+
+    兩道防禦是刻意重疊的：`_loop_interval` 變成 total function 是「不要製造
+    沒有 sleep 的一輪」，這裡守的是「就算製造了也不能變忙迴圈」。拿掉 run()
+    裡 `if not slept:` 那段，這條會在 0.3 秒內累積上萬次迭代而紅。
+    """
+    def boom():
+        raise RuntimeError("interval 炸了")
+
+    sync._loop_interval = boom
+    task = asyncio.create_task(sync.run())
+    await asyncio.sleep(0.3)
+    sync.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert sync._consecutive_failures <= 2
