@@ -313,17 +313,64 @@ class TelegramNotifier:
           告警發過就過去了，「今天出過事」只有這裡看得到。
         計數口徑是「自啟動累計」不是「今日」——引擎重啟頻繁，自造的日增量
         會隨重啟歸零，比誠實累計更誤導（與 _format_stale_quote_line 同裁決）。
+
+        **心跳優先於上面三種狀態**（最終 review I1）：degraded/degraded_total 是
+        由 SyncService.run() 推進的，run() 本身死掉／從未被建立時它們永遠是
+        False/0 ⇒ 「同步整條停擺」與「一切正常」的輸出逐字元相同，正是這條
+        branch 要根除的形態。last_sync_age 是唯一由「同步真的跑完」推進的量，
+        超過門檻就**無條件**印警告，蓋掉其他分支。門檻 max(60, 6*interval)：
+        6 輪的餘裕吸收得掉單次 REST 抖動與重試，60s 的地板擋住 interval 被設得
+        極小時（測試用 0.01）門檻跟著塌成毫秒級的誤報。
+
+        壞欄位一律降級成保守文案、不整行消失（#7）：`int(None)` 讓整行回 ""
+        等於「降級中的警告被一個型別錯吞掉」——fail-silent 換個位置重演。
+        與 _format_stale_quote_line 的既有裁決一致：主訊號不能因為附加數字讀
+        不到就掉。
         """
         if not isinstance(sync, dict):
             return ""
+
+        # 心跳。鍵缺席（舊呼叫端／reporter 的心跳讀取降級）才跳過這一段，
+        # 缺席不等於健康，所以只是退回舊行為、不假裝正常。
+        if "last_sync_age" in sync:
+            age = sync.get("last_sync_age")
+            if age is None:
+                return "⚠️ <b>REST 同步停擺</b>：自啟動以來從未完成任何一輪同步\n"
+            try:
+                age = float(age)
+                interval = float(sync.get("sync_interval", 0) or 0)
+            except Exception:
+                return "⚠️ <b>REST 同步</b>：心跳讀取異常，請查 log\n"
+            # NaN 的任何比較都是 False（會靜默穿過門檻判斷），±inf 會印出
+            # 「距上次同步 inf 分鐘」——兩者都當成心跳異常處理，不放行。
+            if not (float("-inf") < age < float("inf")):
+                return "⚠️ <b>REST 同步</b>：心跳讀取異常，請查 log\n"
+            if age < 0:
+                # 牆鐘往回跳（NTP step / 手動改時間）。沿用 bot._note_stale_quote
+                # 對同一件事的態度：不把它當成「剛同步過」而讓這行消失，重新錨定
+                # 成「時距不可信」的告警——時鐘回跳本身就會讓同步靜默停擺整個跳幅。
+                return "⚠️ <b>REST 同步</b>：偵測到時鐘後跳，同步時距不可信，請查 log\n"
+            if not (0.0 <= interval < float("inf")):    # NaN / 負 / inf 一律不參與門檻
+                interval = 0.0
+            if age > max(60.0, 6.0 * interval):
+                return f"⚠️ <b>REST 同步停擺</b>：距上次同步 {age / 60:.0f} 分鐘\n"
+
+        degraded = bool(sync.get("degraded"))
         try:
-            degraded = bool(sync.get("degraded"))
             failures = int(sync.get("consecutive_failures", 0))
+        except Exception:
+            failures = None
+        try:
             total = int(sync.get("degraded_total", 0))
         except Exception:
-            return ""
+            total = None
+
         if degraded:
+            if failures is None:
+                return "⚠️ <b>REST 同步</b>：降級中（連續失敗次數異常，請查 log）\n"
             return f"⚠️ <b>REST 同步</b>：降級中（連續失敗 {failures} 次）\n"
+        if total is None:
+            return "⚠️ <b>REST 同步</b>：降級累計數異常，請查 log\n"
         if total > 0:
             return f"✅ REST 同步：正常（自啟動曾降級 {total} 次）\n"
         return ""
