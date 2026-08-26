@@ -10,13 +10,14 @@ _WATCHDOG_VALID_STATES = ("healthy", "degraded", "given_up")
 
 class DailyReporter:
     def __init__(self, config, state, notifier, stop_event: asyncio.Event, watchdog=None,
-                 stale_quote_source=None):
+                 stale_quote_source=None, sync_source=None):
         self.config = config
         self.state = state
         self.notifier = notifier
         self._stop_event = stop_event
         self.watchdog = watchdog
         self.stale_quote_source = stale_quote_source
+        self.sync_source = sync_source
 
     def _get_watchdog_status(self):
         """讀取 watchdog 狀態供每日摘要顯示。
@@ -78,6 +79,24 @@ class DailyReporter:
             logger.warning(f"[reporter] 價格過期最近時戳讀取失敗，摘要略過該欄位: {e}")
         return summary
 
+    def _get_sync_status(self):
+        """讀 SyncService 的降級狀態供每日摘要顯示。
+
+        硬性要求同 _get_watchdog_status：任何例外都在這裡吞掉降級成「不顯示
+        該行」，不得讓整封摘要發不出去。純讀，不呼叫任何會改變狀態的方法。
+        """
+        if self.sync_source is None:
+            return None
+        try:
+            return {
+                "degraded": bool(self.sync_source._degraded),
+                "consecutive_failures": int(self.sync_source._consecutive_failures),
+                "degraded_total": int(self.sync_source._degraded_total),
+            }
+        except Exception as e:
+            logger.warning(f"[reporter] 同步狀態讀取失敗，摘要跳過該行: {e}")
+            return None
+
     def _collect_positions(self) -> dict:
         """組持倉快照。單一標的的狀態壞掉（屬性缺失、數值型別錯）只能讓那一個
         標的消失，不得讓整封每日摘要發不出去——run() 的外層 except 是 sleep(60)
@@ -136,6 +155,7 @@ class DailyReporter:
                     "running_hours": running_hours,
                     "watchdog": self._get_watchdog_status(),
                     "stale_quotes": self._get_stale_quote_summary(),
+                    "sync": self._get_sync_status(),
                 }
                 await self.notifier.notify_daily_pnl(pnl_data)
             except asyncio.CancelledError:

@@ -116,6 +116,9 @@ class MaxGridBot:
             risk_monitor=self.risk_monitor, tasks=self.tasks,
             start_time_ms=int(time.time() * 1000),
         )
+        # reporter 建構在 sync_service 之前（它不需要 sync_service 才能建），
+        # 故與 watchdog 同樣採後置指派，不動既有建構順序。
+        self.reporter.sync_source = self.sync_service
         # WS 純傳輸組件（handlers 引用 bot bound method，callback 不包 try——
         # ticker 例外必須冒泡到 WsClient 重連迴圈）
         self.ws_client = WsClient(

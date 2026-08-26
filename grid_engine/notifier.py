@@ -199,6 +199,7 @@ class TelegramNotifier:
 
         watchdog_line = self._format_watchdog_line(pnl_data.get("watchdog"))
         stale_line = self._format_stale_quote_line(pnl_data.get("stale_quotes"))
+        sync_line = self._format_sync_line(pnl_data.get("sync"))
 
         msg = (
             f"{icon} <b>每日損益摘要</b>\n"
@@ -210,6 +211,7 @@ class TelegramNotifier:
             f"運行: {running_hours:.1f} 小時\n"
             f"{watchdog_line}"
             f"{stale_line}"
+            f"{sync_line}"
             f"\n<b>持倉概況:</b>\n{pos_text}"
         )
         await self.send(msg)
@@ -296,6 +298,35 @@ class TelegramNotifier:
         except Exception:
             last_part = ""  # 附加資訊，讀不到就不帶，不影響主訊號
         return f"⚠️ <b>價格快照過期</b>：累計 {total} 次跳過網格調整（自啟動）{last_part}\n"
+
+    @staticmethod
+    def _format_sync_line(sync) -> str:
+        """REST 同步狀態那一行。
+
+        安全要求同 _format_watchdog_line：文案是這裡自己定義的常數，不把外部
+        資料未跳脫插進 HTML 訊息（parse_mode=HTML）。
+
+        三種狀態、兩種省略：
+        - 非 dict（含 None）⇒ 整行省略；
+        - 正常且自啟動從未降級 ⇒ 整行省略（不加噪音）；
+        - 正常但曾降級 ⇒ 顯示累計次數。這是摘要唯一能講、即時告警講不了的事：
+          告警發過就過去了，「今天出過事」只有這裡看得到。
+        計數口徑是「自啟動累計」不是「今日」——引擎重啟頻繁，自造的日增量
+        會隨重啟歸零，比誠實累計更誤導（與 _format_stale_quote_line 同裁決）。
+        """
+        if not isinstance(sync, dict):
+            return ""
+        try:
+            degraded = bool(sync.get("degraded"))
+            failures = int(sync.get("consecutive_failures", 0))
+            total = int(sync.get("degraded_total", 0))
+        except Exception:
+            return ""
+        if degraded:
+            return f"⚠️ <b>REST 同步</b>：降級中（連續失敗 {failures} 次）\n"
+        if total > 0:
+            return f"✅ REST 同步：正常（自啟動曾降級 {total} 次）\n"
+        return ""
 
     async def notify_risk_alert(self, alert: str):
         """風控警報"""

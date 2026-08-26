@@ -64,3 +64,8 @@ def test_bot_run_creates_sync_task():
     """
     src = inspect.getsource(MaxGridBot.run)
     assert "self.sync_service.run()" in src
+
+
+def test_reporter_sync_source_is_wired(bot):
+    """後置指派容易漏——漏了摘要那行永遠不出現，而且不會有人發現。"""
+    assert bot.reporter.sync_source is bot.sync_service
