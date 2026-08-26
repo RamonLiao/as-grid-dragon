@@ -317,10 +317,15 @@ async def test_broken_config_does_not_busy_loop(sync):
     立刻下一輪 ⇒ 再拋 ⇒ 100% CPU、每輪一行 logger.error（實盤會以幾十萬行/秒
     寫 log）。
 
-    鑑別力：`_loop_interval` 的 `except Exception` 縮回 `(TypeError, ValueError)`
-    時，AttributeError 逃出去，這個 0.3 秒窗口內會累積上萬次迭代，下面的
-    `<= 2` 立刻紅。有限窗口內斷言迭代次數上限，是「沒有 sleep 的一輪」唯一
-    測得到的可觀測後果。
+    鑑別力（實測過，不是推理）：斷言的是 `_consecutive_failures == 0`，不是
+    「次數上限」。理由是這裡有兩道重疊的防禦，只挑一道拿掉的話另一道會接住：
+    - 只把 `_loop_interval` 的 `except Exception` 縮回 `(TypeError, ValueError)`：
+      AttributeError 逃出去 → run() 的 `except Exception` 接住 → `slept` 為 False
+      → 補睡 1.0s ⇒ **不會**變成忙迴圈，但會被記成一次 loop 級失敗
+      ⇒ `_consecutive_failures` 變 1 ⇒ 這一行紅。這正是「config 壞掉該在
+      `_loop_interval` 就被吸收成 fallback，不該冒充成一次同步失敗」的語意。
+    - 兩道一起拿掉：0.3 秒內累積上萬次迭代，同一行以更誇張的數字紅。
+    （只拿掉 `slept` 那道由下一條測試守。）
     """
     sync.config = _BrokenConfig()
     task = asyncio.create_task(sync.run())
@@ -328,8 +333,8 @@ async def test_broken_config_does_not_busy_loop(sync):
     sync.stop()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
-    # 每輪至少睡 MIN_SYNC_INTERVAL(1.0s) ⇒ 0.3s 內最多推進一次計數
-    assert sync._consecutive_failures <= 2
+    assert sync._consecutive_failures == 0
+    sync._sync_positions.assert_not_called()   # fallback 1.0s > 窗口，本來就不該同步到
 
 
 @pytest.mark.asyncio
@@ -338,10 +343,24 @@ async def test_loop_interval_raising_does_not_busy_loop(sync):
     「本輪沒 sleep 到就補睡 MIN_SYNC_INTERVAL」的保險本身。
 
     兩道防禦是刻意重疊的：`_loop_interval` 變成 total function 是「不要製造
-    沒有 sleep 的一輪」，這裡守的是「就算製造了也不能變忙迴圈」。拿掉 run()
-    裡 `if not slept:` 那段，這條會在 0.3 秒內累積上萬次迭代而紅。
+    沒有 sleep 的一輪」，這裡守的是「就算製造了也不能變忙迴圈」。
+
+    測法：數 `_loop_interval` 被呼叫幾次。有補睡時，0.3 秒的窗口內最多一次
+    （每輪至少睡 MIN_SYNC_INTERVAL=1.0s）；沒有補睡時，run() 這一輪完全沒有
+    await，event loop 被**完全餓死**（連測試自己的 `await asyncio.sleep(0.3)`
+    都永遠不會恢復），所以不能靠時間窗口收尾——`_ESCAPE_AFTER` 那道逃生門
+    存在的唯一理由就是讓 mutation 下這條測試**紅**而不是**hang**。
+    鑑別力（實測過）：拿掉 run() 裡 `if not slept:` 那段，calls 會在一瞬間衝到
+    逃生門的 51，下面的 `<= 2` 立刻紅。
     """
+    _ESCAPE_AFTER = 50
+    calls = {"n": 0}
+
     def boom():
+        calls["n"] += 1
+        if calls["n"] > _ESCAPE_AFTER:
+            sync.stop()          # 逃生門：忙迴圈餓死 event loop，只能從裡面自己踩煞車
+            return 0.01
         raise RuntimeError("interval 炸了")
 
     sync._loop_interval = boom
@@ -350,4 +369,4 @@ async def test_loop_interval_raising_does_not_busy_loop(sync):
     sync.stop()
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
-    assert sync._consecutive_failures <= 2
+    assert calls["n"] <= 2
