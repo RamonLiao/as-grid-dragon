@@ -118,7 +118,9 @@ class DailyReporter:
             # 現在在 bot.run() 啟動時就會蓋章，摘要發送時（最快也是啟動後數小時）
             # 還停在 0 本身就代表沒有任何一輪同步成功結束過。
             status["last_sync_age"] = None if last <= 0 else clock.guard_now() - last
-            # 停擺門檻由 formatter 算（max(60, 6*interval)），但 interval 要在這裡
+            # 停擺門檻由 formatter 算（min(max(60, 6*interval), 3600)——上限是
+            # dual-review B3 補的，擋 interval 被設成巨大有限值時門檻大到永不
+            # 告警），但 interval 要在這裡
             # 取——formatter 是 staticmethod，不得去讀全域狀態。用 _loop_interval()
             # 而非裸讀 config.sync_interval：它是 total function，非法設定值也回得出
             # 一個合法秒數，且純讀不改狀態。

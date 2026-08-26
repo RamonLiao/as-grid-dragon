@@ -29,6 +29,22 @@ symbol lock 只保護 apply 的那一瞬間（鎖內無 await），**不保護 f
 刻意不採「把 fetch 也放進 symbol lock」：那會讓 `adjust_grid` 的
 `if lock.locked(): return` 在每次 REST round-trip 期間丟掉所有 tick。
 
+⚠️ **帳戶層（`_sync_account`）刻意不設同型的守衛**（2026-08-26 re-review 裁定）。
+它有一模一樣的 fetch→apply 競態：`bot._handle_account_update` 可以在
+`fetch_balance` 的 round-trip 內把 `AccountBalance.wallet_balance` 寫成新值，
+接著 REST 的舊快照蓋回去。不設防的理由，是這個競態在**所有 consumer** 上都無害：
+  - `wallet_balance` / `AccountBalance.unrealized_pnl` 的讀者只有 `ui.py`、
+    `reporting.py`、`notifier.py`——全部只是顯示。
+  - 會下單/會做判斷的三個組件都不讀帳戶餘額：`risk_monitor` 讀
+    `state.margin_usage` 與 **`SymbolState`.unrealized_pnl**（symbol 層，有守衛）、
+    `order_executor` 與 `decision` 完全不碰。
+  - 而且它自癒：下一輪（預設 10s）沒有 WS 撞進來就寫回真值，沒有像 symbol 層
+    那樣「錯一次就一路錯下去」的分岔（symbol 層的 `long_position == 0` 會讓
+    `_grid_step` 撤單重開倉、假的 `unrealized_pnl` 會觸發追蹤止盈的市價平倉）。
+這段話存在的唯一目的：讓下一個讀者看到「`_sync_positions` 有守衛、`_sync_account`
+沒有」時知道那是裁定，不是遺漏。**若哪天有會下單或會做風控判斷的路徑開始讀
+`AccountBalance`，這個裁定即刻失效，必須補上同型守衛。**
+
 規約：**本檔所有計時／節流一律用 `clock.guard_now()`，不用 `clock.now()`**
 （2026-08-26 dual-review B4）。`now()` 是情境時鐘，backtester 每根 K 線用
 `set_clock()` 把它換成歷史 epoch，而 live bot 與回測跑在同一個行程——混用會讓
@@ -81,6 +97,18 @@ TRADE_STATS_MAX_PAGES_PER_SYNC = 10
 # 關鍵項（持倉/帳戶）連續失敗幾輪才告警。3 輪 ≈ 30 秒（sync_interval 預設 10s）：
 # 短到能在一次保證金事件的時間尺度內發出，長到不會被單次 REST 抖動觸發。
 SYNC_FAILURE_THRESHOLD = 3
+
+# 同一個 symbol 的 REST 快照被 ws_seq 守衛**連續**丟棄幾輪才記 warning。
+# 為什麼需要這條儀器：「快照永遠被丟棄」是 C1 守衛引進的一種**新的靜默停擺**——
+# 該 symbol 的持倉/掛單從此只由 WS 維護、REST 對帳完全失效，而 sync_all() 仍然
+# 回 True、心跳照蓋、降級狀態機一次都不會被推進。狀態機與心跳都看不見它。
+# 刻意**不**推降級計數（`_evaluate`）：丟棄是設計中的正常結果，WS 活躍期本來就會
+# 發生，拿它去推狀態機會在最健康的時候誤報降級並送 Telegram。
+# N = 6（≈ 60 秒 @ sync_interval 預設 10s）：與 SYNC_FAILURE_THRESHOLD 同量級，
+# 取 2 倍是因為兩者的偽陽性成本不對稱——REST 失敗是異常，丟棄是設計中的正常結果
+# （一次成交、一次資金費結算都會造成 1~2 輪丟棄），門檻必須高到讓一次 WS 事件叢集
+# 不會出聲，又低到在一分鐘內就能點出「這個 symbol 的 REST 對帳已經被餓死」。
+SNAPSHOT_DISCARD_WARN_THRESHOLD = 6
 
 # 非法 sync_interval（非數／NaN／±inf／<=0）的 fallback 值。**不是下限**：
 # 使用者刻意調小的合法值（例如測試用的 0.01）不受這個常數限制，
@@ -154,6 +182,10 @@ class SyncService:
         self._consecutive_failures = 0
         self._degraded = False
         self._degraded_total = 0    # 自啟動累計，供每日摘要用；永不重置
+        # ws_seq 守衛的連續丟棄計數，key = (kind, symbol)，kind ∈ {"持倉", "掛單"}。
+        # 兩種快照分開計數：它們是兩道獨立的守衛，掛單被餓死與持倉被餓死是不同的
+        # 故障（前者讓網格漏掛，後者讓風控吃過期持倉），混在一起會互相稀釋。
+        self._discard_streak: dict = {}
 
     async def sync_all(self) -> SyncOutcome:
         if self._sync_lock.locked():
@@ -215,6 +247,27 @@ class SyncService:
         if self._degraded:
             self._degraded = False
             self._notify("✅ REST 同步已恢復")
+
+    def _record_discard(self, kind: str, symbol: str):
+        """ws_seq 守衛丟棄了一份快照：推進連續計數，跨門檻就記一行 warning。
+
+        只記 log、**不碰降級狀態機**（理由見 SNAPSHOT_DISCARD_WARN_THRESHOLD）。
+        跨門檻後每再滿 N 輪才印一次（N、2N、3N…），而不是「只印一次」也不是
+        「每輪都印」：只印一次的話，一個永久被餓死的 symbol 在整個引擎生命週期
+        裡只留下一行、之後完全無跡可循；每輪都印則會在實盤把 log 洗掉。
+        """
+        streak = self._discard_streak.get((kind, symbol), 0) + 1
+        self._discard_streak[(kind, symbol)] = streak
+        if streak % SNAPSHOT_DISCARD_WARN_THRESHOLD == 0:
+            logger.warning(
+                f"[sync] {symbol} {kind}快照已連續 {streak} 輪被 WS 版本守衛丟棄——"
+                f"該 symbol 的 REST 對帳實質停擺（狀態仍由 WS 維護），"
+                f"請確認 WS 事件密度是否異常"
+            )
+
+    def _record_snapshot_applied(self, kind: str, symbol: str):
+        """快照成功寫入 ⇒ 連續計數歸零（用 pop 避免字典無限長大）。"""
+        self._discard_streak.pop((kind, symbol), None)
 
     def _notify(self, message: str):
         """告警送出。作法逐字沿用 userdata_watchdog.py 的 _notify：
@@ -409,10 +462,12 @@ class SyncService:
                     # 餓死（每 symbol 每輪至多一行，不會洗版）。
                     logger.info(f"[sync] {symbol} 持倉快照過期（WS 在 fetch 期間更新），"
                                 f"本輪丟棄，下一輪重取")
+                    self._record_discard("持倉", symbol)
                     continue
                 st.long_position = long_pos
                 st.short_position = short_pos
                 st.unrealized_pnl = upnl
+                self._record_snapshot_applied("持倉", symbol)
         return True
 
     async def _sync_orders(self) -> bool:
@@ -455,9 +510,11 @@ class SyncService:
                         # 也走這條：沒有 before 可比就不敢蓋。
                         logger.info(f"[sync] {symbol} 掛單快照過期（WS 在 fetch 期間更新），"
                                     f"本輪丟棄，下一輪重取")
+                        self._record_discard("掛單", symbol)
                         continue
                     state.buy_long_orders, state.sell_long_orders, \
                         state.buy_short_orders, state.sell_short_orders = counts
+                    self._record_snapshot_applied("掛單", symbol)
             except Exception as e:
                 logger.error(f"同步 {symbol} 掛單失敗: {e}")
                 ok = False

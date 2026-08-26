@@ -658,41 +658,65 @@ class MaxGridBot:
 
                     logger.info(f"[userData] {asset} 錢包餘額更新: {wallet_balance:.2f}")
 
-            # ws_seq 在**任何寫入之前**遞增，且涵蓋所有 symbol：下面這個迴圈本身
-            # 就會把每個 symbol 的 unrealized_pnl 歸零（不只 P 陣列裡有的那些），
-            # 所以「這次 ACCOUNT_UPDATE 動到哪些 symbol」的答案是「全部」。
-            # 先遞增再寫入，是為了讓「寫到一半拋例外」的部分寫入也一樣被 REST 端
-            # 判定成髒（保守方向：寧可丟掉一輪 REST 快照，不要蓋掉新資料）。
-            # 這一整個 handler 內沒有 await，遞增與寫入對 event loop 是原子的。
-            for sym_state in self.state.symbols.values():
-                sym_state.ws_seq += 1
-                sym_state.unrealized_pnl = 0
-
+            # ⚠️ ACCOUNT_UPDATE 的 P 陣列是**增量**，不是全量快照：Binance 只帶
+            # 「這次事件有變動的」持倉。FUNDING_FEE 事件甚至完全沒有 P。
+            # 所以這裡**不得**把 P 以外的 symbol 的 unrealized_pnl 歸零——那是
+            # 2026-08-26 之前就存在的錯誤，只是當時下一輪 REST 快照會把假的 0
+            # 治回來；C1 的 ws_seq 守衛（會丟棄「WS 動過的 symbol」的 REST 快照）
+            # 把它從潛伏變成**活的**：該 symbol 永遠停在 upnl=0 ⇒
+            # risk_monitor.check_trailing_stop() 看到 drawdown = peak - 0 超過門檻
+            # ⇒ 對一個健康的倉位送出市價平倉單。
+            #
+            # 先解析出「本次事件真正碰到哪些 symbol」，才決定要動誰的 ws_seq。
+            # 這一整個 handler 內沒有 await，解析/遞增/寫入對 event loop 是原子的。
             positions = account_data.get('P', [])
+            resolved = []           # [(ccxt_symbol, pos), ...] 保持 P 的原順序
+            touched = []            # 去重後的 symbol 清單（順序無關，只用來遞增 seq）
             for pos in positions:
                 symbol_raw = pos.get('s', '')
-                position_amt = float(pos.get('pa', 0) or 0)
-                unrealized_pnl = float(pos.get('up', 0) or 0)
-                position_side = pos.get('ps', '')
-
                 ccxt_symbol = None
                 for cfg in self.config.symbols.values():
                     if cfg.symbol == symbol_raw:
                         ccxt_symbol = cfg.ccxt_symbol
                         break
-
                 if ccxt_symbol and ccxt_symbol in self.state.symbols:
-                    sym_state = self.state.symbols[ccxt_symbol]
+                    resolved.append((ccxt_symbol, pos))
+                    if ccxt_symbol not in touched:
+                        touched.append(ccxt_symbol)
 
-                    if position_side == 'LONG':
-                        sym_state.long_position = abs(position_amt)
-                    elif position_side == 'SHORT':
-                        sym_state.short_position = abs(position_amt)
+            # ws_seq 在**任何寫入之前**遞增，且只涵蓋本次事件會動到的 symbol。
+            # 先遞增再寫入，是為了讓「寫到一半拋例外」的部分寫入也一樣被 REST 端
+            # 判定成髒（保守方向：寧可丟掉一輪 REST 快照，不要蓋掉新資料）。
+            for ccxt_symbol in touched:
+                self.state.symbols[ccxt_symbol].ws_seq += 1
 
+            # 同一個 symbol 在單一事件內可能出現 LONG/SHORT 兩筆，兩筆的 up 要
+            # 相加才是這個 symbol 的浮盈。但也不能單純 `+=` 到舊值上——那會在
+            # 每次事件把新浮盈疊到上一次的浮盈上、無限累加。正確語意是「以本次
+            # 事件為單位」：第一次碰到這個 symbol 時**覆寫**（等於先歸零再加），
+            # 之後的同 symbol 條目才累加。
+            seen = set()
+            for ccxt_symbol, pos in resolved:
+                position_amt = float(pos.get('pa', 0) or 0)
+                unrealized_pnl = float(pos.get('up', 0) or 0)
+                position_side = pos.get('ps', '')
+                symbol_raw = pos.get('s', '')
+
+                sym_state = self.state.symbols[ccxt_symbol]
+
+                if position_side == 'LONG':
+                    sym_state.long_position = abs(position_amt)
+                elif position_side == 'SHORT':
+                    sym_state.short_position = abs(position_amt)
+
+                if ccxt_symbol in seen:
                     sym_state.unrealized_pnl += unrealized_pnl
+                else:
+                    sym_state.unrealized_pnl = unrealized_pnl
+                    seen.add(ccxt_symbol)
 
-                    logger.info(f"[userData] {symbol_raw} {position_side}: "
-                               f"持倉={position_amt:.2f}, 浮盈={unrealized_pnl:.2f}")
+                logger.info(f"[userData] {symbol_raw} {position_side}: "
+                           f"持倉={position_amt:.2f}, 浮盈={unrealized_pnl:.2f}")
 
             for currency in ['USDC', 'USDT']:
                 acc = self.state.get_account(currency)

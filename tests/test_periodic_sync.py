@@ -560,11 +560,17 @@ async def test_position_snapshot_discard_is_per_symbol(bot):
     await bot.sync_service._sync_positions()
 
     assert st.long_position == 0.02          # WS 的值保住
-    # SOL 的 ws_seq 也被同一次 ACCOUNT_UPDATE 推進（handler 會把每個 symbol 的
-    # unrealized_pnl 歸零 = 全部都髒），所以它這一輪同樣被丟棄。這是刻意的保守
-    # 方向：ACCOUNT_UPDATE 是「整個帳戶的快照」，宣稱它只動到 P 陣列裡那些
-    # symbol 是不成立的。下一輪（10s 後）沒有 WS 撞進來就會補上。
-    assert bot.state.symbols[other].long_position == 0.0
+    # SOL 不在 P 陣列裡 ⇒ 它的 ws_seq 沒被推進 ⇒ 它的 REST 快照照常寫入。
+    #
+    # 2026-08-26 修訂（原本這裡斷言的是 `== 0.0`，理由寫「handler 會把每個
+    # symbol 的 unrealized_pnl 歸零 = 全部都髒」）：那個歸零本身就是 bug——
+    # ACCOUNT_UPDATE 的 P 是增量而非全量快照，把 P 以外的 symbol 歸零會讓它們
+    # 停在假的 upnl=0，而 C1 守衛連帶讓 REST 治不回來 ⇒ 追蹤止盈對健康倉位送
+    # 市價平倉單（見 test_account_update_must_not_zero_untouched_symbol_upnl）。
+    # 根因修掉之後，這條測試才真的在測它 docstring 說的那件事：丟棄粒度是單一
+    # symbol，一個活躍 symbol 不會餓死其他 symbol 的對帳。
+    assert bot.state.symbols[other].long_position == 3.0
+    assert bot.state.symbols[other].unrealized_pnl == 7.0
 
 
 # --- B2（dual-review Important）：sleep 之後、sync_all 之前的停機檢查 ----------
@@ -647,3 +653,201 @@ def test_fallback_equals_config_default():
     """
     from grid_engine.sync_service import SYNC_INTERVAL_FALLBACK
     assert SYNC_INTERVAL_FALLBACK == GlobalConfig().sync_interval == 10.0
+
+
+# --- 2026-08-26 re-review Critical：ACCOUNT_UPDATE 的 P 是增量，不是全量 ------
+#
+# C1 的 ws_seq 守衛把一個既有的潛伏 bug 變成活的：`_handle_account_update` 原本
+# 會把**所有** symbol 的 unrealized_pnl 歸零、再只還原 P 陣列裡有的那些。改動前
+# 被漏掉的 symbol 那個假的 0 會由下一輪 REST 快照治好；守衛把那次治療也丟棄了
+# （而且 handler 對每個 symbol 都遞增 ws_seq ⇒ 整個帳戶的持倉對帳都被丟棄）。
+
+OTHER = "SOL/USDC:USDC"
+
+
+def _two_symbol_bot():
+    """兩個 symbol 的 bot：一個會出現在 P 陣列裡，一個不會。"""
+    cfg = GlobalConfig()
+    cfg.symbols = {
+        SYMBOL: SymbolConfig(
+            symbol="XRPUSDC", ccxt_symbol=SYMBOL, enabled=True,
+            take_profit_spacing=0.003, grid_spacing=0.003, initial_quantity=0.02,
+            limit_multiplier=5.0, threshold_multiplier=20.0),
+        OTHER: SymbolConfig(
+            symbol="SOLUSDC", ccxt_symbol=OTHER, enabled=True,
+            take_profit_spacing=0.003, grid_spacing=0.003, initial_quantity=0.02,
+            limit_multiplier=5.0, threshold_multiplier=20.0),
+    }
+    cfg.bandit.enabled = False
+    b = MaxGridBot(cfg)
+    b.order_executor.place_order = AsyncMock()
+    b.order_executor.cancel_orders_for_side = AsyncMock()
+    b.order_executor.close_symbol_positions = AsyncMock()
+    return b
+
+
+@pytest.mark.asyncio
+async def test_account_update_must_not_zero_untouched_symbol_upnl():
+    """P 陣列漏掉的 symbol，其 unrealized_pnl 不得被歸零。
+
+    Binance 的 ACCOUNT_UPDATE 只帶「有變動的」持倉；FUNDING_FEE 事件甚至沒有 P。
+    把 P 以外的 symbol 歸零 = 憑空宣稱那些倉位的浮盈是 0。
+
+    mutation（實跑過）：把 handler 改回「先對 self.state.symbols.values() 全部
+    歸零、再 `+=`」⇒ 紅在 `assert st_other.unrealized_pnl == 7.0`（實際 0.0）。
+    """
+    bot = _two_symbol_bot()
+    bot.adjust_grid = AsyncMock()
+    st_other = bot.state.symbols[OTHER]
+    st_other.long_position = 3.0
+    st_other.unrealized_pnl = 7.0
+    seq_before = st_other.ws_seq
+
+    # 只有 XRP 成交
+    await bot._handle_account_update({"a": {"B": [], "P": [
+        {"s": "XRPUSDC", "pa": "0.02", "up": "1.5", "ps": "LONG"},
+    ]}})
+
+    assert bot.state.symbols[SYMBOL].unrealized_pnl == 1.5
+    assert st_other.unrealized_pnl == 7.0, "P 沒帶到的 symbol 被憑空歸零"
+    assert st_other.long_position == 3.0
+    assert st_other.ws_seq == seq_before, \
+        "沒被這次事件動到的 symbol 不得遞增 ws_seq——否則它的 REST 快照會被白白丟棄"
+
+    # FUNDING_FEE 形態：完全沒有 P
+    await bot._handle_account_update({"a": {"B": [{"a": "USDC", "wb": "100"}]}})
+    assert st_other.unrealized_pnl == 7.0
+    assert bot.state.symbols[SYMBOL].unrealized_pnl == 1.5
+
+
+@pytest.mark.asyncio
+async def test_account_update_same_symbol_long_and_short_accumulate():
+    """同一個 symbol 在單一事件內出現 LONG/SHORT 兩筆 ⇒ 兩筆 up 相加。
+
+    但語意是「以本次事件為單位」重算，不是無腦 `+=` 到舊值上——後者會讓每次
+    ACCOUNT_UPDATE 把新浮盈疊到上一次的浮盈上、無限累加。
+
+    mutation（實跑過）：把 `sym_state.unrealized_pnl = unrealized_pnl` 那條分支
+    改成 `+=` ⇒ 紅在第二次事件後的 `assert st.unrealized_pnl == 3.0`（實際 6.0）。
+    """
+    bot = _two_symbol_bot()
+    bot.adjust_grid = AsyncMock()
+    st = bot.state.symbols[SYMBOL]
+
+    payload = {"a": {"B": [], "P": [
+        {"s": "XRPUSDC", "pa": "0.02", "up": "1.0", "ps": "LONG"},
+        {"s": "XRPUSDC", "pa": "-0.01", "up": "2.0", "ps": "SHORT"},
+    ]}}
+    await bot._handle_account_update(payload)
+    assert st.long_position == 0.02
+    assert st.short_position == 0.01
+    assert st.unrealized_pnl == 3.0, "同一事件的 LONG/SHORT 兩筆要相加"
+
+    # 同樣的事件再來一次：結果必須相同（冪等），不是累加成 6.0
+    await bot._handle_account_update(payload)
+    assert st.unrealized_pnl == 3.0, "跨事件不得累加——那會讓浮盈無限膨脹"
+
+
+@pytest.mark.asyncio
+async def test_account_update_gap_does_not_trigger_spurious_market_close():
+    """端到端：ACCOUNT_UPDATE 落在 fetch_positions 窗口內、且 P 漏掉某 symbol，
+    不得導致對那個健康倉位送出市價平倉單。
+
+    後果鏈（re-review 的 probe 端到端重現過）：漏掉的 symbol 停在假的
+    unrealized_pnl=0 ⇒ REST 快照被 C1 守衛丟棄、治不回來 ⇒ 同一輪稍後
+    `check_trailing_stop()` 看到 drawdown = peak - 0 >= max(2.0, peak*0.10)
+    ⇒ `close_symbol_positions()`。預設值讓它是活的：risk.enabled=True、
+    margin_threshold=0.5、trailing_start_profit=5.0 > trailing_min_drawdown=2.0。
+
+    mutation（實跑過）：把 handler 改回「全部歸零再 `+=`」
+    ⇒ 紅在 `assert st_other.unrealized_pnl == 7.0`，拿掉那條中途斷言後紅在
+    `assert close.call_count == 0`（實際 1）。
+    """
+    bot = _two_symbol_bot()
+    bot.adjust_grid = AsyncMock()
+    st_other = bot.state.symbols[OTHER]
+    st_other.long_position = 3.0
+    st_other.unrealized_pnl = 7.0
+
+    # 追蹤止盈已經在追這個 symbol，峰值 7.0
+    bot.state.trailing_active[OTHER] = True
+    bot.state.peak_pnl[OTHER] = 7.0
+    bot.state.margin_usage = 1.0            # 高於 risk.margin_threshold=0.5
+    assert bot.config.risk.enabled is True  # 預設就是開的，不是測試自己打開的
+
+    ex = _FakeExchange(positions=[
+        {"symbol": SYMBOL, "contracts": 0.02, "side": "long", "unrealizedPnl": 0.1},
+        {"symbol": OTHER, "contracts": 3.0, "side": "long", "unrealizedPnl": 7.0},
+    ])
+
+    async def ws_fill_arrives():
+        # 只有 XRP 成交；SOL 不在 P 裡
+        await bot._handle_account_update({"a": {"B": [], "P": [
+            {"s": "XRPUSDC", "pa": "0.04", "up": "0.2", "ps": "LONG"},
+        ]}})
+
+    ex.on_fetch = ws_fill_arrives
+    bot.ctx.exchange = ex
+    bot.gateway.call = _inline_gateway_call
+
+    await bot.sync_service._sync_positions()
+    assert st_other.unrealized_pnl == 7.0, "SOL 的浮盈被假的 0 取代了"
+
+    bot.state.margin_usage = 1.0   # _sync_account 之後的真實槓桿水位
+    await bot.risk_monitor.check_trailing_stop()
+
+    close = bot.order_executor.close_symbol_positions
+    assert close.call_count == 0, \
+        f"對健康倉位送出市價平倉單: {close.call_args_list}"
+
+
+# --- Ruling 11：per-symbol 連續丟棄計數 ---------------------------------------
+
+@pytest.mark.asyncio
+async def test_consecutive_snapshot_discards_warn(bot, caplog):
+    """快照被連續丟棄 N 輪 = 一種新的靜默停擺：該 symbol 的 REST 對帳實質失效，
+    而 sync_all() 仍回 True、心跳照蓋、降級狀態機一次都不會被推進。
+
+    刻意只記 log、不推降級計數：丟棄是設計中的正常結果，WS 活躍期就會發生，
+    拿它去推狀態機會在最健康的時候誤報降級並送 Telegram。
+
+    mutation（實跑過）：把 `_sync_positions` 丟棄分支裡的 `self._record_discard(...)`
+    刪掉 ⇒ 紅在 `assert "連續" in text`（一行 warning 都沒有）。
+    """
+    from grid_engine.sync_service import SNAPSHOT_DISCARD_WARN_THRESHOLD as N
+
+    st = bot.state.symbols[SYMBOL]
+    ex = _FakeExchange(positions=[
+        {"symbol": SYMBOL, "contracts": 0.0, "side": "long", "unrealizedPnl": 0.0},
+    ])
+
+    async def ws_fill_arrives():
+        await bot._handle_account_update({"a": {"B": [], "P": [
+            {"s": "XRPUSDC", "pa": "0.02", "up": "1.5", "ps": "LONG"},
+        ]}})
+
+    ex.on_fetch = ws_fill_arrives
+    bot.ctx.exchange = ex
+    bot.gateway.call = _inline_gateway_call
+    svc = bot.sync_service
+
+    with caplog.at_level("WARNING", logger="as_grid_max"):
+        for _ in range(N - 1):
+            await svc._sync_positions()
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "連續" not in text, f"未達門檻({N})就告警 = 正常 WS 活動會洗版: {text}"
+
+        await svc._sync_positions()      # 第 N 輪
+        text = "\n".join(r.getMessage() for r in caplog.records)
+
+    assert "連續" in text and SYMBOL in text, f"連續 {N} 輪被丟棄卻沒留下 warning: {text}"
+    assert str(N) in text
+    # 不得污染降級狀態機——丟棄不是失敗
+    assert svc._consecutive_failures == 0
+    assert svc._degraded is False
+
+    # 成功套用一次就歸零
+    ex.on_fetch = None
+    await svc._sync_positions()
+    assert svc._discard_streak.get(("持倉", SYMBOL)) is None, "成功一次必須把連續計數歸零"
+    assert st.long_position == 0.0   # 這輪 REST 快照真的寫進去了

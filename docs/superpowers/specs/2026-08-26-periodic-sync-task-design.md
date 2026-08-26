@@ -446,3 +446,65 @@ REST 呼叫，`rest_gateway` 本來就是單 worker 排隊，多等沒有好處�
   兩個並存的注入方式，違反 dev-rules「兩個 pattern 互斥時選一個，不混用」。
   選刪 kwarg 而不是把 `DailyReporter` 的建構搬到 `SyncService` 之後：後者為了
   形式一致而新增一條硬性建構順序約束，收益為零。
+
+以下修訂由 branch `feat/periodic-sync-task` 的 scoped re-review（修訂 10 的守衛
+本身引入的 Critical）觸發。
+
+**修訂 12（re-review Critical）—— `ACCOUNT_UPDATE` 的 `P` 是增量，不是全量快照。**
+
+- 被撤回的內容：`bot._handle_account_update` 原本「先把**所有** symbol 的
+  `unrealized_pnl` 歸零，再只還原 `P` 陣列裡有的那些」，以及 `sync_service.py`
+  檔頭/`tests/test_periodic_sync.py` 據此寫下的「這次 ACCOUNT_UPDATE 動到哪些
+  symbol 的答案是全部」。
+- 為什麼撤回：Binance 的 `ACCOUNT_UPDATE` 只帶「本次事件有變動的」持倉；
+  `FUNDING_FEE` 事件甚至完全沒有 `P`。把 `P` 以外的 symbol 歸零 = 憑空宣稱那些
+  倉位的浮盈是 0。這是修訂 10 之前就存在的缺陷，當時被下一輪 REST 快照治好；
+  **修訂 10 的 `ws_seq` 守衛把那次治療也丟棄了**（而且 handler 對每個 symbol
+  都遞增 `ws_seq` ⇒ REST 的持倉對帳實質上是整帳戶被丟棄），於是缺陷從潛伏變成
+  活的，後果鏈是：漏掉的 symbol 停在假的 `unrealized_pnl = 0` ⇒ 同一輪稍後
+  `_sync_account()` → `risk_monitor.check_trailing_stop()` 看到
+  `drawdown = peak - 0 >= max(2.0, peak * 0.10)` ⇒ `close_symbol_positions()`
+  = **對健康倉位送出市價平倉單**。預設值（`risk.enabled=True`、
+  `margin_threshold=0.5`、`trailing_start_profit=5.0 > trailing_min_drawdown=2.0`）
+  讓它是活的。
+- 新語意：以「本次事件出現過的 symbol」為集合。只有這個集合裡的 symbol 才遞增
+  `ws_seq`（仍在任何寫入之前遞增，部分寫入也算髒）；`unrealized_pnl` 在同一事件
+  內第一次碰到該 symbol 時**覆寫**、之後的同 symbol 條目才累加——同一 symbol 的
+  LONG/SHORT 兩筆要相加，但跨事件無腦 `+=` 會讓浮盈無限膨脹。
+- 已考慮並否決：在 `check_trailing_stop()` 端加「upnl 突然變 0 就 skip」的防禦。
+  那是在症狀端補救，且需要一個沒有出處的啟發式門檻；根因修法更小也更正確。
+- 連帶（依 dev-rules「找出所有依賴舊語意的地方」）：
+  `tests/test_periodic_sync.py::test_position_snapshot_discard_is_per_symbol`
+  原本斷言「沒出現在 `P` 裡的 SOL 也被丟棄」，那正是在釘死舊的錯誤語意——與它
+  自己的 docstring（「丟棄粒度是單一 symbol」）矛盾。改為斷言 SOL 的 REST 快照
+  照常寫入，並在測試內留下修訂理由。其餘 consumer 逐一確認過：`risk_monitor`
+  讀 `SymbolState.unrealized_pnl`（正是受害者）、`ui.py` / `reporting.py` 只顯示、
+  `sync_service._sync_account` 的 fallback 分支把它加總成帳戶浮盈——三者都只會
+  因這次修正而變得更正確。
+
+**修訂 13（re-review Ruling 11）—— per-symbol 連續丟棄計數。**
+
+- 新增：`SNAPSHOT_DISCARD_WARN_THRESHOLD = 6`，`SyncService._discard_streak`
+  以 `(kind, symbol)` 為 key（`kind ∈ {持倉, 掛單}`，兩道守衛分開計數）。
+  同一 symbol 的快照被 `ws_seq` 守衛連續丟棄滿 N 輪就記一行 `logger.warning`，
+  之後每再滿 N 輪印一次；成功套用一次即歸零。
+- 為什麼需要：「快照永遠被丟棄」是修訂 10 引進的**新的靜默停擺**——該 symbol 的
+  REST 對帳實質失效、狀態只剩 WS 維護，而 `sync_all()` 仍回 `True`、心跳照蓋、
+  降級狀態機一次都不會被推進。狀態機與心跳都看不見它。
+- N = 6（≈60s @ `sync_interval` 預設 10s）：與 `SYNC_FAILURE_THRESHOLD`(3) 同量級，
+  取 2 倍是因為偽陽性成本不對稱——REST 失敗是異常，丟棄是設計中的正常結果
+  （一次成交、一次資金費結算都會造成 1~2 輪丟棄）。
+- 刻意**不**推降級計數（`_evaluate`）：那會在 WS 最活躍（= 最健康）時誤報降級
+  並送 Telegram。
+
+**修訂 14（re-review 文件義務）—— 帳戶層刻意不設防，理由入檔。**
+
+- `_sync_account` 有與 `_sync_positions` 同型的 fetch→apply 競態
+  （`AccountBalance.wallet_balance` / `unrealized_pnl`），**刻意不設守衛**。
+  理由（re-review 追過所有 consumer）：這兩個欄位的讀者只有 `ui.py`、
+  `reporting.py`、`notifier.py`，全部只是顯示；會下單/做風控判斷的
+  `risk_monitor`（讀 `state.margin_usage` 與 **`SymbolState`**.unrealized_pnl）、
+  `order_executor`、`decision` 都不讀帳戶餘額；且下一輪自癒，沒有 symbol 層那種
+  「錯一次就一路錯下去」的分岔。
+- 寫進 `sync_service.py` 檔頭的不變式段落，附**失效條件**：哪天有會下單或會做
+  風控判斷的路徑開始讀 `AccountBalance`，這個裁定即刻失效，必須補上同型守衛。
