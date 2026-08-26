@@ -437,7 +437,11 @@ class SyncService:
             logger.error(f"同步持倉失敗: {e}")
             return False
 
-        agg = {s: [0.0, 0.0, 0.0] for s in self.state.symbols}  # long, short, upnl
+        # long, short, long_upnl, short_upnl —— 浮盈跟持倉一樣分側收，才能直接
+        # 填進 SymbolState 的分側欄位（合計由 property 導出，見 state.py）。
+        # 沒有 side 的條目（空倉）不歸屬到任何一側：猜錯側會讓 REST 快照把 WS
+        # 的正確分側值蓋成偏一邊的假值。
+        agg = {s: [0.0, 0.0, 0.0, 0.0] for s in self.state.symbols}
         for pos in positions:
             symbol = pos['symbol']
             if symbol in agg:
@@ -446,11 +450,12 @@ class SyncService:
                 pnl = float(pos.get('unrealizedPnl', 0) or 0)
                 if side == 'long':
                     agg[symbol][0] = contracts
+                    agg[symbol][2] += pnl
                 elif side == 'short':
                     agg[symbol][1] = abs(contracts)
-                agg[symbol][2] += pnl
+                    agg[symbol][3] += pnl
 
-        for symbol, (long_pos, short_pos, upnl) in agg.items():
+        for symbol, (long_pos, short_pos, long_upnl, short_upnl) in agg.items():
             async with self.locks.get(symbol):
                 # 原子 apply：鎖內無其他 await
                 st = self.state.symbols[symbol]
@@ -466,7 +471,8 @@ class SyncService:
                     continue
                 st.long_position = long_pos
                 st.short_position = short_pos
-                st.unrealized_pnl = upnl
+                st.long_upnl = long_upnl
+                st.short_upnl = short_upnl
                 self._record_snapshot_applied("持倉", symbol)
         return True
 

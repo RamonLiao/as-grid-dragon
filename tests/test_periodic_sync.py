@@ -700,7 +700,7 @@ async def test_account_update_must_not_zero_untouched_symbol_upnl():
     bot.adjust_grid = AsyncMock()
     st_other = bot.state.symbols[OTHER]
     st_other.long_position = 3.0
-    st_other.unrealized_pnl = 7.0
+    st_other.long_upnl = 7.0        # 合計由 long_upnl+short_upnl 導出（唯讀 property）
     seq_before = st_other.ws_seq
 
     # 只有 XRP 成交
@@ -767,7 +767,7 @@ async def test_account_update_gap_does_not_trigger_spurious_market_close():
     bot.adjust_grid = AsyncMock()
     st_other = bot.state.symbols[OTHER]
     st_other.long_position = 3.0
-    st_other.unrealized_pnl = 7.0
+    st_other.long_upnl = 7.0        # 合計由 long_upnl+short_upnl 導出（唯讀 property）
 
     # 追蹤止盈已經在追這個 symbol，峰值 7.0
     bot.state.trailing_active[OTHER] = True
@@ -799,6 +799,171 @@ async def test_account_update_gap_does_not_trigger_spurious_market_close():
     close = bot.order_executor.close_symbol_positions
     assert close.call_count == 0, \
         f"對健康倉位送出市價平倉單: {close.call_args_list}"
+
+
+# --- 2026-08-26 re-review Critical（第三個變形）：ACCOUNT_UPDATE 只帶一側 ------
+#
+# 前兩個變形修的是「symbol 沒被帶到」。這一個是「symbol 被帶到了，但只帶一側」：
+# `unrealized_pnl` 是 symbol 層的合計，而 P 的條目是分側的。用「本次事件出現的
+# 側」重算合計，等於宣稱沒帶到的那一側浮盈是 0。本 repo 強制避險模式
+# （bot._check_hedge_mode），兩側同時有倉是常態，所以這條路很寬。
+# 修法：SymbolState 分側存 long_upnl / short_upnl，合計由 property 導出。
+
+
+@pytest.mark.asyncio
+async def test_account_update_single_side_must_not_wipe_the_other_side():
+    """事件只帶 SHORT 一筆 ⇒ LONG 那一側的浮盈與持倉都不得被動到。
+
+    Binance 在 symbol 層明說只推有變動的持倉，但沒保證兩側都會帶；唯一確證的
+    單筆情境是 isolated 倉的資金費結算只推發生資金費的那一筆倉位（本 repo 從不
+    設定 margin type，跟隨帳戶設定 ⇒ 帳戶若是 isolated 這條就是活的）。
+
+    mutation（實跑過）：把 handler 改回「第一次碰到這個 symbol 就把兩側歸零再
+    寫本次的側」⇒ 紅在 `assert st.long_upnl == 7.0`（實際 0.0）。
+    """
+    bot = _two_symbol_bot()
+    bot.adjust_grid = AsyncMock()
+    st = bot.state.symbols[SYMBOL]
+    st.long_position, st.long_upnl = 0.02, 7.0
+    st.short_position, st.short_upnl = 0.01, -0.1
+    assert st.unrealized_pnl == pytest.approx(6.9)
+
+    # 只帶 SHORT 一筆（例如 isolated 倉的資金費結算）
+    await bot._handle_account_update({"a": {"B": [], "P": [
+        {"s": "XRPUSDC", "pa": "-0.01", "up": "-0.2", "ps": "SHORT"},
+    ]}})
+
+    assert st.long_upnl == 7.0, "事件沒帶到的 LONG 側浮盈被抹掉了"
+    assert st.long_position == 0.02, "事件沒帶到的 LONG 側持倉被抹掉了"
+    assert st.short_upnl == -0.2
+    assert st.unrealized_pnl == pytest.approx(6.8), "合計必須是兩側相加"
+
+
+def test_symbol_state_unrealized_pnl_is_derived_and_read_only():
+    """合計是導出的、且不可寫。
+
+    可寫的合計欄位正是這一族缺陷的入口：只要能寫，就會有人拿「本次事件看到的
+    側」去覆寫它。唯讀 property 讓那種寫法在執行時就會炸，不會靜默寫錯。
+
+    mutation（實跑過）：把 state.py 的 property 換回可寫欄位 `unrealized_pnl`
+    ⇒ 紅在 `with pytest.raises(AttributeError)`（DID NOT RAISE）。
+    """
+    st = SymbolState(symbol=SYMBOL)
+    st.long_upnl = 3.0
+    st.short_upnl = -1.0
+    assert st.unrealized_pnl == pytest.approx(2.0)
+    with pytest.raises(AttributeError):
+        st.unrealized_pnl = 5.0
+
+
+@pytest.mark.asyncio
+async def test_single_side_account_update_does_not_trigger_spurious_market_close():
+    """端到端：只帶一側的 ACCOUNT_UPDATE 落在 fetch_positions 窗口內，不得對
+    健康倉位送出市價平倉單。
+
+    後果鏈與前兩個變形逐字相同：LONG 的 +7 被抹掉 ⇒ 合計掉到 -0.2 ⇒ REST 快照
+    被 C1 的 ws_seq 守衛丟棄、治不回來 ⇒ `check_trailing_stop()` 看到
+    drawdown = 6.9 - (-0.2) = 7.1 >= max(2.0, 0.69) ⇒ `close_symbol_positions()`。
+
+    mutation（實跑過）：把 handler 改回「兩側先歸零再寫本次的側」
+    ⇒ 紅在 `assert st.unrealized_pnl == 6.8`（實際 -0.2），拿掉那條中途斷言後
+    紅在 `assert close.call_count == 0`（實際 1）。
+    """
+    bot = _two_symbol_bot()
+    bot.adjust_grid = AsyncMock()
+    st = bot.state.symbols[SYMBOL]
+    st.long_position, st.long_upnl = 0.02, 7.0
+    st.short_position, st.short_upnl = 0.01, -0.1
+
+    bot.state.trailing_active[SYMBOL] = True
+    bot.state.peak_pnl[SYMBOL] = 6.9
+    bot.state.margin_usage = 1.0            # 高於 risk.margin_threshold=0.5
+    assert bot.config.risk.enabled is True  # 預設就是開的
+
+    ex = _FakeExchange(positions=[
+        {"symbol": SYMBOL, "contracts": 0.02, "side": "long", "unrealizedPnl": 7.0},
+        {"symbol": SYMBOL, "contracts": 0.01, "side": "short", "unrealizedPnl": -0.1},
+    ])
+
+    async def ws_fill_arrives():
+        # 只有 SHORT 那一筆
+        await bot._handle_account_update({"a": {"B": [], "P": [
+            {"s": "XRPUSDC", "pa": "-0.01", "up": "-0.2", "ps": "SHORT"},
+        ]}})
+
+    ex.on_fetch = ws_fill_arrives
+    bot.ctx.exchange = ex
+    bot.gateway.call = _inline_gateway_call
+
+    await bot.sync_service._sync_positions()
+    assert st.unrealized_pnl == pytest.approx(6.8), \
+        "LONG 側的 +7 被抹掉（REST 快照已被 ws_seq 守衛丟棄，治不回來）"
+
+    bot.state.margin_usage = 1.0
+    await bot.risk_monitor.check_trailing_stop()
+
+    close = bot.order_executor.close_symbol_positions
+    assert close.call_count == 0, \
+        f"對健康倉位送出市價平倉單: {close.call_args_list}"
+
+
+@pytest.mark.asyncio
+async def test_account_update_both_position_side_maps_to_the_net_side(caplog):
+    """`ps='BOTH'`（單向持倉模式的淨倉）：映射到對應側、另一側清乾淨，並留
+    warning。
+
+    本 repo 啟動時強制避險模式（_check_hedge_mode 送 dualSidePosition=true），
+    收到 BOTH 代表那個前提在運行中破了。靜默忽略最糟——兩側會停在舊快照上被
+    風控當成真值；只清不寫也不行——合計會憑空消失、觸發假回撤。
+
+    mutation（實跑過）：把 handler 的 `elif position_side == 'BOTH':` 整段刪掉
+    （落到 else 的 `continue`）⇒ 紅在 `assert st.long_position == 0.05 and
+    st.long_upnl == 1.2`（實際 9.0 / 5.0，舊值原封不動）。
+    """
+    bot = _two_symbol_bot()
+    bot.adjust_grid = AsyncMock()
+    st = bot.state.symbols[SYMBOL]
+    st.long_position, st.long_upnl = 9.0, 5.0      # 舊的避險模式殘值
+    st.short_position, st.short_upnl = 8.0, -4.0
+
+    with caplog.at_level("WARNING"):
+        await bot._handle_account_update({"a": {"B": [], "P": [
+            {"s": "XRPUSDC", "pa": "0.05", "up": "1.2", "ps": "BOTH"},
+        ]}})
+
+    assert st.long_position == 0.05 and st.long_upnl == 1.2
+    assert st.short_position == 0.0 and st.short_upnl == 0.0
+    assert st.unrealized_pnl == pytest.approx(1.2), "合計必須等於交易所的淨倉浮盈"
+    assert "BOTH" in "\n".join(r.getMessage() for r in caplog.records), \
+        "避險模式前提被打破卻沒留下任何痕跡"
+
+    # 淨空倉：映射到 SHORT 側
+    await bot._handle_account_update({"a": {"B": [], "P": [
+        {"s": "XRPUSDC", "pa": "-0.03", "up": "-0.4", "ps": "BOTH"},
+    ]}})
+    assert st.short_position == 0.03 and st.short_upnl == -0.4
+    assert st.long_position == 0.0 and st.long_upnl == 0.0
+    assert st.unrealized_pnl == pytest.approx(-0.4)
+
+
+@pytest.mark.asyncio
+async def test_unknown_position_side_is_ignored_not_guessed(caplog):
+    """未知的 ps 不得猜側——猜錯會把另一側的真值蓋掉。留 warning、不套用。"""
+    bot = _two_symbol_bot()
+    bot.adjust_grid = AsyncMock()
+    st = bot.state.symbols[SYMBOL]
+    st.long_position, st.long_upnl = 0.02, 7.0
+    st.short_position, st.short_upnl = 0.01, -0.1
+
+    with caplog.at_level("WARNING"):
+        await bot._handle_account_update({"a": {"B": [], "P": [
+            {"s": "XRPUSDC", "pa": "0.05", "up": "1.2", "ps": "SIDEWAYS"},
+        ]}})
+
+    assert (st.long_position, st.long_upnl) == (0.02, 7.0)
+    assert (st.short_position, st.short_upnl) == (0.01, -0.1)
+    assert "SIDEWAYS" in "\n".join(r.getMessage() for r in caplog.records)
+
 
 
 # --- Ruling 11：per-symbol 連續丟棄計數 ---------------------------------------
@@ -851,3 +1016,32 @@ async def test_consecutive_snapshot_discards_warn(bot, caplog):
     await svc._sync_positions()
     assert svc._discard_streak.get(("持倉", SYMBOL)) is None, "成功一次必須把連續計數歸零"
     assert st.long_position == 0.0   # 這輪 REST 快照真的寫進去了
+
+
+def test_snapshot_discard_warning_is_throttled_to_one_line_per_n(sync, caplog):
+    """節流語意：跨門檻後是「每再滿 N 輪一行」（N、2N、3N…），不是「之後每輪
+    都印」。
+
+    上一條測試只驗「N-1 輪不印、第 N 輪印」——把 `streak % N == 0` 換成
+    `streak >= N` 也照樣綠，而那個版本在實盤會每個 sync_interval 印一行、
+    把 log 洗掉（一個永久被餓死的 symbol 就是永久洗版）。
+
+    mutation（實跑過）：`streak % N == 0` → `streak >= N`
+    ⇒ 紅在第 N+1 輪的 `assert warn_count() == expected`（實際 2、預期 1）。
+    """
+    from grid_engine.sync_service import SNAPSHOT_DISCARD_WARN_THRESHOLD as N
+    assert N >= 2, "N=1 時這條測不出節流"
+
+    def warn_count():
+        return sum(1 for r in caplog.records
+                   if r.levelname == "WARNING" and "連續" in r.getMessage())
+
+    with caplog.at_level("WARNING", logger="as_grid_max"):
+        for streak in range(1, 3 * N + 1):
+            sync._record_discard("持倉", SYMBOL)
+            expected = streak // N        # 只在 N 的倍數那一輪多一行
+            assert warn_count() == expected, (
+                f"第 {streak} 輪（N={N}）累計 warning 應為 {expected}，"
+                f"實得 {warn_count()}：>expected = 節流失效會洗版，"
+                f"<expected = 跨門檻後就再也不提醒"
+            )

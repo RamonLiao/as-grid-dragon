@@ -690,12 +690,16 @@ class MaxGridBot:
             for ccxt_symbol in touched:
                 self.state.symbols[ccxt_symbol].ws_seq += 1
 
-            # 同一個 symbol 在單一事件內可能出現 LONG/SHORT 兩筆，兩筆的 up 要
-            # 相加才是這個 symbol 的浮盈。但也不能單純 `+=` 到舊值上——那會在
-            # 每次事件把新浮盈疊到上一次的浮盈上、無限累加。正確語意是「以本次
-            # 事件為單位」：第一次碰到這個 symbol 時**覆寫**（等於先歸零再加），
-            # 之後的同 symbol 條目才累加。
-            seen = set()
+            # 每筆 P 條目只更新它自己那一側（持倉與浮盈都是）。symbol 層的
+            # `unrealized_pnl` 是 long_upnl + short_upnl 導出的，這裡不碰。
+            # 為什麼不能用「本次事件出現的側」重算合計：Binance 在 symbol 層明說
+            # 「only symbols of changed positions will be pushed」，但沒保證兩側
+            # 都會帶——isolated 倉的資金費結算就只推發生資金費的那一筆。本 repo
+            # 從不設定 margin type（跟隨帳戶設定），所以那條路是活的。事件只帶
+            # SHORT 時把 LONG 的浮盈重算掉 ⇒ 追蹤止盈看到假回撤 ⇒ 對健康倉位送
+            # 市價平倉單（2026-08-26 re-review 端到端重現過）。分側各寫各的，
+            # 「只帶一側」與「同事件帶兩側」就都自動正確，也不必再判斷是不是第
+            # 一次碰到這個 symbol。
             for ccxt_symbol, pos in resolved:
                 position_amt = float(pos.get('pa', 0) or 0)
                 unrealized_pnl = float(pos.get('up', 0) or 0)
@@ -706,14 +710,36 @@ class MaxGridBot:
 
                 if position_side == 'LONG':
                     sym_state.long_position = abs(position_amt)
+                    sym_state.long_upnl = unrealized_pnl
                 elif position_side == 'SHORT':
                     sym_state.short_position = abs(position_amt)
-
-                if ccxt_symbol in seen:
-                    sym_state.unrealized_pnl += unrealized_pnl
+                    sym_state.short_upnl = unrealized_pnl
+                elif position_side == 'BOTH':
+                    # 單向持倉模式的淨倉。本 repo 啟動時強制避險模式
+                    # （_check_hedge_mode: dualSidePosition=true），所以收到 BOTH
+                    # 代表那個前提在運行中破了（例如手動改回單向、或設定沒套用
+                    # 成功）。這種時候「靜默忽略」最糟：兩側的值會停在舊快照上被
+                    # 風控當成真值。改成把淨倉映射到對應側、另一側清乾淨——合計
+                    # 仍然等於交易所的真值，_grid_step 的
+                    # `long_position == 0 / short_position == 0` 分岔也還是對的。
+                    if position_amt >= 0:
+                        sym_state.long_position = position_amt
+                        sym_state.long_upnl = unrealized_pnl
+                        sym_state.short_position = 0.0
+                        sym_state.short_upnl = 0.0
+                    else:
+                        sym_state.short_position = abs(position_amt)
+                        sym_state.short_upnl = unrealized_pnl
+                        sym_state.long_position = 0.0
+                        sym_state.long_upnl = 0.0
+                    logger.warning(f"[userData] {symbol_raw} 收到 ps=BOTH（單向持倉模式）——"
+                                   f"避險模式前提已破，請確認帳戶的 dualSidePosition 設定")
                 else:
-                    sym_state.unrealized_pnl = unrealized_pnl
-                    seen.add(ccxt_symbol)
+                    # 未知的 ps：無法歸屬到任何一側，寧可不動也不要猜。留一行
+                    # warning，否則這種情況完全不可觀測。
+                    logger.warning(f"[userData] {symbol_raw} 未知的 positionSide="
+                                   f"{position_side!r}，本筆不套用")
+                    continue
 
                 logger.info(f"[userData] {symbol_raw} {position_side}: "
                            f"持倉={position_amt:.2f}, 浮盈={unrealized_pnl:.2f}")

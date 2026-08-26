@@ -508,3 +508,41 @@ REST 呼叫，`rest_gateway` 本來就是單 worker 排隊，多等沒有好處�
   「錯一次就一路錯下去」的分岔。
 - 寫進 `sync_service.py` 檔頭的不變式段落，附**失效條件**：哪天有會下單或會做
   風控判斷的路徑開始讀 `AccountBalance`，這個裁定即刻失效，必須補上同型守衛。
+
+**修訂 15（re-review Critical，同族第三個變形）—— 浮盈改成分側存放，
+`SymbolState.unrealized_pnl` 由兩側導出。**
+
+- 被撤回的內容：修訂 12 的「`unrealized_pnl` 在同一事件內第一次碰到該 symbol
+  時**覆寫**、之後的同 symbol 條目才累加」。
+- 為什麼撤回：那條語意的前提是「一次 `ACCOUNT_UPDATE` 會帶齊這個 symbol 的兩
+  側」。Binance 在 symbol 層明說「only symbols of changed positions will be
+  pushed」，但**沒有**保證兩側都會帶；唯一確證的單筆情境是 isolated 倉的資金費
+  結算只推發生資金費的那一筆倉位。本 repo 從不設定 margin type（`grep
+  marginType/set_margin_mode` 無命中），跟隨帳戶設定 ⇒ 帳戶若是 isolated 這條路
+  就是活的。而 `unrealized_pnl` 是 **symbol 層的合計**、`long_position` /
+  `short_position` 是**分側**的——用「本次事件出現的側」重算合計，等於宣稱沒帶
+  到的那一側浮盈是 0。本 repo 強制避險模式（`bot._check_hedge_mode`
+  `dualSidePosition=true`），兩側同時有倉是常態，所以這條路很寬。
+  後果鏈與修訂 12 逐字相同：LONG +7.0 / SHORT -0.1（合計 6.9、trailing 中、
+  peak 6.9），下一個事件只帶 SHORT（up=-0.2）且落在 `fetch_positions` 窗口內
+  ⇒ 合計掉到 -0.2、REST 快照被修訂 10 的 `ws_seq` 守衛丟棄治不回來 ⇒
+  `drawdown = 6.9 - (-0.2) = 7.1 >= max(2.0, 0.69)` ⇒ `close_symbol_positions()`
+  = **對健康倉位送出市價平倉單**（re-review 已在 sandbox 端到端重現）。
+- 新語意：`SymbolState` 新增 `long_upnl` / `short_upnl` 兩個分側欄位，
+  `unrealized_pnl` 改成**唯讀 property** = `long_upnl + short_upnl`（對所有讀者
+  語意不變，仍是「這個 symbol 的浮盈合計」）。`_handle_account_update` 依 `ps`
+  各寫各的側，不再有「本次事件看到哪些側」的概念（修訂 12 引入的 `seen` 集合
+  一併移除）；`_sync_positions` 的 `agg` 本來就分側，改成一併帶回兩側浮盈。
+  「只帶一側」與「同事件帶兩側」自此都自動正確。
+- 為什麼合計唯讀（而不是每次寫入時同步更新一個可寫欄位）：這一族缺陷已經出現
+  三次，每次的形狀都是「有人拿手上有的那部分資訊去重算合計」。只要合計可寫，
+  下一個變形就還有入口；唯讀讓那種寫法在執行時直接炸，不會靜默寫錯。代價是
+  少數測試改用 `long_upnl` 指派——已全數更新。
+- `ps='BOTH'`（單向持倉模式的淨倉）：本 repo 啟動時強制避險模式，收到 `BOTH`
+  代表那個前提在運行中破了。處理方式是把淨倉映射到對應側（`pa >= 0` → LONG、
+  `pa < 0` → SHORT）、另一側清乾淨，並記一行 `logger.warning`。靜默忽略最糟
+  ——兩側會停在舊快照上被風控當成真值；只清不寫也不行——合計會憑空消失、觸發
+  假回撤。未知的 `ps` 則完全不套用（猜側會蓋掉另一側的真值），同樣留 warning。
+- 連帶：修訂 13 的節流告警補一條「每 N 輪一行」的語意測試——原測試只驗
+  「N-1 輪不印、第 N 輪印」，把 `streak % N == 0` 突變成 `streak >= N`
+  （之後每輪都印、實盤洗版）仍然全綠。
