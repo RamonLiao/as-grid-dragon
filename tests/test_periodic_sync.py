@@ -11,6 +11,7 @@ import pytest
 from grid_engine import clock
 from grid_engine.bot import MaxGridBot
 from grid_engine.config import GlobalConfig, SymbolConfig
+from grid_engine.state import SymbolState
 from grid_engine.sync_service import SyncOutcome
 
 SYMBOL = "XRP/USDC:USDC"
@@ -41,13 +42,19 @@ def bot():
 
 @pytest.fixture
 def sync(bot):
-    """把五個子項全換成成功的 no-op，測試各自再覆寫要失敗的那一個。"""
+    """把五個子項全換成成功的 no-op，測試各自再覆寫要失敗的那一個。
+
+    `return_value=True` 不可省（dual-review M9）：裸 `AsyncMock()` 回的是一個
+    truthy 的 MagicMock，`SyncOutcome.positions_ok` 會是那個 mock 而不是 True，
+    下面所有斷言就只驗到「truthy」，驗不到「這個子項回報成功」——真實子項回
+    一個非 True 的 truthy 值（例如回了個物件）也照樣綠。
+    """
     s = bot.sync_service
-    s._sync_positions = AsyncMock()
-    s._sync_orders = AsyncMock()
-    s._sync_account = AsyncMock()
-    s._sync_funding_rates = AsyncMock()
-    s._sync_trade_stats = AsyncMock()
+    s._sync_positions = AsyncMock(return_value=True)
+    s._sync_orders = AsyncMock(return_value=True)
+    s._sync_account = AsyncMock(return_value=True)
+    s._sync_funding_rates = AsyncMock(return_value=True)
+    s._sync_trade_stats = AsyncMock(return_value=True)
     return s
 
 
@@ -55,9 +62,12 @@ def sync(bot):
 async def test_sync_all_reports_all_ok(sync):
     outcome = await sync.sync_all()
     assert isinstance(outcome, SyncOutcome)
-    assert outcome.positions_ok and outcome.account_ok
-    assert outcome.critical_ok
-    assert not outcome.skipped
+    # `is True` 而不是 truthy（M9）：五個子項回的必須是布林 True 本身
+    assert outcome.positions_ok is True and outcome.account_ok is True
+    assert outcome.orders_ok is True and outcome.funding_ok is True
+    assert outcome.trade_stats_ok is True
+    assert outcome.critical_ok is True
+    assert outcome.skipped is False
 
 
 @pytest.mark.asyncio
@@ -136,7 +146,7 @@ def test_module_time_helper_still_exists():
     assert callable(sync_service._time)
 
 
-from grid_engine.sync_service import SYNC_FAILURE_THRESHOLD
+from grid_engine.sync_service import SYNC_FAILURE_THRESHOLD, SYNC_INTERVAL_FALLBACK
 
 
 @pytest.fixture
@@ -283,13 +293,23 @@ async def test_run_survives_exception_and_counts_it(sync, notified):
     assert len(notified) == 1
 
 
-@pytest.mark.parametrize("bad", [0, -5, float("nan"), "abc", None])
+@pytest.mark.parametrize(
+    "bad", [0, -5, float("nan"), float("inf"), float("-inf"), "abc", None])
 def test_loop_interval_clamps_illegal_values(sync, bad):
-    """sleep(0) 會變成忙迴圈打爆 REST 配額。夾到下限而非 fallback 預設值：
-    使用者刻意調小是合法意圖，只有非法值才需要糾正。
+    """非法值一律換成 SYNC_INTERVAL_FALLBACK，不是「夾到某個下限」。
+
+    `sleep(0)` 會變成忙迴圈打爆 REST 配額；`sleep(inf)` 是反方向的同一件事——
+    永遠不醒、`_stop_event` 也叫不醒它（sleep 不受 event 中斷）、執行中把設定
+    改回正常值同樣救不回來（每輪才重讀 config，而這一輪永遠不會結束）⇒ REST
+    同步整條停擺、降級狀態機一次都不會被推進 = 完全靜默（dual-review B3）。
+
+    斷言 `== SYNC_INTERVAL_FALLBACK` 而不是舊的 `>= 1.0`：`float("inf") >= 1.0`
+    為真，舊斷言對 inf 這個最危險的輸入恆綠。
+    mutation（實跑過）：把 `_loop_interval` 的 `not math.isfinite(interval)` 換回
+    `math.isnan(interval)` ⇒ 紅在 `bad=inf` 這個 case（回傳 inf 而非 10.0）。
     """
     sync.config.sync_interval = bad
-    assert sync._loop_interval() >= 1.0
+    assert sync._loop_interval() == SYNC_INTERVAL_FALLBACK
 
 
 def test_loop_interval_respects_legal_small_value(sync):
@@ -321,7 +341,7 @@ async def test_broken_config_does_not_busy_loop(sync):
     「次數上限」。理由是這裡有兩道重疊的防禦，只挑一道拿掉的話另一道會接住：
     - 只把 `_loop_interval` 的 `except Exception` 縮回 `(TypeError, ValueError)`：
       AttributeError 逃出去 → run() 的 `except Exception` 接住 → `slept` 為 False
-      → 補睡 1.0s ⇒ **不會**變成忙迴圈，但會被記成一次 loop 級失敗
+      → 補睡 SYNC_INTERVAL_FALLBACK(10s) ⇒ **不會**變成忙迴圈，但會被記成一次 loop 級失敗
       ⇒ `_consecutive_failures` 變 1 ⇒ 這一行紅。這正是「config 壞掉該在
       `_loop_interval` 就被吸收成 fallback，不該冒充成一次同步失敗」的語意。
     - 兩道一起拿掉：0.3 秒內累積上萬次迭代，同一行以更誇張的數字紅。
@@ -334,19 +354,19 @@ async def test_broken_config_does_not_busy_loop(sync):
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert sync._consecutive_failures == 0
-    sync._sync_positions.assert_not_called()   # fallback 1.0s > 窗口，本來就不該同步到
+    sync._sync_positions.assert_not_called()   # fallback 10s > 窗口，本來就不該同步到
 
 
 @pytest.mark.asyncio
 async def test_loop_interval_raising_does_not_busy_loop(sync):
     """同上，但直接讓 `_loop_interval()` 拋例外——守的是 run() 裡那道
-    「本輪沒 sleep 到就補睡 MIN_SYNC_INTERVAL」的保險本身。
+    「本輪沒 sleep 到就補睡 SYNC_INTERVAL_FALLBACK」的保險本身。
 
     兩道防禦是刻意重疊的：`_loop_interval` 變成 total function 是「不要製造
     沒有 sleep 的一輪」，這裡守的是「就算製造了也不能變忙迴圈」。
 
     測法：數 `_loop_interval` 被呼叫幾次。有補睡時，0.3 秒的窗口內最多一次
-    （每輪至少睡 MIN_SYNC_INTERVAL=1.0s）；沒有補睡時，run() 這一輪完全沒有
+    （每輪至少睡 SYNC_INTERVAL_FALLBACK=10s）；沒有補睡時，run() 這一輪完全沒有
     await，event loop 被**完全餓死**（連測試自己的 `await asyncio.sleep(0.3)`
     都永遠不會恢復），所以不能靠時間窗口收尾——`_ESCAPE_AFTER` 那道逃生門
     存在的唯一理由就是讓 mutation 下這條測試**紅**而不是**hang**。
@@ -370,3 +390,260 @@ async def test_loop_interval_raising_does_not_busy_loop(sync):
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert calls["n"] <= 2
+
+
+# --- C1（dual-review Critical）：REST 的 fetch→apply 窗口 vs WS handler ---------
+#
+# 背景：`_sync_positions` / `_sync_orders` 從 REST 讀回資料到寫進 state 之間隔著
+# 一整趟 round-trip 的 await。改動前 `sync_all()` 被 await 在 `_handle_ticker` 內、
+# 而 ws_client 的 recv 迴圈一次只跑一個 handler ⇒ 那個 await 期間沒有任何 WS
+# handler 能執行。搬成獨立 task 之後這個天然序列化消失了，而 WS handler 不取
+# symbol lock ⇒ REST 會拿過期快照蓋掉成交後的新狀態。
+# 守衛：SymbolState.ws_seq（WS 端遞增，REST 端在 symbol lock 內比對）。
+
+class _FakeExchange:
+    """只提供這兩條測試用得到的兩個方法。"""
+    def __init__(self, positions=None, open_orders=None):
+        self._positions = positions or []
+        self._open_orders = open_orders or []
+        self.on_fetch = None
+
+    async def fetch_positions(self, params=None):
+        if self.on_fetch:
+            await self.on_fetch()
+        return self._positions
+
+    async def fetch_open_orders(self, symbol=None):
+        if self.on_fetch:
+            await self.on_fetch()
+        return self._open_orders
+
+
+async def _inline_gateway_call(fn, *args, **kwargs):
+    """把 RestGateway.call 換成「同一個 event loop 內直接跑」。
+
+    真的 gateway 把同步 ccxt 丟到 worker thread，沒辦法在裡面 await 一個 WS
+    handler。這個替身保留了唯一重要的性質——`await self.gateway.call(...)` 是一個
+    真正的讓出點，其他 task（WS handler）可以在那期間跑完。
+    """
+    result = fn(*args, **kwargs)
+    if asyncio.iscoroutine(result):
+        result = await result
+    return result
+
+
+@pytest.mark.asyncio
+async def test_ws_position_write_during_fetch_is_not_overwritten(bot):
+    """成交後 WS 寫進來的持倉，不得被同一輪 REST 的舊快照蓋回去。
+
+    會動錢的路徑：`_grid_step` 用 `sym_state.long_position == 0` 分岔
+    （bot.py 多頭/空頭兩段）。WS 把它寫成 0.02、REST 舊快照蓋回 0 ⇒ 下一 tick
+    走「無倉位」分支 ⇒ `cancel_orders_for_side('long')` 撤掉剛掛好的網格 +
+    `place_order` 再開一次倉，而且完全靜默。
+
+    mutation（實跑過）：拿掉 `_sync_positions` apply 迴圈裡的
+    `if st.ws_seq != seq_before.get(symbol): continue`
+    ⇒ 紅在 `assert st.long_position == 0.02`（實際變成 REST 的 0.0）。
+    """
+    st = bot.state.symbols[SYMBOL]
+    st.long_position = 0.0
+
+    # REST 回的是「成交之前」的快照：沒有任何持倉
+    ex = _FakeExchange(positions=[
+        {"symbol": SYMBOL, "contracts": 0.0, "side": "long", "unrealizedPnl": 0.0},
+    ])
+
+    async def ws_fill_arrives():
+        # REST 還在路上時，userData 推來成交後的新持倉（不取 symbol lock）
+        await bot._handle_account_update({"a": {"B": [], "P": [
+            {"s": "XRPUSDC", "pa": "0.02", "up": "1.5", "ps": "LONG"},
+        ]}})
+
+    ex.on_fetch = ws_fill_arrives
+    bot.ctx.exchange = ex
+    bot.gateway.call = _inline_gateway_call
+
+    seq_at_start = st.ws_seq
+    ok = await bot.sync_service._sync_positions()
+
+    assert ok is True, "丟棄過期快照不算同步失敗——state 裡的值是對的（且更新）"
+    assert st.ws_seq > seq_at_start, "WS handler 必須遞增 ws_seq，否則守衛根本沒被觸發"
+    assert st.long_position == 0.02, "REST 舊快照蓋掉了 WS 剛寫進來的持倉"
+    assert st.unrealized_pnl == 1.5
+
+
+@pytest.mark.asyncio
+async def test_ws_order_write_during_fetch_is_not_overwritten(bot):
+    """WS 把某側掛單計數歸零、正要重掛時，不得被同一輪 REST 的舊快照寫回非 0。
+
+    反方向但同樣靜默的後果：`_should_adjust_grid`（bot.py）看到
+    `sell_long_orders > 0` 就回 False ⇒ 該側網格漏掛，最長一整個 sync_interval。
+
+    mutation（實跑過）：拿掉 `_sync_orders` apply 區塊裡的
+    `if state.ws_seq != seq_before: continue`
+    ⇒ 紅在 `assert st.sell_long_orders == 0`（實際變成 REST 的 0.02）。
+    """
+    st = bot.state.symbols[SYMBOL]
+    st.sell_long_orders = 0.02
+    bot.adjust_grid = AsyncMock()      # handler 尾端會呼叫，這裡不是待驗行為
+
+    # REST 回的是「成交之前」的快照：那張止盈單還掛著
+    ex = _FakeExchange(open_orders=[
+        {"side": "sell", "info": {"origQty": "0.02", "positionSide": "LONG"}},
+    ])
+
+    async def ws_fill_arrives():
+        await bot._handle_order_update({"o": {
+            "s": "XRPUSDC", "X": "FILLED", "S": "SELL", "ps": "LONG",
+            "rp": "0.3", "p": "100", "q": "0.02",
+        }})
+
+    ex.on_fetch = ws_fill_arrives
+    bot.ctx.exchange = ex
+    bot.gateway.call = _inline_gateway_call
+
+    seq_at_start = st.ws_seq
+    ok = await bot.sync_service._sync_orders()
+
+    assert ok is True
+    assert st.ws_seq > seq_at_start, "WS handler 必須遞增 ws_seq，否則守衛根本沒被觸發"
+    assert st.sell_long_orders == 0, "REST 舊快照把剛成交歸零的掛單計數寫回去了"
+
+
+@pytest.mark.asyncio
+async def test_rest_snapshot_still_applied_when_ws_is_silent(bot):
+    """守衛不得變成「REST 永遠不生效」：WS 沒動過就照常 apply。
+
+    這條是上面兩條的對照組——只斷言「丟棄」而不斷言「不丟棄時要寫入」，
+    等於一個 `return` 就能讓兩條測試全綠。
+    """
+    st = bot.state.symbols[SYMBOL]
+    ex = _FakeExchange(
+        positions=[{"symbol": SYMBOL, "contracts": 0.05, "side": "long", "unrealizedPnl": 2.0}],
+        open_orders=[{"side": "sell", "info": {"origQty": "0.02", "positionSide": "LONG"}}],
+    )
+    bot.ctx.exchange = ex
+    bot.gateway.call = _inline_gateway_call
+
+    assert await bot.sync_service._sync_positions() is True
+    assert await bot.sync_service._sync_orders() is True
+    assert st.long_position == 0.05
+    assert st.unrealized_pnl == 2.0
+    assert st.sell_long_orders == 0.02
+
+
+@pytest.mark.asyncio
+async def test_position_snapshot_discard_is_per_symbol(bot):
+    """丟棄粒度是單一 symbol，不是整輪：`_sync_positions` 先把所有 symbol 聚合
+    成 agg 再逐一 apply，整輪丟棄會讓一個活躍 symbol 餓死其他所有 symbol 的對帳。
+    """
+    other = "SOL/USDC:USDC"
+    bot.state.symbols[other] = SymbolState(symbol=other)
+    st = bot.state.symbols[SYMBOL]
+    st.long_position = 0.0
+
+    ex = _FakeExchange(positions=[
+        {"symbol": SYMBOL, "contracts": 0.0, "side": "long", "unrealizedPnl": 0.0},
+        {"symbol": other, "contracts": 3.0, "side": "long", "unrealizedPnl": 7.0},
+    ])
+
+    async def ws_fill_arrives():
+        # 只動 XRP（SOL 不在 P 陣列裡），但 handler 會把兩個 symbol 的 ws_seq 都推進
+        await bot._handle_account_update({"a": {"B": [], "P": [
+            {"s": "XRPUSDC", "pa": "0.02", "up": "1.5", "ps": "LONG"},
+        ]}})
+
+    ex.on_fetch = ws_fill_arrives
+    bot.ctx.exchange = ex
+    bot.gateway.call = _inline_gateway_call
+
+    await bot.sync_service._sync_positions()
+
+    assert st.long_position == 0.02          # WS 的值保住
+    # SOL 的 ws_seq 也被同一次 ACCOUNT_UPDATE 推進（handler 會把每個 symbol 的
+    # unrealized_pnl 歸零 = 全部都髒），所以它這一輪同樣被丟棄。這是刻意的保守
+    # 方向：ACCOUNT_UPDATE 是「整個帳戶的快照」，宣稱它只動到 P 陣列裡那些
+    # symbol 是不成立的。下一輪（10s 後）沒有 WS 撞進來就會補上。
+    assert bot.state.symbols[other].long_position == 0.0
+
+
+# --- B2（dual-review Important）：sleep 之後、sync_all 之前的停機檢查 ----------
+
+@pytest.mark.asyncio
+async def test_stop_set_during_sleep_skips_that_round(sync):
+    """`run()` 裡 sleep 之後那句 `if self._stop_event.is_set(): break` 是唯一擋住
+    「共享停機訊號已 set，卻又跑一輪 `_sync_account → check_trailing_stop →
+    close_symbol_positions`（**送市價平倉單**）」的東西。
+
+    為什麼不能用「被呼叫時就 set() 的 fake `_sync_positions`」來測（外部
+    reviewer 的建議寫法）：那樣 stop 是在**這一輪已經開始之後**才被 set 的，
+    第二輪根本不會開始——因為 `while not self._stop_event.is_set()` 自己就擋掉
+    了。刪掉那兩行照樣全綠，等於一條會執行的註解。有鑑別力的情境只有一個：
+    **stop 落在 sleep 中途**，while 的條件已經檢查完了。
+
+    mutation（實跑過）：刪掉 run() 裡 sleep 之後的那兩行
+    ⇒ 紅在 `sync._sync_positions.assert_not_called()`（實際被呼叫 1 次）。
+    """
+    sync.config.sync_interval = 0.3
+    task = asyncio.create_task(sync.run())
+    await asyncio.sleep(0.05)               # 落在第一輪 sleep 中間
+    assert sync._sync_positions.call_count == 0, "前置條件：這時第一輪還在睡"
+    sync._stop_event.set()                  # 共享停機訊號（bot.stop() 會做的事）
+    await asyncio.wait_for(task, timeout=2.0)
+
+    sync._sync_positions.assert_not_called()
+    sync._sync_account.assert_not_called()  # 這條才是會下市價單的那一個
+    assert task.done() and task.exception() is None
+
+
+# --- B5（dual-review Important）：sync_once ------------------------------------
+
+@pytest.mark.asyncio
+async def test_sync_once_evaluates_the_outcome(sync, notified):
+    """`sync_once()` = `sync_all()` + `_evaluate()`。「一輪同步的結果必須被評估」
+    這條不變式收在 SyncService 內一處，不再散到 bot.py（那裡呼叫私有 `_evaluate`）。
+    """
+    sync._sync_positions = AsyncMock(return_value=False)
+    for _ in range(SYNC_FAILURE_THRESHOLD):
+        outcome = await sync.sync_once()
+    assert outcome.positions_ok is False
+    assert sync._consecutive_failures == SYNC_FAILURE_THRESHOLD
+    assert len(notified) == 1               # 有被評估過才會發降級告警
+
+
+def test_bot_uses_sync_once_not_private_evaluate():
+    """bot.run() 不得再直接呼叫私有 `_evaluate()`（B5 的 tripwire）。"""
+    import inspect
+    src = inspect.getsource(MaxGridBot.run)
+    assert "sync_once" in src
+    # 比對「呼叫」而不是裸字串 `_evaluate`：檔內註解會提到這個名字。
+    assert "sync_service._evaluate" not in src
+
+
+# --- M8：狀態轉換一律留 log，與 notifier 是否啟用無關 --------------------------
+
+def test_state_transition_logs_even_when_notifier_disabled(sync, caplog):
+    """沒設 Telegram 的部署，降級/恢復原本連一行 log 都沒有（`_notify` 直接
+    return）⇒ 整個降級狀態機不可觀測。"""
+    assert sync.notifier.enabled is False
+    with caplog.at_level("WARNING"):
+        for _ in range(SYNC_FAILURE_THRESHOLD):
+            sync._evaluate(SyncOutcome(positions_ok=False))
+        sync._evaluate(SyncOutcome())
+    text = "\n".join(r.getMessage() for r in caplog.records)
+    assert "降級" in text
+    assert "恢復" in text
+
+
+# --- M7：fallback 值釘住 config 預設 ------------------------------------------
+
+def test_fallback_equals_config_default():
+    """非法 config 的 fallback = `GlobalConfig.sync_interval` 預設值。
+
+    刻意不 import GlobalConfig 進 sync_service（避免循環相依），改由這條測試
+    釘住兩者相等：預設值日後被改而 fallback 沒跟上就會紅。
+    fallback 不可比預設值更小——config 已經壞掉的情境下把 REST 頻率拉高，
+    而 RestGateway 是單 worker、與 place_order 共用同一條 queue（見 M7）。
+    """
+    from grid_engine.sync_service import SYNC_INTERVAL_FALLBACK
+    assert SYNC_INTERVAL_FALLBACK == GlobalConfig().sync_interval == 10.0

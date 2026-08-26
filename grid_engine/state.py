@@ -33,6 +33,16 @@ class SymbolState:
     total_trades: int = 0
     total_profit: float = 0
 
+    # WS 寫入版本號：每次 userData handler 動到本 symbol 的持倉/浮盈/掛單計數
+    # 就 +1（bot._handle_account_update / bot._handle_order_update）。
+    # 用途只有一個——REST 同步（sync_service._sync_positions/_sync_orders）在
+    # 「fetch 之前」抓一份，「apply 時（symbol lock 內）」比對，變了就丟棄這個
+    # symbol 的 REST 快照。REST 的 fetch→apply 中間隔著一整趟 round-trip 的
+    # await，而 WS handler 不取 symbol lock；沒有這個版本號，REST 會拿過期快照
+    # 蓋掉成交後的新持倉/掛單計數（見 sync_service 檔頭的不變式敘述）。
+    # 只增不減、不重置；Python int 無上限，不會繞回。
+    ws_seq: int = 0
+
     # 裝死模式狀態
     long_dead_mode: bool = False
     short_dead_mode: bool = False

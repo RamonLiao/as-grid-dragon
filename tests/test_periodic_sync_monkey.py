@@ -38,11 +38,13 @@ def _make_bot():
 def sync():
     bot = _make_bot()
     s = bot.sync_service
-    s._sync_positions = AsyncMock()
-    s._sync_orders = AsyncMock()
-    s._sync_account = AsyncMock()
-    s._sync_funding_rates = AsyncMock()
-    s._sync_trade_stats = AsyncMock()
+    # return_value=True 不可省（dual-review M9，同 test_periodic_sync.py 的 fixture）：
+    # 裸 AsyncMock() 回 truthy 的 MagicMock，SyncOutcome 的欄位就不是布林 True。
+    s._sync_positions = AsyncMock(return_value=True)
+    s._sync_orders = AsyncMock(return_value=True)
+    s._sync_account = AsyncMock(return_value=True)
+    s._sync_funding_rates = AsyncMock(return_value=True)
+    s._sync_trade_stats = AsyncMock(return_value=True)
     yield s
     clock.reset_clock()
     clock.reset_guard_clock()
@@ -111,7 +113,23 @@ async def test_concurrent_run_and_manual_sync_all(sync):
     是裝飾性斷言。該語意由 test_periodic_sync.py 的
     test_none_and_skipped_do_not_move_counter 守住（它驗的是 _evaluate 對
     skipped 的處理，不是 dataclass 的預設值）。
+
+    (3) **真的斷言「不得重入」**（dual-review M10）：上面兩條都沒有驗到
+    docstring 宣稱的重入語意——把 `sync_all()` 開頭的 `if self._sync_lock.locked():
+    return` 與 `async with self._sync_lock` 一起拿掉，兩條照樣全綠。這裡用一個
+    進入 +1 / 離開 -1 的計數器包住 `_sync_positions`（中間刻意 `await` 讓出控制
+    權，給重入機會），最大同時進入數必須是 1。
     """
+    depth = {"cur": 0, "max": 0}
+
+    async def counting_positions():
+        depth["cur"] += 1
+        depth["max"] = max(depth["max"], depth["cur"])
+        await asyncio.sleep(0)      # 讓出控制權：沒有鎖的話這裡就會被別人插進來
+        depth["cur"] -= 1
+        return True
+
+    sync._sync_positions = counting_positions
     sync.config.sync_interval = 0.01
     task = asyncio.create_task(sync.run())
     results = await asyncio.gather(*[sync.sync_all() for _ in range(5)])
@@ -121,6 +139,7 @@ async def test_concurrent_run_and_manual_sync_all(sync):
 
     assert not sync._sync_lock.locked()
     assert all(isinstance(r, SyncOutcome) for r in results)
+    assert depth["max"] == 1, f"sync_all 重入了（同時最多 {depth['max']} 個在跑）"
 
 
 @pytest.mark.asyncio

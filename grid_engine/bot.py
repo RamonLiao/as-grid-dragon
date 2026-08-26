@@ -658,7 +658,14 @@ class MaxGridBot:
 
                     logger.info(f"[userData] {asset} 錢包餘額更新: {wallet_balance:.2f}")
 
+            # ws_seq 在**任何寫入之前**遞增，且涵蓋所有 symbol：下面這個迴圈本身
+            # 就會把每個 symbol 的 unrealized_pnl 歸零（不只 P 陣列裡有的那些），
+            # 所以「這次 ACCOUNT_UPDATE 動到哪些 symbol」的答案是「全部」。
+            # 先遞增再寫入，是為了讓「寫到一半拋例外」的部分寫入也一樣被 REST 端
+            # 判定成髒（保守方向：寧可丟掉一輪 REST 快照，不要蓋掉新資料）。
+            # 這一整個 handler 內沒有 await，遞增與寫入對 event loop 是原子的。
             for sym_state in self.state.symbols.values():
+                sym_state.ws_seq += 1
                 sym_state.unrealized_pnl = 0
 
             positions = account_data.get('P', [])
@@ -745,6 +752,12 @@ class MaxGridBot:
                 else:
                     logger.info(f"[userData] {symbol_raw} 開倉成交: {side} {position_side}")
 
+                # 先遞增 ws_seq 再改掛單計數（同 _handle_account_update）：這幾行
+                # 之後緊接著 `await self.adjust_grid(...)` 會依這些計數重掛網格，
+                # 若 REST 的舊快照在這中間把計數蓋回非 0，_should_adjust_grid 會
+                # 回 False，該側網格靜默漏掛整個 sync_interval。遞增到 await 之前
+                # 這段沒有 await，對 event loop 是原子的。
+                sym_state.ws_seq += 1
                 if position_side == 'LONG':
                     if side == 'BUY':
                         sym_state.buy_long_orders = 0
@@ -793,10 +806,12 @@ class MaxGridBot:
                 ):
                     self._bandit_last_saved_pulls = self.bandit_optimizer.total_pulls
 
-            # 回傳值必須餵進 _evaluate()：啟動當下 REST 就壞掉（key 被撤、IP 被擋）
-            # 是最該立刻知道的情境，丟掉回傳值等於這一輪完全不計數、還要再等
-            # 3 × sync_interval 才會有第一次計數（見最終 review M1 / Ruling 5）。
-            self.sync_service._evaluate(await self.sync_service.sync_all())
+            # 用 sync_once()（= sync_all() + _evaluate()）而不是自己拆兩步：啟動
+            # 當下 REST 就壞掉（key 被撤、IP 被擋）是最該立刻知道的情境，漏掉
+            # 評估等於這一輪完全不計數、還要再等 3 × sync_interval 才會有第一次
+            # 計數（見最終 review M1 / Ruling 5）。「一輪同步必須被評估」這條
+            # 不變式收在 SyncService 內一處，不再散到這個檔（dual-review B5）。
+            await self.sync_service.sync_once()
         except Exception as e:
             logger.error(f"[MAX] 初始化失敗: {e}")
             await self.notifier.notify_crash(f"初始化失敗: {e}")

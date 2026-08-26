@@ -212,3 +212,32 @@ def test_recovered_line_survives_broken_total(bad):
         {"degraded": False, "consecutive_failures": 0, "degraded_total": bad})
     assert line != ""
     assert "異常" in line
+
+
+# --- B3（dual-review Important）：門檻的天花板 --------------------------------
+
+def test_heartbeat_threshold_has_ceiling():
+    """interval 被設成巨大但**有限**的值時，6*interval 會讓停擺門檻大到永不告警
+    ——停擺偵測被一個設定值靜默關掉。1 小時的天花板擋住這件事。
+
+    mutation（實跑過）：把 `min(..., SYNC_STALE_CEILING_SEC)` 拿掉
+    ⇒ 紅在第二個斷言（門檻變成 6*86400=518400s，4000s 的停擺完全不告警）。
+    """
+    # interval=86400（一天）：舊算法門檻 518400s，新算法被夾到 3600s
+    assert TelegramNotifier._format_sync_line(_hb(3000.0, interval=86400.0)) == ""
+    assert "停擺" in TelegramNotifier._format_sync_line(_hb(4000.0, interval=86400.0))
+
+
+# --- M12：age 與 interval 的 try 必須拆開 --------------------------------------
+
+def test_broken_interval_does_not_poison_healthy_age():
+    """`interval` 欄位壞掉不得讓**健康的 age** 也被判成「心跳讀取異常」：
+    主訊號（心跳）不該因為門檻參數讀不到就變成告警或消失。
+    壞掉的 interval 退回 0.0 ⇒ 門檻落到 60s 這個安全地板。
+    """
+    # age 健康（5s < 60s 地板）⇒ 整行省略，不誤報
+    assert TelegramNotifier._format_sync_line(_hb(5.0, interval="abc")) == ""
+    # age 真的停擺 ⇒ 照樣印停擺，而不是「心跳讀取異常」
+    line = TelegramNotifier._format_sync_line(_hb(1800.0, interval="abc"))
+    assert "停擺" in line
+    assert "異常" not in line

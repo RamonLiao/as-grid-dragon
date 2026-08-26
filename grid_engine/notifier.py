@@ -9,6 +9,13 @@ import aiohttp
 from datetime import datetime
 from .utils import logger
 
+# REST 同步「停擺」判定門檻的地板與天花板（秒）。門檻本體是 6 * sync_interval：
+# 地板擋 interval 被設得極小（測試用 0.01）時門檻塌成毫秒級的誤報；天花板擋
+# interval 被設得巨大但有限時門檻大到永不告警（dual-review B3）——1 小時沒有
+# 任何一輪同步跑完，不管 interval 設多少都是異常。
+SYNC_STALE_FLOOR_SEC = 60.0
+SYNC_STALE_CEILING_SEC = 3600.0
+
 
 class TelegramNotifier:
     """Telegram Bot 通知器"""
@@ -320,7 +327,8 @@ class TelegramNotifier:
         branch 要根除的形態。last_sync_age 是唯一由「同步真的跑完」推進的量，
         超過門檻就**無條件**印警告，蓋掉其他分支。門檻 max(60, 6*interval)：
         6 輪的餘裕吸收得掉單次 REST 抖動與重試，60s 的地板擋住 interval 被設得
-        極小時（測試用 0.01）門檻跟著塌成毫秒級的誤報。
+        極小時（測試用 0.01）門檻跟著塌成毫秒級的誤報，3600s 的天花板擋住
+        interval 被設得極大時門檻大到永不告警（dual-review B3）。
 
         壞欄位一律降級成保守文案、不整行消失（#7）：`int(None)` 讓整行回 ""
         等於「降級中的警告被一個型別錯吞掉」——fail-silent 換個位置重演。
@@ -336,11 +344,18 @@ class TelegramNotifier:
             age = sync.get("last_sync_age")
             if age is None:
                 return "⚠️ <b>REST 同步停擺</b>：自啟動以來從未完成任何一輪同步\n"
+            # age 與 interval 拆成兩個 try（#M12）：共用一個 try 時，interval
+            # 欄位壞掉會讓**健康的 age** 也被判成讀取異常——主訊號（心跳）不該
+            # 因為門檻參數讀不到就消失。interval 壞掉退回 0.0，門檻自然落到
+            # SYNC_STALE_FLOOR_SEC 這個安全地板。
             try:
                 age = float(age)
-                interval = float(sync.get("sync_interval", 0) or 0)
             except Exception:
                 return "⚠️ <b>REST 同步</b>：心跳讀取異常，請查 log\n"
+            try:
+                interval = float(sync.get("sync_interval", 0) or 0)
+            except Exception:
+                interval = 0.0
             # NaN 的任何比較都是 False（會靜默穿過門檻判斷），±inf 會印出
             # 「距上次同步 inf 分鐘」——兩者都當成心跳異常處理，不放行。
             if not (float("-inf") < age < float("inf")):
@@ -352,7 +367,12 @@ class TelegramNotifier:
                 return "⚠️ <b>REST 同步</b>：偵測到時鐘後跳，同步時距不可信，請查 log\n"
             if not (0.0 <= interval < float("inf")):    # NaN / 負 / inf 一律不參與門檻
                 interval = 0.0
-            if age > max(60.0, 6.0 * interval):
+            # 門檻同時有地板與**天花板**（dual-review B3）：sync_interval 被設成
+            # 巨大但有限的值（例如 86400）時，6*interval 會讓門檻大到永遠不告警
+            # ——停擺偵測被一個設定值靜默關掉。1 小時之後不管 interval 是多少，
+            # 沒有任何一輪同步跑完就是異常。
+            threshold = min(max(SYNC_STALE_FLOOR_SEC, 6.0 * interval), SYNC_STALE_CEILING_SEC)
+            if age > threshold:
                 return f"⚠️ <b>REST 同步停擺</b>：距上次同步 {age / 60:.0f} 分鐘\n"
 
         degraded = bool(sync.get("degraded"))

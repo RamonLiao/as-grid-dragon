@@ -7,11 +7,33 @@
 `_sync_account()` → `risk_monitor.check_trailing_stop()` → `close_symbol_positions()`
 會送市價平倉單。驅動源從 `_handle_ticker`（跑在 WS recv 迴圈內、與 `adjust_grid`
 天生序列化）改成本檔 `run()` 的獨立 task 之後，**這條下單路徑與 `adjust_grid`
-是真的並行的**。今天安全的理由只有一個：`close_symbol_positions()` 自己會取
-symbol lock，而上面那條鎖序不變式是單向的（`_sync_lock` → symbol lock，沒有
-反向持有），所以兩條路徑不會互卡、也不會在同一個 symbol 上交錯改狀態。
-這是靠既有紀律碰巧成立、不是被設計出來的——寫在這裡是為了讓下一個人在動
-`check_trailing_stop` 的鎖或加新的下單路徑時知道自己踩在什麼上面。
+是真的並行的**。不互卡的理由是鎖序單向（`_sync_lock` → symbol lock，沒有反向
+持有）+ `close_symbol_positions()` 自己會取 symbol lock。這是靠既有紀律碰巧
+成立、不是被設計出來的——寫在這裡是為了讓下一個人在動 `check_trailing_stop`
+的鎖或加新的下單路徑時知道自己踩在什麼上面。
+
+⚠️ 不變式的正確敘述（2026-08-26 dual-review C1 修正；在那之前這段寫的是
+「不會在同一個 symbol 上交錯改狀態」，**那句是錯的**）：
+symbol lock 只保護 apply 的那一瞬間（鎖內無 await），**不保護 fetch→apply 的
+窗口**——`_sync_positions` / `_sync_orders` 從 REST 讀回資料到寫進 state 之間
+隔著一整趟 REST round-trip 的 await，而 WS handler（`bot._handle_account_update`
+/ `bot._handle_order_update`）**根本不取 symbol lock**，可以整段落在那個窗口裡。
+改動前這件事不會發生，純粹是因為 `sync_all()` 被 await 在 `_handle_ticker` 內、
+而 `ws_client` 的 recv 迴圈一次只跑一個 handler；搬成獨立 task 之後那個天然的
+序列化消失了。
+
+所以真正的不變式是：**apply 之前必須確認「這份 REST 快照對應的那一版 state 還
+沒被 WS 改過」**。作法是 `SymbolState.ws_seq`——WS handler 每次動持倉/掛單計數
+就 +1，REST 在 fetch 之前抓一份、在 symbol lock 內比對，變了就丟棄該 symbol 的
+快照（下一輪自然補上）。丟棄粒度是**單一 symbol**，不是整輪。
+刻意不採「把 fetch 也放進 symbol lock」：那會讓 `adjust_grid` 的
+`if lock.locked(): return` 在每次 REST round-trip 期間丟掉所有 tick。
+
+規約：**本檔所有計時／節流一律用 `clock.guard_now()`，不用 `clock.now()`**
+（2026-08-26 dual-review B4）。`now()` 是情境時鐘，backtester 每根 K 線用
+`set_clock()` 把它換成歷史 epoch，而 live bot 與回測跑在同一個行程——混用會讓
+節流量到大負數（每輪 early-return，統計靜默凍結）或在 `reset_clock()` 之後
+永久失效（節流形同關閉，API 權重暴增）。這裡量的是本機牆鐘，不是情境時間。
 """
 import asyncio
 from dataclasses import dataclass
@@ -60,10 +82,16 @@ TRADE_STATS_MAX_PAGES_PER_SYNC = 10
 # 短到能在一次保證金事件的時間尺度內發出，長到不會被單次 REST 抖動觸發。
 SYNC_FAILURE_THRESHOLD = 3
 
-# sleep(0) 會變成忙迴圈打爆 REST 配額；這不是下限，是非法 sync_interval
-# （非數／NaN／<=0）的 fallback 值。使用者刻意調小的合法值（例如測試用的
-# 0.01）不受這個常數限制，_loop_interval() 只糾正非法值，不夾住小值。
-MIN_SYNC_INTERVAL = 1.0
+# 非法 sync_interval（非數／NaN／±inf／<=0）的 fallback 值。**不是下限**：
+# 使用者刻意調小的合法值（例如測試用的 0.01）不受這個常數限制，
+# _loop_interval() 只糾正非法值，不夾住小值。
+# 值 = GlobalConfig.sync_interval 的預設值（10.0），由
+# test_periodic_sync.test_fallback_equals_config_default 釘住。
+# 2026-08-26 dual-review M7 從 1.0 改成 10.0（spec §10 修訂 6）：config 已經壞
+# 掉的情境下把 REST 頻率拉高 10 倍是最糟的選擇——RestGateway 是單 worker、與
+# place_order 共用同一條 queue，同步風暴會延遲下單、還可能吃到 Binance 權重限制。
+# 舊名 MIN_SYNC_INTERVAL 一併改掉：它從來就不是「最小值」，名字與語意不符。
+SYNC_INTERVAL_FALLBACK = 10.0
 
 
 @dataclass(frozen=True)
@@ -194,7 +222,12 @@ class SyncService:
         存引用防止 task 在執行前被 GC；完成後自移除避免長跑累積；無 event loop
         時只留 log（不退回 asyncio.run —— 那是純為了讓同步測試能跑而存在的
         生產程式碼路徑，專案規則 9 禁止兩個 pattern 混用）。
+
+        **log 一律先寫，與 notifier 是否啟用無關**（dual-review M8）：原本
+        `notifier.enabled` 為 False 時這個方法直接 return，降級/恢復的狀態轉換
+        連一行 log 都不會留 ⇒ 沒設 Telegram 的部署等於整個降級狀態機不可觀測。
         """
+        logger.warning(f"[sync] {message}")
         if not self.notifier.enabled:
             return
         try:
@@ -208,9 +241,15 @@ class SyncService:
     def _loop_interval(self) -> float:
         """本輪 sleep 秒數。每輪重讀 config，讓執行中改設定下一輪就生效。
 
-        只糾正非法值（非數／NaN／<=0），不夾合法小值——使用者刻意調小
+        只糾正非法值（非數／NaN／±inf／<=0），不夾合法小值——使用者刻意調小
         （例如測試用的 0.01）是合法意圖，只有非法值才需要糾正到
-        MIN_SYNC_INTERVAL fallback。
+        SYNC_INTERVAL_FALLBACK。
+
+        `+inf` 必須擋（dual-review B3）：`asyncio.sleep(inf)` 不會醒，`_stop_event`
+        也叫不醒它（sleep 不受 event 中斷），執行中把設定改回正常值同樣救不回來
+        （每輪才重讀 config，而這一輪永遠不會結束）⇒ REST 同步整條停擺、降級狀態機
+        一次都不會被推進 = 完全靜默。`notifier._format_sync_line` 對同一個量特地擋了
+        ±inf，producer 端漏掉才是問題所在。
 
         **本函式必須是 total function（任何輸入都回一個合法秒數，絕不拋例外）**：
         它被 `run()` 用在 `await asyncio.sleep(self._loop_interval())` 這一整句裡，
@@ -226,12 +265,14 @@ class SyncService:
             interval = float(self.config.sync_interval)
         except Exception as e:
             logger.warning(f"[sync] sync_interval 讀取/轉換失敗({e})，"
-                           f"本輪改用 fallback {MIN_SYNC_INTERVAL}s")
-            return MIN_SYNC_INTERVAL
-        if math.isnan(interval) or interval <= 0:
+                           f"本輪改用 fallback {SYNC_INTERVAL_FALLBACK}s")
+            return SYNC_INTERVAL_FALLBACK
+        # isfinite 一次擋掉 NaN 與 ±inf（-inf 也會被 <= 0 擋，但寫在同一個判斷裡
+        # 語意更清楚：這裡要的是「一個有限的正秒數」）。
+        if not math.isfinite(interval) or interval <= 0:
             logger.warning(f"[sync] sync_interval 非法({interval})，"
-                           f"本輪改用 fallback {MIN_SYNC_INTERVAL}s")
-            return MIN_SYNC_INTERVAL
+                           f"本輪改用 fallback {SYNC_INTERVAL_FALLBACK}s")
+            return SYNC_INTERVAL_FALLBACK
         return interval
 
     async def run(self):
@@ -254,9 +295,14 @@ class SyncService:
             try:
                 await asyncio.sleep(self._loop_interval())
                 slept = True
+                # 睡醒後再確認一次停機訊號（sleep 期間 bot.stop() 可能已經 set）。
+                # 這兩行是唯一擋住「共享停機訊號已 set，卻又跑一輪 _sync_account →
+                # check_trailing_stop → close_symbol_positions（送市價平倉單）」的
+                # 東西——while 的條件只在**進入**這一輪時檢查，擋不到 sleep 中途
+                # 才被 set 的情況。由 test_stop_set_during_sleep_skips_that_round 守。
                 if self._stop_event.is_set():
                     break
-                self._evaluate(await self.sync_all())
+                await self.sync_once()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -264,11 +310,30 @@ class SyncService:
                 self._evaluate(None, loop_error=True)
                 if not slept:
                     try:
-                        await asyncio.sleep(MIN_SYNC_INTERVAL)
+                        await asyncio.sleep(SYNC_INTERVAL_FALLBACK)
                     except asyncio.CancelledError:
                         break
 
+    async def sync_once(self) -> SyncOutcome:
+        """一輪同步 + 評估。**所有呼叫端只該用這個**（dual-review B5）。
+
+        `sync_all()` 保持純粹（只做同步、回報成敗，既有並發測試直接用它），
+        「一輪同步的結果必須被評估」這條不變式收斂在這裡一處——原本它散在
+        `run()` 與 `bot.run()` 兩個檔案，任何一邊漏掉就是一整輪不計數而且靜默。
+        """
+        outcome = await self.sync_all()
+        self._evaluate(outcome)
+        return outcome
+
     def stop(self):
+        """停整個 bot，不只停這條 loop。
+
+        `_stop_event` 是 bot 傳進來的**共享**停機訊號（與 ws_client /
+        userdata_watchdog / reporter 同一個實例，見 __init__ 的說明），所以呼叫
+        這個方法會一併停掉那些組件。刻意如此——反過來（私有事件）等於「共享
+        停機訊號已 set，這條會下單的 loop 卻照跑」。副作用寫在這裡是因為方法名
+        `stop()` 讀起來像是只停自己。
+        """
         self._stop_event.set()
 
     async def _sync_funding_rates(self) -> bool:
@@ -307,6 +372,12 @@ class SyncService:
         return ok
 
     async def _sync_positions(self) -> bool:
+        # fetch 之前先抓每個 symbol 的 WS 版本號（見檔頭不變式）。下面那個
+        # `await` 是一整趟 REST round-trip，期間 bot._handle_account_update 可以
+        # 把成交後的新持倉寫進 state；沒有這道比對，apply 會拿 REST 的舊快照蓋
+        # 回去 ⇒ _grid_step 的 `long_position == 0` 分岔走錯邊 ⇒ 撤掉剛掛好的
+        # 網格並重新開倉（會動錢，且完全靜默）。
+        seq_before = {s: st.ws_seq for s, st in self.state.symbols.items()}
         try:
             positions = await self.gateway.call(self.ctx.exchange.fetch_positions, params={'type': 'future'})
         except Exception as e:
@@ -330,6 +401,15 @@ class SyncService:
             async with self.locks.get(symbol):
                 # 原子 apply：鎖內無其他 await
                 st = self.state.symbols[symbol]
+                if st.ws_seq != seq_before.get(symbol):
+                    # WS 在 fetch→apply 窗口內動過這個 symbol ⇒ REST 快照已過期，
+                    # 丟棄**這一個 symbol**（不是整輪；其他 symbol 的快照仍然有效）。
+                    # 不重試：下一輪 sync_all 自然會補上，而 WS 的值比 REST 新。
+                    # 這行 log 常態出現代表 WS 事件密度已經高到 REST 對帳被持續
+                    # 餓死（每 symbol 每輪至多一行，不會洗版）。
+                    logger.info(f"[sync] {symbol} 持倉快照過期（WS 在 fetch 期間更新），"
+                                f"本輪丟棄，下一輪重取")
+                    continue
                 st.long_position = long_pos
                 st.short_position = short_pos
                 st.unrealized_pnl = upnl
@@ -343,6 +423,12 @@ class SyncService:
             symbol = sym_config.ccxt_symbol
 
             try:
+                # 同 _sync_positions：fetch 之前抓版本號（見檔頭不變式）。這裡的
+                # 反向風險是 bot._handle_order_update 把某側掛單計數歸零、正要重掛，
+                # REST 舊快照把它寫回非 0 ⇒ _should_adjust_grid 回 False ⇒ 該側網格
+                # 靜默漏掛，最長一整個 sync_interval。
+                pre = self.state.symbols.get(symbol)
+                seq_before = pre.ws_seq if pre else None
                 orders = await self.gateway.call(self.ctx.exchange.fetch_open_orders, symbol=symbol)
                 state = self.state.symbols.get(symbol)
                 if not state:
@@ -363,6 +449,13 @@ class SyncService:
                         counts[3] += qty
                 async with self.locks.get(symbol):
                     # 原子 apply：鎖內無其他 await
+                    if state.ws_seq != seq_before:
+                        # 丟棄這個 symbol 的掛單快照（理由同 _sync_positions）。
+                        # seq_before 為 None（fetch 期間才被加進 state.symbols）
+                        # 也走這條：沒有 before 可比就不敢蓋。
+                        logger.info(f"[sync] {symbol} 掛單快照過期（WS 在 fetch 期間更新），"
+                                    f"本輪丟棄，下一輪重取")
+                        continue
                     state.buy_long_orders, state.sell_long_orders, \
                         state.buy_short_orders, state.sell_short_orders = counts
             except Exception as e:
@@ -432,11 +525,18 @@ class SyncService:
         `_last_trade_id` / `_last_trade_since`。分頁中途失敗絕不能半套用——半套用會讓
         下一輪從舊游標重新拉到這批已經算過的成交，造成重複計數（見 review Critical-2）。
 
+        節流時鐘用 `guard_now()` 不是 `now()`（dual-review B4，與檔頭規約一致）：
+        `now()` 會被 backtester 換成歷史 epoch，邊實盤邊點回測時 `now() -
+        _last_trade_stats_at` 是大負數 ⇒ 每輪 early-return、成交統計靜默凍結；
+        回測結束 `reset_clock()` 後時間戳卡在歷史 epoch ⇒ 節流失效 ⇒ 每 10s 打
+        一次 fetch_my_trades（正是 test_body_exception_does_not_disable_throttle
+        警告過的「靜默變成 6 倍 API 權重」）。
+
         口徑注意：舊路徑（userData ORDER_TRADE_UPDATE）數的是「FILLED 事件」，每張單一次；
         這裡數的是 `fetch_my_trades` 回傳的成交紀錄，部分成交會拆成多筆，口徑因此略有偏高。
         非嚴格等價，但實務影響小（BNBUSDC 常見單量 0.02，很少發生部分成交拆單）。
         """
-        if clock.now() - self._last_trade_stats_at < TRADE_STATS_INTERVAL:
+        if clock.guard_now() - self._last_trade_stats_at < TRADE_STATS_INTERVAL:
             return True
 
         try:
@@ -465,7 +565,7 @@ class SyncService:
             # （正是這層保險要接的那種）會讓時間戳永不前進 ⇒ 之後每一次 sync_all()
             # （每 10s）都重打 fetch_my_trades，靜默變成 6 倍 API 權重，且每輪重做
             # 同一批 pending 計算（見 dual-review B1）。
-            self._last_trade_stats_at = clock.now()
+            self._last_trade_stats_at = clock.guard_now()
 
     async def _sync_trade_stats_body(self):
         for sym_config in self.config.symbols.values():

@@ -10,14 +10,21 @@ _WATCHDOG_VALID_STATES = ("healthy", "degraded", "given_up")
 
 class DailyReporter:
     def __init__(self, config, state, notifier, stop_event: asyncio.Event, watchdog=None,
-                 stale_quote_source=None, sync_source=None):
+                 stale_quote_source=None):
         self.config = config
         self.state = state
         self.notifier = notifier
         self._stop_event = stop_event
         self.watchdog = watchdog
         self.stale_quote_source = stale_quote_source
-        self.sync_source = sync_source
+        # sync_source 刻意**沒有** ctor kwarg（2026-08-26 dual-review M6）：
+        # SyncService 建構在 DailyReporter 之後（它需要 RiskMonitor，而 reporter
+        # 不需要它），生產端與測試端一律走後置指派（bot.py 的
+        # `self.reporter.sync_source = self.sync_service`，與 `reporter.watchdog`
+        # 同一個 pattern）。留一個沒有任何呼叫端的 kwarg = 兩個並存的注入方式，
+        # 違反「兩個 pattern 互斥時選一個」；選刪 kwarg 而不是把建構順序倒過來，
+        # 是因為後者為了美觀新增一條硬性建構順序約束，收益為零。
+        self.sync_source = None
 
     def _get_watchdog_status(self):
         """讀取 watchdog 狀態供每日摘要顯示。
