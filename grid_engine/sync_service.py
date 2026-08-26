@@ -41,6 +41,11 @@ TRADE_STATS_MAX_PAGES_PER_SYNC = 10
 # 短到能在一次保證金事件的時間尺度內發出，長到不會被單次 REST 抖動觸發。
 SYNC_FAILURE_THRESHOLD = 3
 
+# sleep(0) 會變成忙迴圈打爆 REST 配額；這不是下限，是非法 sync_interval
+# （非數／NaN／<=0）的 fallback 值。使用者刻意調小的合法值（例如測試用的
+# 0.01）不受這個常數限制，_loop_interval() 只糾正非法值，不夾住小值。
+MIN_SYNC_INTERVAL = 1.0
+
 
 @dataclass(frozen=True)
 class SyncOutcome:
@@ -169,6 +174,47 @@ class SyncService:
             task.add_done_callback(lambda t: t in self.tasks and self.tasks.remove(t))
         except RuntimeError:
             logger.warning(f"[sync] 無 event loop，通知未送出: {message}")
+
+    def _loop_interval(self) -> float:
+        """本輪 sleep 秒數。每輪重讀 config，讓執行中改設定下一輪就生效。
+
+        只糾正非法值（非數／NaN／<=0），不夾合法小值——使用者刻意調小
+        （例如測試用的 0.01）是合法意圖，只有非法值才需要糾正到
+        MIN_SYNC_INTERVAL fallback。
+        """
+        try:
+            interval = float(self.config.sync_interval)
+        except (TypeError, ValueError):
+            logger.warning(f"[sync] sync_interval 非數值({self.config.sync_interval!r})，"
+                           f"夾到 {MIN_SYNC_INTERVAL}s")
+            return MIN_SYNC_INTERVAL
+        if math.isnan(interval) or interval <= 0:
+            logger.warning(f"[sync] sync_interval 非法({interval})，夾到 {MIN_SYNC_INTERVAL}s")
+            return MIN_SYNC_INTERVAL
+        return interval
+
+    async def run(self):
+        """常駐同步驅動。移除 _handle_ticker 的呼叫後，這是唯一驅動源。
+
+        例外一律吞掉續跑：這個 task 一死，REST 同步完全消失（比改動前更糟），
+        所以它不能有「因為某次同步炸了就退出」的分支。CancelledError 例外——
+        那是 bot.stop() 的收尾訊號，必須讓它穿過去。
+        """
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(self._loop_interval())
+                if self._stop_event.is_set():
+                    break
+                outcome = await self.maybe_sync()
+                self._evaluate(outcome)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"[sync] 週期同步失敗: {e}")
+                self._evaluate(None, loop_error=True)
+
+    def stop(self):
+        self._stop_event.set()
 
     async def _sync_funding_rates(self) -> bool:
         """同步所有交易對的 funding rate。

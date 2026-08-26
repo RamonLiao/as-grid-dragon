@@ -208,3 +208,69 @@ def test_threshold_literal_fires_on_third_not_second(sync, notified):
 
     sync._evaluate(SyncOutcome(positions_ok=False))
     assert len(notified) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_syncs_while_ticker_is_completely_silent(sync):
+    """本改動的核心主張：_handle_ticker 一次都不被呼叫，同步照樣進行。
+
+    這是整份計畫存在的理由——今天 maybe_sync 只掛在 ticker handler 上，
+    bookTicker 一斷，持倉同步/保證金告警/訂單對帳全部靜默停擺。
+    """
+    sync.config.sync_interval = 0.01
+    task = asyncio.create_task(sync.run())
+    await asyncio.sleep(0.1)
+    sync.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert sync._sync_positions.call_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_run_exits_cleanly_on_cancel(sync):
+    """CancelledError 必須穿過去：bot.stop() 靠 cancel + await 收尾，
+    被 except Exception 吃掉會讓關機卡住。
+
+    task.cancelled() 而不只是 task.done() 才能分辨兩種退出路徑：CancelledError
+    若沒被 run() 內部 `except asyncio.CancelledError: break` 接住，它會直接穿出
+    run()，task 進入 cancelled 狀態——用 gather(return_exceptions=True) 收尾時
+    兩種路徑都不會 hang、task.done() 兩者皆真，只有 task.cancelled() 能照出
+    「有沒有接住」的差異（asyncio.CancelledError 繼承 BaseException，不會被
+    `except Exception` 攔到，所以順序本身不會讓程式掛住，但沒接住會讓 task
+    帶著 cancelled 狀態退出，與『乾淨退出』的預期不符）。
+    """
+    sync.config.sync_interval = 0.01
+    task = asyncio.create_task(sync.run())
+    await asyncio.sleep(0.03)
+    task.cancel()
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1.0)
+    assert task.done()
+    assert not task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_run_survives_exception_and_counts_it(sync, notified):
+    """loop 內例外不得殺掉 task——修一個靜默故障的改動自己不能靜默死掉。"""
+    sync.config.sync_interval = 0.01
+    sync.sync_all = AsyncMock(side_effect=RuntimeError("boom"))
+    task = asyncio.create_task(sync.run())
+    await asyncio.sleep(0.15)
+    sync.stop()
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    assert sync._consecutive_failures >= SYNC_FAILURE_THRESHOLD
+    assert len(notified) == 1
+
+
+@pytest.mark.parametrize("bad", [0, -5, float("nan"), "abc", None])
+def test_loop_interval_clamps_illegal_values(sync, bad):
+    """sleep(0) 會變成忙迴圈打爆 REST 配額。夾到下限而非 fallback 預設值：
+    使用者刻意調小是合法意圖，只有非法值才需要糾正。
+    """
+    sync.config.sync_interval = bad
+    assert sync._loop_interval() >= 1.0
+
+
+def test_loop_interval_respects_legal_small_value(sync):
+    sync.config.sync_interval = 2.5
+    assert sync._loop_interval() == 2.5
