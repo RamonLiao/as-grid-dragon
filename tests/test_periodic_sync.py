@@ -533,6 +533,38 @@ async def test_rest_snapshot_still_applied_when_ws_is_silent(bot):
 
 
 @pytest.mark.asyncio
+async def test_rest_sync_positions_writes_upnl_to_matching_side(bot):
+    """REST `_sync_positions` 必須把多單浮盈寫進 `long_upnl`、空單浮盈寫進
+    `short_upnl`，不能兩側對調，也不能有一側漏寫。
+
+    `unrealized_pnl` 只是 `long_upnl + short_upnl` 的合計 property（見
+    state.py）——只斷言合計對這兩種寫錯完全不敏感：
+      - 把兩側的目標欄位對調（long 的浮盈寫進 short_upnl，反之亦然），合計不變，
+        全綠；但下一個只帶單邊的 WS 事件會把其中一側再寫一次，另一側永遠留著
+        錯的舊值，合計就此偏離。
+      - 整段刪掉其中一側的寫入（例如 short_upnl 永遠不被 REST 更新），初始合計
+        仍然對（因為 fixture 一開始兩側都是 0），只有等 WS 也不巧沒補上那一側
+        才會現形——生產環境就是這樣：靠合計掩護到 `risk_monitor` 拿錯 drawdown
+        才炸出來（見 risk_monitor.py 的 close_symbol_positions）。
+    所以這裡刻意分側斷言 `long_upnl` / `short_upnl`，而不是只驗 `unrealized_pnl`。
+    """
+    st = bot.state.symbols[SYMBOL]
+    ex = _FakeExchange(positions=[
+        {"symbol": SYMBOL, "contracts": 0.05, "side": "long", "unrealizedPnl": 2.0},
+        {"symbol": SYMBOL, "contracts": 0.03, "side": "short", "unrealizedPnl": -0.7},
+    ])
+    bot.ctx.exchange = ex
+    bot.gateway.call = _inline_gateway_call
+
+    assert await bot.sync_service._sync_positions() is True
+    assert st.long_position == 0.05
+    assert st.short_position == 0.03
+    assert st.long_upnl == 2.0, "多單浮盈必須寫進 long_upnl，不能寫錯側"
+    assert st.short_upnl == -0.7, "空單浮盈必須寫進 short_upnl，不能漏寫或寫錯側"
+    assert st.unrealized_pnl == pytest.approx(1.3)
+
+
+@pytest.mark.asyncio
 async def test_position_snapshot_discard_is_per_symbol(bot):
     """丟棄粒度是單一 symbol，不是整輪：`_sync_positions` 先把所有 symbol 聚合
     成 agg 再逐一 apply，整輪丟棄會讓一個活躍 symbol 餓死其他所有 symbol 的對帳。
