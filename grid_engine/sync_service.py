@@ -101,10 +101,15 @@ class SyncService:
         )
 
     async def maybe_sync(self) -> Optional[SyncOutcome]:
-        """節流同步。回 None 表示本輪未達門檻（不算成功也不算失敗）。"""
-        if _time() - self.last_sync_time > self.config.sync_interval:
+        """節流同步。回 None 表示本輪未達門檻（不算成功也不算失敗）。
+
+        計時用 guard_now()（牆鐘）而非 now()（情境時鐘）：後者會被 backtester
+        替換成歷史 epoch，live 與回測同行程時會讓節流判斷錯亂。
+        與價格時效守衛（bot.py:415）用同一個時鐘，語意一致。
+        """
+        if clock.guard_now() - self.last_sync_time > self.config.sync_interval:
             outcome = await self.sync_all()
-            self.last_sync_time = _time()
+            self.last_sync_time = clock.guard_now()
             return outcome
         return None
 

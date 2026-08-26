@@ -80,3 +80,38 @@ async def test_maybe_sync_returns_none_when_throttled(sync):
     await sync.maybe_sync()                 # 第一次必過（last_sync_time=0）
     second = await sync.maybe_sync()         # 立刻再來一次，門檻未過
     assert second is None
+
+
+@pytest.fixture
+def fake_clock():
+    """可推進的假守衛時鐘。注入 set_guard_clock 而非 set_clock：
+
+    live bot 與 backtester 同行程，clock.now() 會被 backtester 換成歷史 epoch。
+    同步節流量的是「本機牆鐘」，與情境時鐘是不同的物理量，混用是分類錯誤。
+    """
+    t = {"now": 1_000_000.0}
+    clock.set_guard_clock(lambda: t["now"])
+
+    def advance(seconds):
+        t["now"] += seconds
+    yield advance
+    clock.reset_guard_clock()
+
+
+@pytest.mark.asyncio
+async def test_maybe_sync_throttle_uses_guard_clock(sync, fake_clock):
+    """節流以守衛時鐘計時：推進時間就該再同步一次。"""
+    first = await sync.maybe_sync()
+    assert first is not None
+    assert await sync.maybe_sync() is None          # 門檻未過
+
+    fake_clock(sync.config.sync_interval + 1)
+    assert await sync.maybe_sync() is not None      # 過門檻
+
+
+def test_module_time_helper_still_exists():
+    """_time 不得整個刪除：test_trade_stats_sync.py 正在 monkeypatch 它，
+    那是 TRADE_STATS_INTERVAL 在用的計時來源。
+    """
+    from grid_engine import sync_service
+    assert callable(sync_service._time)
