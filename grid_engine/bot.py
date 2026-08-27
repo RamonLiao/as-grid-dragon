@@ -115,7 +115,11 @@ class MaxGridBot:
             state=self.state, locks=self.locks, notifier=self.notifier,
             risk_monitor=self.risk_monitor, tasks=self.tasks,
             start_time_ms=int(time.time() * 1000),
+            stop_event=self._stop_event,
         )
+        # reporter 建構在 sync_service 之前（它不需要 sync_service 才能建），
+        # 故與 watchdog 同樣採後置指派，不動既有建構順序。
+        self.reporter.sync_source = self.sync_service
         # WS 純傳輸組件（handlers 引用 bot bound method，callback 不包 try——
         # ticker 例外必須冒泡到 WsClient 重連迴圈）
         self.ws_client = WsClient(
@@ -597,6 +601,12 @@ class MaxGridBot:
             logger.error(f"決策日誌寫入失敗 {ccxt_symbol}: {e}")
 
     async def _handle_ticker(self, data: dict):
+        """處理 bookTicker 推送：更新報價、調整網格。
+
+        REST 同步刻意不在這裡驅動：綁在 WS 推送上會讓 bookTicker 一斷就全部
+        靜默停擺（見 docs/superpowers/specs/2026-08-26-periodic-sync-task-design.md）。
+        驅動源是 SyncService.run() 常駐 task，唯一。
+        """
         symbol_raw = data.get('s', '')
         bid = float(data.get('b', 0))
         ask = float(data.get('a', 0))
@@ -621,8 +631,6 @@ class MaxGridBot:
 
                     await self.adjust_grid(ccxt_symbol)
                 break
-
-        await self.sync_service.maybe_sync()
 
     async def _handle_account_update(self, data: dict):
         """處理 ACCOUNT_UPDATE 事件
@@ -650,34 +658,91 @@ class MaxGridBot:
 
                     logger.info(f"[userData] {asset} 錢包餘額更新: {wallet_balance:.2f}")
 
-            for sym_state in self.state.symbols.values():
-                sym_state.unrealized_pnl = 0
-
+            # ⚠️ ACCOUNT_UPDATE 的 P 陣列是**增量**，不是全量快照：Binance 只帶
+            # 「這次事件有變動的」持倉。FUNDING_FEE 事件甚至完全沒有 P。
+            # 所以這裡**不得**把 P 以外的 symbol 的 unrealized_pnl 歸零——那是
+            # 2026-08-26 之前就存在的錯誤，只是當時下一輪 REST 快照會把假的 0
+            # 治回來；C1 的 ws_seq 守衛（會丟棄「WS 動過的 symbol」的 REST 快照）
+            # 把它從潛伏變成**活的**：該 symbol 永遠停在 upnl=0 ⇒
+            # risk_monitor.check_trailing_stop() 看到 drawdown = peak - 0 超過門檻
+            # ⇒ 對一個健康的倉位送出市價平倉單。
+            #
+            # 先解析出「本次事件真正碰到哪些 symbol」，才決定要動誰的 ws_seq。
+            # 這一整個 handler 內沒有 await，解析/遞增/寫入對 event loop 是原子的。
             positions = account_data.get('P', [])
+            resolved = []           # [(ccxt_symbol, pos), ...] 保持 P 的原順序
+            touched = []            # 去重後的 symbol 清單（順序無關，只用來遞增 seq）
             for pos in positions:
                 symbol_raw = pos.get('s', '')
-                position_amt = float(pos.get('pa', 0) or 0)
-                unrealized_pnl = float(pos.get('up', 0) or 0)
-                position_side = pos.get('ps', '')
-
                 ccxt_symbol = None
                 for cfg in self.config.symbols.values():
                     if cfg.symbol == symbol_raw:
                         ccxt_symbol = cfg.ccxt_symbol
                         break
-
                 if ccxt_symbol and ccxt_symbol in self.state.symbols:
-                    sym_state = self.state.symbols[ccxt_symbol]
+                    resolved.append((ccxt_symbol, pos))
+                    if ccxt_symbol not in touched:
+                        touched.append(ccxt_symbol)
 
-                    if position_side == 'LONG':
-                        sym_state.long_position = abs(position_amt)
-                    elif position_side == 'SHORT':
+            # ws_seq 在**任何寫入之前**遞增，且只涵蓋本次事件會動到的 symbol。
+            # 先遞增再寫入，是為了讓「寫到一半拋例外」的部分寫入也一樣被 REST 端
+            # 判定成髒（保守方向：寧可丟掉一輪 REST 快照，不要蓋掉新資料）。
+            for ccxt_symbol in touched:
+                self.state.symbols[ccxt_symbol].ws_seq += 1
+
+            # 每筆 P 條目只更新它自己那一側（持倉與浮盈都是）。symbol 層的
+            # `unrealized_pnl` 是 long_upnl + short_upnl 導出的，這裡不碰。
+            # 為什麼不能用「本次事件出現的側」重算合計：Binance 在 symbol 層明說
+            # 「only symbols of changed positions will be pushed」，但沒保證兩側
+            # 都會帶——isolated 倉的資金費結算就只推發生資金費的那一筆。本 repo
+            # 從不設定 margin type（跟隨帳戶設定），所以那條路是活的。事件只帶
+            # SHORT 時把 LONG 的浮盈重算掉 ⇒ 追蹤止盈看到假回撤 ⇒ 對健康倉位送
+            # 市價平倉單（2026-08-26 re-review 端到端重現過）。分側各寫各的，
+            # 「只帶一側」與「同事件帶兩側」就都自動正確，也不必再判斷是不是第
+            # 一次碰到這個 symbol。
+            for ccxt_symbol, pos in resolved:
+                position_amt = float(pos.get('pa', 0) or 0)
+                unrealized_pnl = float(pos.get('up', 0) or 0)
+                position_side = pos.get('ps', '')
+                symbol_raw = pos.get('s', '')
+
+                sym_state = self.state.symbols[ccxt_symbol]
+
+                if position_side == 'LONG':
+                    sym_state.long_position = abs(position_amt)
+                    sym_state.long_upnl = unrealized_pnl
+                elif position_side == 'SHORT':
+                    sym_state.short_position = abs(position_amt)
+                    sym_state.short_upnl = unrealized_pnl
+                elif position_side == 'BOTH':
+                    # 單向持倉模式的淨倉。本 repo 啟動時強制避險模式
+                    # （_check_hedge_mode: dualSidePosition=true），所以收到 BOTH
+                    # 代表那個前提在運行中破了（例如手動改回單向、或設定沒套用
+                    # 成功）。這種時候「靜默忽略」最糟：兩側的值會停在舊快照上被
+                    # 風控當成真值。改成把淨倉映射到對應側、另一側清乾淨——合計
+                    # 仍然等於交易所的真值，_grid_step 的
+                    # `long_position == 0 / short_position == 0` 分岔也還是對的。
+                    if position_amt >= 0:
+                        sym_state.long_position = position_amt
+                        sym_state.long_upnl = unrealized_pnl
+                        sym_state.short_position = 0.0
+                        sym_state.short_upnl = 0.0
+                    else:
                         sym_state.short_position = abs(position_amt)
+                        sym_state.short_upnl = unrealized_pnl
+                        sym_state.long_position = 0.0
+                        sym_state.long_upnl = 0.0
+                    logger.warning(f"[userData] {symbol_raw} 收到 ps=BOTH（單向持倉模式）——"
+                                   f"避險模式前提已破，請確認帳戶的 dualSidePosition 設定")
+                else:
+                    # 未知的 ps：無法歸屬到任何一側，寧可不動也不要猜。留一行
+                    # warning，否則這種情況完全不可觀測。
+                    logger.warning(f"[userData] {symbol_raw} 未知的 positionSide="
+                                   f"{position_side!r}，本筆不套用")
+                    continue
 
-                    sym_state.unrealized_pnl += unrealized_pnl
-
-                    logger.info(f"[userData] {symbol_raw} {position_side}: "
-                               f"持倉={position_amt:.2f}, 浮盈={unrealized_pnl:.2f}")
+                logger.info(f"[userData] {symbol_raw} {position_side}: "
+                           f"持倉={position_amt:.2f}, 浮盈={unrealized_pnl:.2f}")
 
             for currency in ['USDC', 'USDT']:
                 acc = self.state.get_account(currency)
@@ -737,6 +802,12 @@ class MaxGridBot:
                 else:
                     logger.info(f"[userData] {symbol_raw} 開倉成交: {side} {position_side}")
 
+                # 先遞增 ws_seq 再改掛單計數（同 _handle_account_update）：這幾行
+                # 之後緊接著 `await self.adjust_grid(...)` 會依這些計數重掛網格，
+                # 若 REST 的舊快照在這中間把計數蓋回非 0，_should_adjust_grid 會
+                # 回 False，該側網格靜默漏掛整個 sync_interval。遞增到 await 之前
+                # 這段沒有 await，對 event loop 是原子的。
+                sym_state.ws_seq += 1
                 if position_side == 'LONG':
                     if side == 'BUY':
                         sym_state.buy_long_orders = 0
@@ -785,7 +856,12 @@ class MaxGridBot:
                 ):
                     self._bandit_last_saved_pulls = self.bandit_optimizer.total_pulls
 
-            await self.sync_service.sync_all()
+            # 用 sync_once()（= sync_all() + _evaluate()）而不是自己拆兩步：啟動
+            # 當下 REST 就壞掉（key 被撤、IP 被擋）是最該立刻知道的情境，漏掉
+            # 評估等於這一輪完全不計數、還要再等 3 × sync_interval 才會有第一次
+            # 計數（見最終 review M1 / Ruling 5）。「一輪同步必須被評估」這條
+            # 不變式收在 SyncService 內一處，不再散到這個檔（dual-review B5）。
+            await self.sync_service.sync_once()
         except Exception as e:
             logger.error(f"[MAX] 初始化失敗: {e}")
             await self.notifier.notify_crash(f"初始化失敗: {e}")
@@ -797,6 +873,7 @@ class MaxGridBot:
             asyncio.create_task(self.ws_client.run()),
             asyncio.create_task(self.ws_client.keep_alive_loop()),
             asyncio.create_task(self.userdata_watchdog.run()),
+            asyncio.create_task(self.sync_service.run()),
         ])
         if self.notifier.enabled:
             self.tasks.append(asyncio.create_task(self.reporter.run()))

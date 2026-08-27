@@ -1,6 +1,112 @@
 # Progress
 
-## Current Task（2026-08-25 17:25 更新）：價格時效守衛全數完成，**已 merge 並推上 origin；生產是否生效未確認**
+> ⚠️ 這是 worktree `as-grid-dragon-periodic-sync` 內的副本。主目錄 `../as-grid-dragon/tasks/progress.md`
+> 還停在上一個任務的版本（session 被 worktree 隔離，改不到主目錄的檔）。**merge 前記得把這一段搬過去。**
+
+## Current Task（2026-08-27 更新）：週期性 REST 同步 task（B1-A）—— **驗收完成，待 merge + 重啟**
+
+### 🟢 狀態：`Ship as-is`。全套 851 passed / 2 skipped（基線 756/2，淨增 95），mutation 4/4 KILLED
+
+- worktree `../as-grid-dragon-periodic-sync`，branch `feat/periodic-sync-task`，base `6852f7e`，HEAD `a4fef4b`，16 commits。
+- **主目錄 `../as-grid-dragon` 全程未動**，生產引擎（pid 67584/67585）跑的仍是舊碼。
+- SDD ledger 在 `.superpowers/sdd/2026-08-26-periodic-sync-task/progress.md`（gitignored）。
+- verdict 與各輪 findings 計數已落 `tasks/notes.md` 最上方那則。
+
+### ✅ mutation M2-M5 已補完（2026-08-27，解掉三位 verifier 的死結）
+
+三位 verifier 都死在同一個陷阱：**`cd` 出 worktree 會毒化被隔離 session 的 shell**（與 `/tmp`
+拼法無關）。主 session 不受該隔離，改用乾淨快照跑，worktree 全程未動：
+
+```
+git -C <worktree> archive HEAD | tar -x -C <scratchpad>/mut
+cd <scratchpad>/mut && PYTHONPATH=<scratchpad>/mut \
+  <LouisLab>/.venv/bin/python -m pytest tests/... -q -p no:cacheprovider
+```
+
+（`uv run pytest` 在 sandbox 內不可用——uv project root 是父目錄 `LouisLab/`。）
+
+| Mutation | 結果 |
+|---|---|
+| M2 `sync_service.py:511` `ws_seq` 比對 → `if False` | KILLED，紅在 `test_periodic_sync.py:510` |
+| M3 `state.py:74` 給 `unrealized_pnl` 加 setter | KILLED，紅在 `:887` DID NOT RAISE |
+| M4 `bot.py:711` 兩側歸零再寫本次側 | KILLED，4 條紅（含端到端偽市價平倉重現） |
+| M5 `sync_service.py:355` 刪掉 sleep 後停機守衛 | KILLED，紅在 `test_stop_set_during_sleep_skips_that_round` |
+
+還原後快照全套 **851 passed / 2 skipped**，與 branch 宣稱一致（獨立複驗，非採信自述）。
+
+### 下一步（依序）
+
+1. `superpowers:finishing-a-development-branch` 決定 merge 方式 → merge 進 main
+2. 把本段搬進主目錄 `tasks/progress.md`（worktree 的副本改不到主目錄）
+3. **merge 後必須重啟引擎才生效**。確認方式：`ps -o lstart= -p $(pgrep -f as_terminal_max | head -1)`
+   晚於 `ls -lT grid_engine/sync_service.py` 的寫入時刻，並在 log 看到新行程的初始化區塊。
+4. backlog 見下方「其他待辦 6.」
+
+### 驗收現況
+
+| 關卡 | 結果 |
+|---|---|
+| SDD 7 個 task | 全部 complete（T3/T7 各進一次 fix loop，其餘一次過） |
+| 最終 whole-branch review（opus） | Ship with follow-ups：C0 / B4 / M5 → 全數修完，re-review 13/13 ADDRESSED |
+| security-review | **零 findings**（≥8 信心） |
+| dual-review Round 1（外部輪，opus，不給 spec／不給前面結論） | **Fix required**：C1 + B4 + M5 → 修完 re-review 12/12 ADDRESSED |
+| dual-review Round 2（專案規則） | 已查：無新依賴（uv）、monkey testing 8 條、只 stage 指定檔、無 CLAUDE 相關檔入 git |
+| verifier #1 | REJECT（工具環境崩潰）——讀得到的部分全 PASS |
+| verifier #2 | ACCEPT WITH FINDINGS：read-back 4 項全 PASS、M1 實跑 KILLED；mutation 只完成 1/5 |
+| verifier #3 | REJECT（BLOCKED）：0/4，只做到靜態 read-back |
+
+**dual-review 尚未產出 `Ship as-is` verdict ⇒ 依 dev-rules，本任務不得標記完成。**
+
+### 這條 branch 做了什麼
+
+把 `SyncService.maybe_sync()` 從 `_handle_ticker` 移到常駐背景 task 驅動，並讓失敗會說話：
+1. `sync_all()` 回傳 `SyncOutcome`（五子項逐項成敗 + `skipped`；`critical_ok` = 持倉 and 帳戶）
+2. 節流計時改 `clock.guard_now()`（牆鐘，backtester 換不掉）
+3. `_evaluate()` 告警狀態機：關鍵項連續失敗 3 次發一封 Telegram、降級中不重發、恢復發一封
+4. `run()`/`stop()`/`_loop_interval()` 常駐 loop（後改走 `sync_once()`，`maybe_sync()` 已刪）
+5. **移除 `bot.py:625`** —— 唯一的行為切換點
+6. 每日摘要多一行降級狀態 + `last_sync_age` 心跳
+7. Monkey testing 8 條 + 驗收準則逐條對帳
+
+### review 過程翻出來的四條真缺陷（都不在原計畫裡）
+
+1. **C1 競態（外部輪抓到，前面所有輪都漏）**：改動前 `sync_all()` 在 `_handle_ticker` 內被 await，
+   而 `ws_client.py:97` 是 inline `await handler(data)` ⇒ REST round-trip 期間沒有任何 WS handler 能跑。
+   搬到獨立 task 後這個天然序列化消失：`_handle_account_update`（**完全無鎖**寫持倉）會落在 fetch→apply
+   窗口裡，接著 REST 拿到 symbol lock 把過期快照寫回去 ⇒ `_grid_step` 用 `long_position == 0` 分岔
+   ⇒ 撤掉剛掛好的網格再開一次倉。修法：`SymbolState.ws_seq` per-symbol 版本號，REST 在 fetch 前抓、
+   apply 時在鎖內比對，變了就丟棄該 symbol 的快照。
+   ⚠️ **最終 whole-branch review 查過同一個不變式並判「撐得住」**——它看的是 apply block 有拿鎖、鎖序單向，
+   但鎖只保護 apply 的那一瞬間，不保護 fetch→apply 窗口，而 WS handler 根本不拿鎖。
+2. **C1 的修法本身引入新 Critical**：`_handle_account_update` 把**所有** symbol 的 upnl 歸零、只還原 `P` 裡有的；
+   本來由下一輪 REST 治好的「被 `P` 漏掉的 symbol」現在被 C1 守衛擋掉 ⇒ 停在假的 upnl=0 ⇒ 同一輪
+   `check_trailing_stop` 看到 `drawdown = peak - 0` ⇒ **對健康倉位送市價平倉單**。
+   修根因：`ACCOUNT_UPDATE` 的 `P` 是增量、不是全量快照，不得對沒帶到的 symbol 歸零。
+3. **同族第三個變形**：`unrealized_pnl` 是 symbol 層合計但 `long/short_position` 是分側的 ⇒ 事件只帶一側時
+   另一側的浮盈被抹掉（Binance 文件確證的活路徑：isolated 倉的資金費結算只推發生資金費的那一筆）。
+   結構解：`long_upnl`/`short_upnl` 分側存放，合計改成**唯讀 property** ⇒ 在型別層關掉
+   「合計被局部資訊重算」這個 pattern。re-reviewer 盤了全 repo 5 處合計欄位，確認這一族在會下單的路徑上關掉了。
+4. **REST 那側分側寫入零覆蓋**：對全套 850 條跑兩個 mutation（long/short 寫反、刪掉 `short_upnl` 寫入）
+   **兩個都活著**——因為那兩條測試的 fixture 只有單邊持倉、且只斷言合計（合計對「寫反」不敏感）。已補。
+
+### 下次開工的其他待辦（M2-M5 之後）
+
+1. 整合 dual-review 兩輪 → 產出最終 verdict（要 `Ship as-is` 才算完成）
+2. verdict + 各輪 findings 計數落 `tasks/notes.md`（dev-rules 要求）
+3. 把本段搬進主目錄的 `tasks/progress.md`
+4. `superpowers:finishing-a-development-branch` 決定 merge 方式
+5. **merge 後必須重啟引擎才生效**。確認方式：`ps -o lstart= -p $(pgrep -f as_terminal_max | head -1)`
+   晚於 `ls -lT grid_engine/sync_service.py` 的寫入時刻，並在 log 看到新行程的初始化區塊。
+6. backlog（本次產生，皆未做）：
+   - `_handle_order_update` 對 `ps='BOTH'` 兩支都不命中 ⇒ 掛單計數不重置也沒 warning，與 account handler 不對稱（pre-existing）
+   - `bot.py:749-752` 帳戶層浮盈用 config 內 symbol 加總覆寫交易所真值（顯示用，spec §10 修訂 14 已裁定可接受）
+   - 測試收集非決定性：同一 suite 同機第一次跑出 64 個 `partially initialized module 'pandas'` collection error、後兩次全綠
+   - `tests/test_periodic_sync_monkey.py:101` docstring 的行號指向 `bot.py:788`，實際是 `:864` 且已改名 `sync_once()`
+   - 未能驗證：`web/`、`backtest/` 是否有殘留的 `SymbolState.unrealized_pnl` 寫入端（唯讀 property 命中會是 runtime AttributeError）
+
+---
+
+## 先前狀態（2026-08-25 17:25）：價格時效守衛全數完成，**已 merge 並推上 origin；生產是否生效未確認**
 
 ### 🟡 狀態：已 merge + 已 push，但**生產是否跑到新碼無法確認**
 

@@ -60,7 +60,6 @@ def fake_clock():
 async def test_handle_ticker_stamps_quote_at(bot, fake_clock):
     """ticker 進來時，quote_at 必須與 bid/ask 在同一次更新中被蓋章。"""
     bot.adjust_grid = AsyncMock()          # 隔離：本測試只驗蓋章
-    bot.sync_service.maybe_sync = AsyncMock()
     state = bot.state.symbols[SYMBOL]
     assert state.quote_at == 0
 
@@ -107,7 +106,6 @@ async def _seed_fresh_quote(bot, price=100.0):
     """
     real_adjust = bot.adjust_grid
     bot.adjust_grid = AsyncMock()
-    bot.sync_service.maybe_sync = AsyncMock()
     try:
         await bot._handle_ticker({"s": "XRPUSDC", "b": str(price), "a": str(price)})
     finally:

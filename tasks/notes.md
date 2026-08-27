@@ -1,3 +1,39 @@
+# 2026-08-27 週期性 REST 同步 task（B1-A）：review verdict 與 findings 計數
+
+**最終 verdict：`Ship as-is`**（外部輪 fix 後 re-review 12/12 ADDRESSED；mutation M1-M5 全 KILLED）。
+測試 **851 passed / 2 skipped**（worktree 基線 756/2，淨增 95）；16 commits，`6852f7e..a4fef4b`。
+**尚未 merge、尚未重啟 ⇒ 尚未在生產生效。**
+
+## 各輪 findings 計數（C=blocker / B=should-fix / A=clean）
+
+| 輪次 | 對象 | 結果 |
+|---|---|---|
+| SDD task review ×7 | Task 1-7 | T3、T7 各進一次 fix loop，其餘 A |
+| 最終 whole-branch review (opus) | 整條 branch | C0 / B4 / M5 → 全修，re-review 13/13 ADDRESSED |
+| security-review | 整條 branch | **零 findings**（≥8 信心） |
+| dual-review Round 1（外部，不給 spec） | 整條 branch | **C1 / B4 / M5** → 全修，re-review 12/12 ADDRESSED |
+| dual-review Round 2（專案規則） | 整條 branch | A（無新依賴、monkey 8 條、只 stage 指定檔） |
+| verifier #1 / #2 / #3 | 驗收 | 工具環境崩潰／ACCEPT WITH FINDINGS（mutation 1/5）／BLOCKED |
+| mutation M2-M5（2026-08-27 主 session 補完） | 4 個守衛 | **4/4 KILLED** |
+
+## mutation 補完（本次，解掉三位 verifier 的死結）
+
+三位 verifier 都被同一個陷阱擋死：**`cd` 出 worktree 會毒化被隔離 session 的 shell**。
+主 session 不受該隔離，改用乾淨快照跑：`git -C <worktree> archive HEAD | tar -x -C <scratchpad>`，
+再 `PYTHONPATH=<snap> <LouisLab>/.venv/bin/python -m pytest ... -p no:cacheprovider`。
+worktree 全程未動（mutation 只落在快照）。結果：
+
+| Mutation | 改法 | 結果 |
+|---|---|---|
+| M2 `sync_service.py:511` | `_sync_orders` 的 `ws_seq != seq_before` → `if False` | KILLED，紅在 `test_periodic_sync.py:510`（REST 舊快照蓋回 0.02） |
+| M3 `state.py:74` | 給 `unrealized_pnl` 加 setter（換回可寫） | KILLED，紅在 `:887` DID NOT RAISE |
+| M4 `bot.py:711` | 兩側 upnl 先歸零再寫本次側 | KILLED，**4 條紅**（含端到端偽市價平倉重現） |
+| M5 `sync_service.py:355-356` | 刪掉 sleep 後的 `_stop_event` 守衛 | KILLED，紅在 `test_stop_set_during_sleep_skips_that_round` |
+
+還原後快照全套複跑 **851 passed / 2 skipped**，與 branch 宣稱數字一致（獨立複驗，非採信實作者自述）。
+
+---
+
 # 2026-08-24 價格時效守衛：review verdict 與 findings 計數（dev-rules 要求留痕）
 
 **最終 verdict：`Ship as-is`**（最終 whole-branch 外部輪 opus + scoped re-review 確認）。

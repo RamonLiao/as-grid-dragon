@@ -17,6 +17,14 @@ class DailyReporter:
         self._stop_event = stop_event
         self.watchdog = watchdog
         self.stale_quote_source = stale_quote_source
+        # sync_source 刻意**沒有** ctor kwarg（2026-08-26 dual-review M6）：
+        # SyncService 建構在 DailyReporter 之後（它需要 RiskMonitor，而 reporter
+        # 不需要它），生產端與測試端一律走後置指派（bot.py 的
+        # `self.reporter.sync_source = self.sync_service`，與 `reporter.watchdog`
+        # 同一個 pattern）。留一個沒有任何呼叫端的 kwarg = 兩個並存的注入方式，
+        # 違反「兩個 pattern 互斥時選一個」；選刪 kwarg 而不是把建構順序倒過來，
+        # 是因為後者為了美觀新增一條硬性建構順序約束，收益為零。
+        self.sync_source = None
 
     def _get_watchdog_status(self):
         """讀取 watchdog 狀態供每日摘要顯示。
@@ -78,6 +86,49 @@ class DailyReporter:
             logger.warning(f"[reporter] 價格過期最近時戳讀取失敗，摘要略過該欄位: {e}")
         return summary
 
+    def _get_sync_status(self):
+        """讀 SyncService 的降級狀態供每日摘要顯示。
+
+        硬性要求同 _get_watchdog_status：任何例外都在這裡吞掉降級成「不顯示
+        該行」，不得讓整封摘要發不出去。純讀，不呼叫任何會改變狀態的方法。
+        """
+        if self.sync_source is None:
+            return None
+        try:
+            status = {
+                "degraded": bool(self.sync_source._degraded),
+                "consecutive_failures": int(self.sync_source._consecutive_failures),
+                "degraded_total": int(self.sync_source._degraded_total),
+            }
+        except Exception as e:
+            logger.warning(f"[reporter] 同步狀態讀取失敗，摘要跳過該行: {e}")
+            return None
+        # 心跳（最終 review I1）：上面三個欄位量的是「降級狀態機有沒有被推進」，
+        # 而狀態機自己是被 SyncService.run() 推的——那個 task 從未被建立、被
+        # BaseException 帶走、或被誰 cancel 掉時，三個欄位會永遠停在
+        # False/0/0，摘要那行與「一切正常」逐字元相同 = 最致命的失效模式沒有
+        # 儀器。last_sync_time 是唯一由「同步真的跑完」推進的量，補進來當心跳。
+        # 內層獨立 try：心跳讀不到只讓這兩個鍵缺席（formatter 會退回舊行為），
+        # 不連累已經讀到的降級狀態，也不讓整封摘要發不出去。
+        try:
+            last = float(self.sync_source.last_sync_time)
+            # last_sync_time 初值 0（引擎剛啟動、還沒有任何一輪 sync_all 跑完）
+            # 不能直接相減：那會得到 ~1.8e9 秒的假年齡。用 None 表達「無年齡可
+            # 算」，由 formatter 用專屬文案處理——刻意不省略那一行：sync_all()
+            # 現在在 bot.run() 啟動時就會蓋章，摘要發送時（最快也是啟動後數小時）
+            # 還停在 0 本身就代表沒有任何一輪同步成功結束過。
+            status["last_sync_age"] = None if last <= 0 else clock.guard_now() - last
+            # 停擺門檻由 formatter 算（min(max(60, 6*interval), 3600)——上限是
+            # dual-review B3 補的，擋 interval 被設成巨大有限值時門檻大到永不
+            # 告警），但 interval 要在這裡
+            # 取——formatter 是 staticmethod，不得去讀全域狀態。用 _loop_interval()
+            # 而非裸讀 config.sync_interval：它是 total function，非法設定值也回得出
+            # 一個合法秒數，且純讀不改狀態。
+            status["sync_interval"] = float(self.sync_source._loop_interval())
+        except Exception as e:
+            logger.warning(f"[reporter] 同步心跳讀取失敗，摘要略過該欄位: {e}")
+        return status
+
     def _collect_positions(self) -> dict:
         """組持倉快照。單一標的的狀態壞掉（屬性缺失、數值型別錯）只能讓那一個
         標的消失，不得讓整封每日摘要發不出去——run() 的外層 except 是 sleep(60)
@@ -136,6 +187,7 @@ class DailyReporter:
                     "running_hours": running_hours,
                     "watchdog": self._get_watchdog_status(),
                     "stale_quotes": self._get_stale_quote_summary(),
+                    "sync": self._get_sync_status(),
                 }
                 await self.notifier.notify_daily_pnl(pnl_data)
             except asyncio.CancelledError:

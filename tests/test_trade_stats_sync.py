@@ -69,10 +69,21 @@ def make_service(pages):
 
 @pytest.fixture
 def frozen_clock():
+    """可推進的假**守衛**時鐘（`guard_now()`）。
+
+    2026-08-26 dual-review B4 起改注入 set_guard_clock 而非 set_clock：
+    `_sync_trade_stats` 的 60s 節流（比較 + finally 蓋章）量的是本機牆鐘，
+    不是情境時鐘。`clock.now()` 會被 backtester 每根 K 線換成歷史 epoch，而
+    live bot 與回測跑在同一個行程——節流若掛在 now() 上，回測期間差值是大負數
+    ⇒ 每輪 early-return、成交統計靜默凍結；回測結束 reset_clock() 後時間戳卡在
+    歷史 epoch ⇒ 節流永久失效 ⇒ 每 10s 打一次 fetch_my_trades。
+    本檔既有斷言的語意完全沒變：holder["t"] 推進的仍然是「_sync_trade_stats
+    節流看到的那個時間」，只是那個時間現在是 guard 時鐘。
+    """
     holder = {"t": 1_000_000.0}
-    clock.set_clock(lambda: holder["t"])
+    clock.set_guard_clock(lambda: holder["t"])
     yield holder
-    clock.reset_clock()
+    clock.reset_guard_clock()
 
 
 def test_counts_and_sums(frozen_clock):
