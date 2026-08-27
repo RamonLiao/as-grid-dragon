@@ -1,14 +1,17 @@
 # Progress
 
-> ⚠️ 這是 worktree `as-grid-dragon-periodic-sync` 內的副本。主目錄 `../as-grid-dragon/tasks/progress.md`
-> 還停在上一個任務的版本（session 被 worktree 隔離，改不到主目錄的檔）。**merge 前記得把這一段搬過去。**
+## Current Task（2026-08-27 更新）：週期性 REST 同步 task（B1-A）—— **已 merge、已重啟、上線生效**
 
-## Current Task（2026-08-27 更新）：週期性 REST 同步 task（B1-A）—— **驗收完成，待 merge + 重啟**
+### ✅ 狀態：`Ship as-is` + 已 merge（`81e7d87`，no-ff）+ **已重啟生效**
 
-### 🟢 狀態：`Ship as-is`。全套 851 passed / 2 skipped（基線 756/2，淨增 95），mutation 4/4 KILLED
-
-- worktree `../as-grid-dragon-periodic-sync`，branch `feat/periodic-sync-task`，base `6852f7e`，HEAD `a4fef4b`，16 commits。
-- **主目錄 `../as-grid-dragon` 全程未動**，生產引擎（pid 67584/67585）跑的仍是舊碼。
+- merge commit `81e7d87`（base `6852f7e`，branch `feat/periodic-sync-task` 17 commits）。
+  merged 結果上重跑全套：**851 passed / 2 skipped**（跑在 `git archive` 快照裡，不寫 `config/`、`log/`）。
+- **尚未 push 到 origin**；branch 與 worktree `../as-grid-dragon-periodic-sync` 都還留著（未清）。
+- ✅ **已重啟、已生效（2026-08-27 12:00，使用者手動重啟）**：
+  `grid_engine/{sync_service,bot,state}.py` mtime `11:59:45` → 新 pid 24966/24967 起於
+  `11:59:53`（晚 8 秒）→ log `12:00:13` 有整段初始化（Bandit 冷啟動／LeadingIndicator／
+  MAX 初始化），`12:00:17` 重新訂閱 userData ⇒ 新行程 import 的是新碼。
+  `bot.py` 內只剩 `:864` 啟動時的 `sync_once()`，`_handle_ticker` 的同步呼叫已不存在。
 - SDD ledger 在 `.superpowers/sdd/2026-08-26-periodic-sync-task/progress.md`（gitignored）。
 - verdict 與各輪 findings 計數已落 `tasks/notes.md` 最上方那則。
 
@@ -36,10 +39,10 @@ cd <scratchpad>/mut && PYTHONPATH=<scratchpad>/mut \
 
 ### 下一步（依序）
 
-1. `superpowers:finishing-a-development-branch` 決定 merge 方式 → merge 進 main
-2. 把本段搬進主目錄 `tasks/progress.md`（worktree 的副本改不到主目錄）
-3. **merge 後必須重啟引擎才生效**。確認方式：`ps -o lstart= -p $(pgrep -f as_terminal_max | head -1)`
-   晚於 `ls -lT grid_engine/sync_service.py` 的寫入時刻，並在 log 看到新行程的初始化區塊。
+1. ~~重啟引擎~~ ✅ 已完成並驗證（見上）
+2. 決定要不要 `git push origin main`（目前 main 領先 origin）
+3. 清理：`git worktree remove ../as-grid-dragon-periodic-sync` + `git branch -d feat/periodic-sync-task`
+   （worktree 內有 gitignored 的 `.superpowers/sdd/` ledger，刪掉就沒了——結論已在 `tasks/notes.md`）
 4. backlog 見下方「其他待辦 6.」
 
 ### 驗收現況
@@ -106,20 +109,26 @@ cd <scratchpad>/mut && PYTHONPATH=<scratchpad>/mut \
 
 ---
 
-## 先前狀態（2026-08-25 17:25）：價格時效守衛全數完成，**已 merge 並推上 origin；生產是否生效未確認**
+## 先前狀態（2026-08-25 18:0x）：價格時效守衛已 merge、已 push、**確認生產跑的是新碼**
 
-### 🟡 狀態：已 merge + 已 push，但**生產是否跑到新碼無法確認**
+### ✅ 狀態：上線已生效
 
-- `main == origin/main` @ `ea09993`（本次 16 commits，連同先前留著沒推的共推出 18 個）。
-- feature branch 與 worktree 已刪除；SDD review 產物（ledger／各輪報告／mutation 證據）
-  依使用者指示一併清除，結論已濃縮進 `tasks/notes.md` 最上方那則。
-- 工作區只剩既有的 ` M .gitignore`（與本次無關，使用者未指示處理）。
-- ⚠️ **重啟狀態不明**：引擎 pid 67585 啟動於 `2026-08-25 17:23:00`，而 fast-forward
-  merge 也在 `17:23` 前後完成。fast-forward **不產生 merge commit**，git 裡沒有可查的
-  merge 時刻 ⇒ 兩者先後**驗不出來**。Python 在 import 時載入模組，若行程早於檔案寫入
-  啟動，跑的就是舊碼。**下次開工第一件事：確認引擎已在 merge 之後重啟過。**
-  確認方式：`ps -o lstart= -p $(pgrep -f as_terminal_max | head -1)` 晚於 2026-08-25 17:25；
-  生效徵兆為 `config/trading_config_max.json` 下次存檔時出現 `max_price_age_sec`。
+- `main == origin/main` @ `ea09993`（+ docs commit `4eb7bf6`）。
+- **重啟疑點已解**（本次以 reflog + 檔案 mtime 對時）：
+  - `git reflog --date=iso` → fast-forward merge 落在 `2026-08-25 17:22:59`，
+    `.git/ORIG_HEAD` 與 `grid_engine/{bot,config,notifier}.py` 的 mtime 同為 **17:22:59**
+    （checkout 寫檔時刻，這才是「新碼落地」的可查時間，不是 merge commit）。
+  - `ps -o lstart=` → 引擎 pid 67584/67585 啟動於 **17:23:00**，晚於檔案寫入 1 秒。
+  - log 佐證：`log/as_terminal_max.log` 17:23:04 有整段初始化（Bandit 冷啟動／
+    LeadingIndicator／MAX 初始化），17:23:09 重新訂閱 userData ⇒ 確實是新行程 import 的新碼。
+  - `config/trading_config_max.json` 仍停在 07-26、無 `max_price_age_sec`——**這只代表
+    config 自那時起沒被存過，不是守衛沒生效**，別再拿它當判準。
+- feature branch 與 worktree 已刪除；SDD review 產物依使用者指示清除，結論在 `tasks/notes.md`。
+- 工作區只剩既有的 ` M .gitignore`（與本次無關）。
+- 順帶觀察：17:33:09 watchdog 判定 userData 靜默 604s 並強制重連（第 1/3 次）——
+  即 TODO 0a 的活體驗收仍在跑，重連後 17:33:18 已重新訂閱成功。
+
+### 歷史（保留追溯）
 
 - Work 在 git worktree `as-grid-dragon-staleness`，branch `feat/price-staleness-guard`
   （base `12cdb89`）。**主目錄 `../as-grid-dragon` 全程未動**，生產引擎跑的仍是
