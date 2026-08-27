@@ -6,7 +6,9 @@
 
 - merge commit `81e7d87`（base `6852f7e`，branch `feat/periodic-sync-task` 17 commits）。
   merged 結果上重跑全套：**851 passed / 2 skipped**（跑在 `git archive` 快照裡，不寫 `config/`、`log/`）。
-- **尚未 push 到 origin**；branch 與 worktree `../as-grid-dragon-periodic-sync` 都還留著（未清）。
+- 已 `git push origin main`（`origin/main == main == 5abd367`）。
+- worktree `../as-grid-dragon-periodic-sync` 已 remove、branch `feat/periodic-sync-task` 已 `-d` 刪除；
+  SDD ledger 搬到主目錄 `.superpowers/sdd/2026-08-26-periodic-sync-task/`（git ignore，未刪）。
 - ✅ **已重啟、已生效（2026-08-27 12:00，使用者手動重啟）**：
   `grid_engine/{sync_service,bot,state}.py` mtime `11:59:45` → 新 pid 24966/24967 起於
   `11:59:53`（晚 8 秒）→ log `12:00:13` 有整段初始化（Bandit 冷啟動／LeadingIndicator／
@@ -40,9 +42,11 @@ cd <scratchpad>/mut && PYTHONPATH=<scratchpad>/mut \
 ### 下一步（依序）
 
 1. ~~重啟引擎~~ ✅ 已完成並驗證（見上）
-2. 決定要不要 `git push origin main`（目前 main 領先 origin）
-3. 清理：`git worktree remove ../as-grid-dragon-periodic-sync` + `git branch -d feat/periodic-sync-task`
-   （worktree 內有 gitignored 的 `.superpowers/sdd/` ledger，刪掉就沒了——結論已在 `tasks/notes.md`）
+2. ~~push~~ ✅ / ~~清 worktree + branch~~ ✅（2026-08-27）
+3. ⚠️ 未處理：工作區的 ` M .gitignore`（新增 `CLAUDE.md`、`tasks/{progress,lessons,notes}.md`）。
+   **這筆改動目前無效**——`tasks/*.md` 已是 tracked（且已在 origin 上），.gitignore 對 tracked 檔不生效。
+   要真的排除得先 `git rm --cached tasks/progress.md tasks/lessons.md tasks/notes.md` 再 commit，
+   等於把它們從 repo 移除（歷史仍留著）。**未經指示不動**。
 4. backlog 見下方「其他待辦 6.」
 
 ### 驗收現況
