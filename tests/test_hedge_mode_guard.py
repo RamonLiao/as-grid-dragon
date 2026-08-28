@@ -5,8 +5,9 @@ order_executor.place_order 對每一張網格單都帶 positionSide（order_exec
 而 position mode 是幣安帳戶層設定 —— one-way 模式下這些單會被整批拒絕，
 bot 一張單都下不出去，只會一路撞下單斷路器。
 
-  守衛 1（啟動）：_check_hedge_mode 確立不了 hedge 就 raise，由 run() 的
-                  except（bot.py:938-944）接成乾淨返回，不啟動。
+  守衛 1（啟動）：_check_hedge_mode 確立不了 hedge 就 raise，由 run() 內那個
+                  except Exception 區塊（送 notify_crash(f"初始化失敗: {e}")
+                  的那一段）接成乾淨返回，不啟動。
   守衛 2（運行期）：_handle_order_update 對 ps 非 LONG/SHORT 的成交事件早退，
                   不重置掛單計數、不餵 bandit、不重掛網格。
 """

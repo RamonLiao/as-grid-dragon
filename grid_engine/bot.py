@@ -253,7 +253,8 @@ class MaxGridBot:
         都下不出去，只會一路撞 `_register_order_failure` 直到斷路。帶著未經
         證實的模式假設啟動，等於把「完全不能交易」偽裝成一串看不懂的下單失敗。
 
-        raise 由 `run()` 的 except（bot.py:938-944）接住 → notify_crash 一封
+        raise 由 `run()` 內那個 `except Exception` 區塊（送
+        `notify_crash(f"初始化失敗: {e}")` 的那一段）接住 → notify_crash 一封
         + gateway.shutdown() + return，是**乾淨返回而非行程崩潰**，不會觸發
         container restart policy 造成重啟迴圈。
 
