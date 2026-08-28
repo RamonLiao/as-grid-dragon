@@ -308,10 +308,17 @@ class MaxGridBot:
                 f"拒絕啟動（本 bot 的每張單都帶 positionSide，單向模式下會被"
                 f"整批拒絕）：{err}"
             )
-        if hedged is None:
+        if hedged is not False:
+            # 只有**明確的 False** 才代表「確定是單向、該去切換」。缺失（None）
+            # 與任何無法判讀的值（字串 'true'、數字 1、巢狀 dict……）都是「未知」。
+            # 這裡用 `is not False` 而不是 `is None`：後者會讓 truthy 的字串
+            # 'true' 掉進下面的切換分支，拿一個讀不懂的值去 POST 改使用者的
+            # **帳戶層**設定 —— 「因為看不懂就去改帳戶」正是最不該做的事。
+            # （monkey testing 抓到；ccxt safe_bool 目前只會回 True/False/None，
+            # 但這條路徑通往本 bot 唯一一個會改帳戶狀態的呼叫，值得硬性收斂。）
             raise RuntimeError(
-                "[MAX] 交易所未回報持倉模式（dualSidePosition 欄位缺失），"
-                "無法確認是否為雙向持倉模式，拒絕啟動"
+                f"[MAX] 交易所未回報持倉模式（dualSidePosition 欄位缺失，或值"
+                f"無法判讀：{hedged!r}），無法確認是否為雙向持倉模式，拒絕啟動"
             )
 
         logger.warning(
@@ -891,9 +898,17 @@ class MaxGridBot:
 
         只影響 log，不影響呼叫端的早退 —— 節流跟行為綁在一起就會變成
         「第二筆之後靜默套用」，那正是這道守衛要擋的事。
+
+        `0.0 <= delta` 這一半是給時鐘倒退用的（NTP 校正、休眠喚醒、guard clock
+        被替換）：只寫 `delta < 窗口` 的話，倒退會讓差值變負而**恆為真**，
+        告警就靜音到時鐘追回來為止（倒退量 + 一個窗口）。這道告警是「帳戶模式
+        已被外部改掉」的唯一運行期通知，寧可多印也不能靜音，所以倒退時直接放行
+        並把錨點重設到新的 now。（monkey testing 抓到；security review 原本記成
+        「倒退只會多印（fail open）」，方向剛好相反。）
         """
         now = clock.guard_now()
-        if now - self._last_unknown_ps_log_at.get(ccxt_symbol, 0.0) < UNKNOWN_PS_LOG_SECONDS:
+        delta = now - self._last_unknown_ps_log_at.get(ccxt_symbol, 0.0)
+        if 0.0 <= delta < UNKNOWN_PS_LOG_SECONDS:
             return
         self._last_unknown_ps_log_at[ccxt_symbol] = now
         logger.warning(

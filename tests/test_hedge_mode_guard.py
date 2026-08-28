@@ -11,6 +11,8 @@ bot 一張單都下不出去，只會一路撞下單斷路器。
   守衛 2（運行期）：_handle_order_update 對 ps 非 LONG/SHORT 的成交事件早退，
                   不重置掛單計數、不餵 bandit、不重掛網格。
 """
+import asyncio
+
 import ccxt
 import pytest
 from unittest.mock import AsyncMock, MagicMock
@@ -365,8 +367,18 @@ class TestStartupWiring:
         bot.ws_client.acquire_listen_key = AsyncMock()
         bot.sync_service.sync_once = AsyncMock()
         bot.notifier.notify_crash = AsyncMock()
+        # 以下純粹是為了「守衛被繞過」那一側能乾淨地紅：若例外被吞掉，run() 會
+        # 一路走到常駐 task 與 while not _stop_event 迴圈而永不返回 —— 那樣
+        # mutation 得到的是 hang，不是失敗的斷言。先 set stop event 並把常駐
+        # 部件換成 AsyncMock，讓「被繞過」變成「跑完後斷言紅」。
+        bot._stop_event.set()
+        bot.ws_client.run = AsyncMock()
+        bot.ws_client.keep_alive_loop = AsyncMock()
+        bot.userdata_watchdog.run = AsyncMock()
+        bot.sync_service.run = AsyncMock()
+        bot.stop = AsyncMock()
 
-        await bot.run()
+        await asyncio.wait_for(bot.run(), timeout=5)
 
         # acquire_listen_key 是 _check_hedge_mode 之後的下一步：只要它被呼叫，
         # 就代表 raise 沒有擋住啟動序列（例外被吞掉了）。
