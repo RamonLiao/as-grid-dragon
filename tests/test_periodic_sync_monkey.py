@@ -98,7 +98,7 @@ async def test_stop_then_run_exits_immediately(sync):
 
 @pytest.mark.asyncio
 async def test_concurrent_run_and_manual_sync_all(sync):
-    """loop 與啟動時的 sync_all()（bot.py:788）撞在一起：靠 `_sync_lock` 的
+    """loop 與啟動時的 sync_once()（bot.py:864）撞在一起：靠 `_sync_lock` 的
     early-return 化解，不得死鎖、不得重入、skipped 不得被算成失敗。
 
     原 brief 版本的收尾斷言 `any(skipped) or all(not skipped)` 涵蓋所有可能
