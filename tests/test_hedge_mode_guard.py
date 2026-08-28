@@ -6,7 +6,7 @@ order_executor.place_order 對每一張網格單都帶 positionSide（order_exec
 bot 一張單都下不出去，只會一路撞下單斷路器。
 
   守衛 1（啟動）：_check_hedge_mode 確立不了 hedge 就 raise，由 run() 的
-                  except（bot.py:865-871）接成乾淨返回，不啟動。
+                  except（bot.py:938-944）接成乾淨返回，不啟動。
   守衛 2（運行期）：_handle_order_update 對 ps 非 LONG/SHORT 的成交事件早退，
                   不重置掛單計數、不餵 bandit、不重掛網格。
 """
@@ -117,3 +117,16 @@ class TestCheckHedgeMode:
         bot.exchange = _exchange([RuntimeError("should not be called")])
         bot._check_hedge_mode()
         bot.exchange.fetch_position_mode.assert_not_called()
+
+    def test_fetch_returns_non_dict_aborts_startup(self):
+        """fetch_position_mode 回的東西不是 dict（例如 None、字串）—— 這不是
+        「沒回報 dualSidePosition 欄位」以外的第三種未知形態，同樣不得放行。
+        `_fetch_hedged` 的 `if not isinstance(mode, dict): return None, None`
+        分支必須真的被行使到，不能只靠 dict-但欄位缺失 的測試間接覆蓋。"""
+        bot = _make_bot()
+        ex = MagicMock()
+        ex.fetch_position_mode.return_value = None  # 非 dict 回應
+        bot.exchange = ex
+        with pytest.raises(RuntimeError, match="未回報持倉模式"):
+            bot._check_hedge_mode()
+        bot.exchange.fapiPrivatePostPositionSideDual.assert_not_called()

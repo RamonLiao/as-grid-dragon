@@ -253,7 +253,7 @@ class MaxGridBot:
         都下不出去，只會一路撞 `_register_order_failure` 直到斷路。帶著未經
         證實的模式假設啟動，等於把「完全不能交易」偽裝成一串看不懂的下單失敗。
 
-        raise 由 `run()` 的 except（bot.py:865-871）接住 → notify_crash 一封
+        raise 由 `run()` 的 except（bot.py:938-944）接住 → notify_crash 一封
         + gateway.shutdown() + return，是**乾淨返回而非行程崩潰**，不會觸發
         container restart policy 造成重啟迴圈。
 
@@ -295,17 +295,21 @@ class MaxGridBot:
                 f"（帳戶有持倉或掛單時無法切換，需先手動平倉/撤單）：{e}"
             ) from e
 
+        last_err = None
         for attempt in range(HEDGE_MODE_VERIFY_ATTEMPTS):
             if attempt:
                 time.sleep(HEDGE_MODE_VERIFY_DELAY_SEC)
-            again, _ = self._fetch_hedged(sym_config.ccxt_symbol)
+            again, verify_err = self._fetch_hedged(sym_config.ccxt_symbol)
             if again is True:
                 logger.info("[MAX] 已切換為雙向持倉模式並複驗通過")
                 return
+            if verify_err is not None:
+                last_err = verify_err
 
+        detail = f"（最後一次查詢錯誤：{last_err}）" if last_err is not None else ""
         raise RuntimeError(
             f"[MAX] 切換持倉模式後複驗 {HEDGE_MODE_VERIFY_ATTEMPTS} 次仍非"
-            f"雙向持倉模式，拒絕啟動（切換呼叫沒報錯但實際未生效）"
+            f"雙向持倉模式，拒絕啟動（切換呼叫沒報錯但實際未生效）{detail}"
         )
 
     def _build_bundle(self, sym_config: SymbolConfig) -> ManagerBundle:
