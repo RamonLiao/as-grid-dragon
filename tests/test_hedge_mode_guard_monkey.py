@@ -14,8 +14,6 @@
 """
 import asyncio
 
-import asyncio
-
 import ccxt
 import pytest
 from unittest.mock import MagicMock

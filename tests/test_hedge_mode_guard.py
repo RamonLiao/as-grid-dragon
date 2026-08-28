@@ -150,6 +150,28 @@ class TestCheckHedgeMode:
         assert "原文已截斷" in msg
         assert len(msg) < 1000, "整條訊息不得被 5 萬字的 HTML body 撐爆"
 
+    @pytest.mark.parametrize("exc_factory", [
+        lambda: ccxt.ExchangeNotAvailable("<html>" + "B" * 80_000 + "</html>"),
+        lambda: ccxt.BadRequest("<html>" + "B" * 80_000 + "</html>"),
+    ], ids=["retryable-ExchangeNotAvailable", "definitive-BadRequest"])
+    def test_initial_fetch_failure_message_is_bounded(self, _no_real_sleep, exc_factory):
+        """初查失敗那條 raise 也必須截斷交易所原文。
+
+        它是 `_check_hedge_mode` 裡第三個注入點，先前只有另外兩處套了 `_clip`
+        ⇒ 這條路徑實測會產生 8 萬字的訊息，每次啟動失敗往日誌灌 80KB。
+        危害比切換那條低（這條的指引本來就排在原文**前面**，不會被擠掉），
+        但「維護中的 ExchangeNotAvailable 重試 3 次後從這裡 raise」是很常見的
+        真實路徑，所以兩種例外（可重試 / 不可重試）都釘。
+        """
+        bot = _make_bot()
+        bot.exchange = _exchange([exc_factory()])
+        with pytest.raises(RuntimeError, match="查詢持倉模式失敗") as ei:
+            bot._check_hedge_mode()
+        msg = str(ei.value)
+        assert len(msg) < 1000, f"訊息未截斷（實得 {len(msg)} 字）"
+        assert "原文已截斷" in msg
+        assert "拒絕啟動" in msg, "截斷不得把給人的說明也一起吃掉"
+
     def test_verification_accepts_only_the_exact_true(self):
         """複驗和初查一樣，只有**明確的 True** 才算確認。
 

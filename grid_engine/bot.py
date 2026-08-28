@@ -61,7 +61,19 @@ CustomExchange = type('CustomExchange', (ccxt.binance,), {
 })
 
 STALE_QUOTE_LOG_SECONDS = 3600.0  # 價格過期 log 節流間隔（秒），不洗版
-# 切換 dualSidePosition 後交易所端非同步生效，立刻複驗可能讀到舊值
+# 切換 dualSidePosition 後交易所端非同步生效，立刻複驗可能讀到舊值。
+#
+# 調大 HEDGE_MODE_VERIFY_ATTEMPTS 前先讀這段：它同時決定四件事，但只有前兩件
+# 在調整時會有測試變紅，另外兩件會靜默改變：
+#   1. 初查的重試次數（會紅）
+#   2. 切換後的複驗次數（會紅）
+#   3. `-1003 RateLimitExceeded` 留在重試白名單的划算性（**不會紅**）——
+#      見 `_is_retryable_fetch_error`。目前「重試限流錯誤」可接受，是因為代價
+#      有界：唯讀 GET、最多 3 次。次數變大就是在對交易所加壓，那個取捨要重估。
+#   4. 啟動路徑的最壞延遲（**不會紅**）：初查 (n-1) 次 sleep + 複驗 (n-1) 次
+#      sleep，n=3 時約 4s，加上 ccxt 自身的逾時後最壞約 32s —— 已經超過
+#      as_terminal_max.py 那個 100 × 0.1s 的 TUI 等待預算，再調大會更常走進
+#      「啟動逾時」分支。
 HEDGE_MODE_VERIFY_ATTEMPTS = 3
 HEDGE_MODE_VERIFY_DELAY_SEC = 1.0
 UNKNOWN_PS_LOG_SECONDS = 3600.0  # 非 LONG/SHORT 的 positionSide 事件 log 節流
@@ -332,7 +344,7 @@ class MaxGridBot:
                 # 否則日誌會出現「重試中（第 3/3 次）」這種不會發生的下一次。
                 logger.warning(
                     f"[MAX] 查詢持倉模式失敗（第 {attempt + 1}/{HEDGE_MODE_VERIFY_ATTEMPTS} "
-                    f"次），{HEDGE_MODE_VERIFY_DELAY_SEC} 秒後重試：{err}"
+                    f"次），{HEDGE_MODE_VERIFY_DELAY_SEC} 秒後重試：{_clip(err)}"
                 )
 
         if hedged is True:
@@ -341,7 +353,7 @@ class MaxGridBot:
             raise RuntimeError(
                 f"[MAX] 查詢持倉模式失敗，無法確認帳戶是否為雙向持倉模式，"
                 f"拒絕啟動（本 bot 的每張單都帶 positionSide，單向模式下會被"
-                f"整批拒絕）：{err}"
+                f"整批拒絕）：{_clip(err)}"
             )
         if hedged is not False:
             # 只有**明確的 False** 才代表「確定是單向、該去切換」。缺失（None）
@@ -370,7 +382,8 @@ class MaxGridBot:
             # 「POST 已生效但回應 timeout」都會走到這裡）。交給下面的複驗裁決。
             switch_err = e
             logger.warning(
-                f"[MAX] 切換持倉模式的呼叫回報錯誤，改以複驗實際狀態裁決：{e}"
+                f"[MAX] 切換持倉模式的呼叫回報錯誤，改以複驗實際狀態裁決："
+                f"{_clip(e)}"
             )
 
         last_err = None
@@ -382,7 +395,7 @@ class MaxGridBot:
                 if switch_err is not None:
                     logger.info(
                         f"[MAX] 切換呼叫曾回報錯誤但帳戶實際已是雙向持倉模式，"
-                        f"複驗通過，正常啟動（原始錯誤：{switch_err}）"
+                        f"複驗通過，正常啟動（原始錯誤：{_clip(switch_err)}）"
                     )
                 else:
                     logger.info("[MAX] 已切換為雙向持倉模式並複驗通過")
@@ -393,10 +406,14 @@ class MaxGridBot:
         detail = (f"｜最後一次查詢錯誤：{_clip(last_err)}"
                   if last_err is not None else "")
         if switch_err is not None:
-            # 給人的指引一律排在**最前面**，交易所原文排最後並截斷：notify_crash
-            # 只送前 500 字（notifier 的既有行為，不改它），而交易所維護/5xx 會讓
-            # ccxt 把整包 HTML body 塞進例外訊息。指引排在原文後面就會被截掉，
-            # 只剩「可能是持倉問題」——操作員照字面去手動平倉的是真錢。
+            # 為什麼要防：notify_crash 只送前 500 字（notifier 的既有行為，不改
+            # 它），而交易所維護/5xx 會讓 ccxt 把整包 HTML body 塞進例外訊息。
+            # 指引若被擠出截斷線，操作員只讀到「可能是持倉問題」——照字面去手動
+            # 平倉的是真錢。
+            # **主要防線是 `_clip()`**：原文壓到 200 字後，整條訊息穩穩落在 500
+            # 字內，順序其實已經不影響結果。指引排在原文前面是**次要的縱深**，
+            # 用來擋「日後有人調大 EXCHANGE_ERR_CLIP_CHARS 或新增更長欄位」。
+            # 兩者都不要單獨拿掉。
             raise RuntimeError(
                 f"[MAX] 切換持倉模式被交易所拒絕，且複驗 {HEDGE_MODE_VERIFY_ATTEMPTS} "
                 f"次仍非雙向持倉模式，拒絕啟動。"
