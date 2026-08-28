@@ -67,8 +67,16 @@ bot 帶著未經證實的模式假設繼續啟動。Binance 在有持倉/掛單�
 - 複驗用的 `time.sleep` 只允許出現在 `_check_hedge_mode` 內：該函式是**同步**的、
   跑在 `gateway.call` 的 worker thread，不阻塞 event loop。複驗上限 3 次、間隔 1s
   ⇒ 啟動路徑最壞多耗 ~3s。不得改成 `asyncio.sleep`（函式非 async）。
-- `_handle_order_update` 對 `BOTH` 早退後**不呼叫 `adjust_grid`**：這是刻意的，
-  帳戶模式錯誤時重掛網格只會製造更多被拒的單。
+- `_handle_order_update` 對 `BOTH` 早退後不呼叫 `adjust_grid`。
+  ⚠️ **2026-08-28 修訂**：原文寫「這是刻意的，帳戶模式錯誤時重掛網格只會製造
+  更多被拒的單」——**該宣稱已被最終 review 證偽**。`_handle_ticker` 對每筆
+  bookTicker 都無條件呼叫 `adjust_grid`，且 `sync_service` 的掛單統計只認
+  LONG/SHORT ⇒ one-way 下四個掛單計數會被 REST 寫成 0 ⇒ `_should_adjust_grid`
+  恆為 True ⇒ 每 tick 都在重掛。早退**沒有**阻止重掛。
+  早退真正避免的是「把成交套用到錯的一側」（掛單計數、bandit 分側統計），
+  不是「阻止重掛網格」——後者由 ticker 路徑主導，本守衛管不到。
+  「不在 one-way 下重掛網格」若要成立，得在 ticker 路徑加守衛，那超出本次
+  spec 範圍（Non-goals：不支援 one-way 模式、不新增降級路徑）。
 - warning 節流以 `ccxt_symbol` 為 key（比照既有 `_last_stale_log_at` 的做法），
   避免每筆成交刷一條。節流**只影響 log，不影響早退行為**。
 - 不得改動 `sym_state.ws_seq += 1` 的位置與時機（`bot.py:810`）——它的原子性註解
