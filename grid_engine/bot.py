@@ -61,6 +61,9 @@ CustomExchange = type('CustomExchange', (ccxt.binance,), {
 })
 
 STALE_QUOTE_LOG_SECONDS = 3600.0  # 價格過期 log 節流間隔（秒），不洗版
+# 切換 dualSidePosition 後交易所端非同步生效，立刻複驗可能讀到舊值
+HEDGE_MODE_VERIFY_ATTEMPTS = 3
+HEDGE_MODE_VERIFY_DELAY_SEC = 1.0
 
 
 class MaxGridBot:
@@ -224,16 +227,86 @@ class MaxGridBot:
             except Exception as e:
                 logger.error(f"獲取 {sym_config.ccxt_symbol} 精度失敗: {e}")
 
+    def _fetch_hedged(self, ccxt_symbol: str):
+        """查帳戶持倉模式，回 `(hedged, err)`。
+
+        兩種「不是 True/False」要分開回報，因為它們的訊息與後續動作不同：
+          - `err` 非 None：查詢本身失敗（網路/限流/權限）。
+          - `hedged is None`：查得到但交易所沒回報 dualSidePosition。
+            ccxt 4.5.32 的 `safe_bool` 在欄位缺失時回 None（binance.py:12791），
+            所以 `mode['hedged']` 不會 KeyError，但會是三態。
+        """
+        try:
+            mode = self.exchange.fetch_position_mode(symbol=ccxt_symbol)
+        except Exception as e:
+            return None, str(e)
+        if not isinstance(mode, dict):
+            return None, None
+        return mode.get('hedged'), None
+
     def _check_hedge_mode(self):
-        for sym_config in self.config.symbols.values():
-            if sym_config.enabled:
-                try:
-                    mode = self.exchange.fetch_position_mode(symbol=sym_config.ccxt_symbol)
-                    if not mode['hedged']:
-                        self.exchange.fapiPrivatePostPositionSideDual({'dualSidePosition': 'true'})
-                        break
-                except Exception:
-                    pass
+        """啟動守衛：確立帳戶處於 hedge（雙向持倉）模式，確立不了就 raise。
+
+        為什麼是硬失敗而不是告警續跑：`order_executor.place_order` 對每一張
+        網格單都帶 `positionSide`（order_executor.py:90-91），而 position mode
+        是幣安**帳戶層**設定 —— one-way 模式下這些單會被整批拒絕，bot 一張單
+        都下不出去，只會一路撞 `_register_order_failure` 直到斷路。帶著未經
+        證實的模式假設啟動，等於把「完全不能交易」偽裝成一串看不懂的下單失敗。
+
+        raise 由 `run()` 的 except（bot.py:865-871）接住 → notify_crash 一封
+        + gateway.shutdown() + return，是**乾淨返回而非行程崩潰**，不會觸發
+        container restart policy 造成重啟迴圈。
+
+        position mode 是帳戶層設定，因此只查一次（取第一個啟用中的 symbol），
+        不逐 symbol 重複查。
+        """
+        sym_config = next(
+            (c for c in self.config.symbols.values() if c.enabled), None
+        )
+        if sym_config is None:
+            return  # 沒有啟用中的 symbol ⇒ 不會下單 ⇒ 這個前提無關緊要
+
+        hedged, err = self._fetch_hedged(sym_config.ccxt_symbol)
+        if hedged is True:
+            return
+        if err is not None:
+            raise RuntimeError(
+                f"[MAX] 查詢持倉模式失敗，無法確認帳戶是否為雙向持倉模式，"
+                f"拒絕啟動（本 bot 的每張單都帶 positionSide，單向模式下會被"
+                f"整批拒絕）：{err}"
+            )
+        if hedged is None:
+            raise RuntimeError(
+                "[MAX] 交易所未回報持倉模式（dualSidePosition 欄位缺失），"
+                "無法確認是否為雙向持倉模式，拒絕啟動"
+            )
+
+        logger.warning(
+            f"[MAX] 偵測到帳戶為單向持倉模式，嘗試切換為雙向持倉模式"
+            f"（{sym_config.symbol}）"
+        )
+        try:
+            self.exchange.fapiPrivatePostPositionSideDual(
+                {'dualSidePosition': 'true'}
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[MAX] 切換持倉模式被交易所拒絕，拒絕啟動"
+                f"（帳戶有持倉或掛單時無法切換，需先手動平倉/撤單）：{e}"
+            ) from e
+
+        for attempt in range(HEDGE_MODE_VERIFY_ATTEMPTS):
+            if attempt:
+                time.sleep(HEDGE_MODE_VERIFY_DELAY_SEC)
+            again, _ = self._fetch_hedged(sym_config.ccxt_symbol)
+            if again is True:
+                logger.info("[MAX] 已切換為雙向持倉模式並複驗通過")
+                return
+
+        raise RuntimeError(
+            f"[MAX] 切換持倉模式後複驗 {HEDGE_MODE_VERIFY_ATTEMPTS} 次仍非"
+            f"雙向持倉模式，拒絕啟動（切換呼叫沒報錯但實際未生效）"
+        )
 
     def _build_bundle(self, sym_config: SymbolConfig) -> ManagerBundle:
         """組現有 manager 實例成 ManagerBundle，供 build_snapshot 共用（回測/實盤同源）。"""
