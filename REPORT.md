@@ -310,3 +310,112 @@ Bot 已結束（背景 thread 不在運行）
 ## 測試結果
 
 962 passed / 2 skipped → **969 passed / 2 skipped**（+7，零退步）。
+
+---
+
+# 外部 review 第二輪（最終）
+
+commits `548476e` + `81d5bbb`
+
+## 1. `HEDGE_MODE_FETCH_TIMEOUT_SEC` 3.0 → 5.0（採納）
+
+這是我自己在上一輪列的第 1 個 concern，reviewer 的論證比我的原始取捨強，採納。
+理由寫進常數註解（那裡是它唯一會被再讀到的地方）：
+
+- **兩個離線可得的生態系錨點都指向反方向**：ccxt 4.5.32 binance 的 `timeout`
+  預設 10000ms，`options['recvWindow']` 預設也是 10000ms（ccxt 把幣安自己的
+  5000 再放寬）。recvWindow 是幣安**伺服器端**對簽名請求的過期窗口 ⇒ 幣安自己
+  認為「端到端晚到 5~10 秒仍屬正常」。3.0 比這兩個錨點緊 3.3 倍，2.8 甚至比
+  幣安預設的 recvWindow 小一半。
+- **成本完全不對稱**：太大 ⇒ 使用者多等，落在這次剛修好的「仍在初始化、參照
+  已保留」安全分支，金錢損失 0；太小 ⇒ 硬失敗拒絕啟動，而 `sync_service` 在
+  那個 raise 之後才啟動 ⇒ **既有真實持倉同時失去追蹤止盈與網格管理**。
+- **決定性的一點**：當初敢壓到 3.0 的唯一理由是「塞進 TUI 的 20s 預算」，而那個
+  理由已經被本 branch 自己撤銷（預算從 `thread.start()` 起算，前面還有
+  `load_markets` / `fetch_markets`）。理由沒了，數字不該留在原地。
+
+連帶重算的字面值：`seen_timeouts == [5000]`、最壞耗時上下界（見下）。對
+`SLOW_BUT_HEALTHY_RESPONSE_SEC = 2.8` 的餘裕從 7% 變成約 79%。
+
+**沒有動 `_init_exchange` 的 `exchange_config`，沒有任何全域 timeout**——這次改的
+仍然只是守衛期間那一段 `try/finally`。
+
+## 2. Minor-7：`40.05s` 不是上確界（已修）
+
+分支表把最壞路徑的「初查第 3 顆」寫死 `0.05s`，但那顆只需要**成功回值**，可以
+慢到幾乎貼著 per-request timeout。這是**同一個病灶的第三種型態**：
+
+```
+第一次：推導了，但沒有斷言接住      → 上一條 branch 整條被丟棄
+第二次：量測了，但只量一條分支      → I-1
+第三次：分支跑到了，但輸入不是最壞  → Minor-7
+```
+
+改用 `SLOWEST_SUCCESSFUL_RESPONSE_SEC = 4.99`（「還不算逾時的最慢一顆成功回應」，
+是**輸入**不是期望值）。
+
+## T=5.0 之下的六條路徑（實測，虛擬時鐘）
+
+| 分支 | 耗時 |
+|---|---|
+| 初查逾時 2 次 → 單向 → 切換 POST 逾時 → 複驗全逾時 | **68.99s ← max** |
+| 單向 → 切換 → 複驗全逾時 | 33.50s |
+| 初查全逾時 | 32.00s |
+| 單向 → 切換被 -4068 拒絕 → 複驗全 False | 4.55s |
+| 單向 → 切換 → 複驗通過 | 1.55s |
+| 初查即通過 | 0.05s |
+
+**max = 68.99s**，字面上界 `HEDGE_GUARD_WORST_CASE_LIMIT_SEC = 70.0`。
+
+上界只留約 1 秒餘裕是刻意的：reviewer 指出舊的 45.0 有 2.0s 餘裕、`HEDGE_MODE_
+VERIFY_DELAY_SEC` 從 1.0 調到 1.5 就頂破 —— 那正是它該做的事。現在 1.0→1.5 會
+把最壞推到 70.99s 並紅在上界（見 M19）。任何推高最壞值的改動都必須重新裁決這個
+數字，而不是被一個寬鬆上界靜默吸收。
+
+**下界也貼著實測值（68.0）**：M17 證明只有上界擋不住「輸入被弱化」——把第 3 顆
+改回 0.05 之後最壞降到 64.05s，舊的 60.0 下界照樣綠。量到的數字**變小**最常見的
+原因不是程式變快，而是測試自己被弱化了。
+
+## 3. Minor-8：註解裡的數字是不可能的情境（已修）
+
+上一輪我寫的「7 顆全部逾時 ≈ 41.5s」**那個情境不可能發生**——初查 3 顆全逾時就
+直接 raise，根本走不到切換；真要算是 46s，反而超過我自己當時設的 45.0 上界；
+而 `bot.py` 同一段又寫「約 40s」。兩處都是散文、沒有任何斷言引用。
+
+修法照 reviewer 的判準：**註解裡的每個數字要嘛對應到一條實際跑的分支，要嘛就
+不要寫具體數字**。`bot.py` 的常數註解與 `HEDGE_GUARD_WORST_CASE_LIMIT_SEC` 的
+註解現在都不寫推導出來的耗時，只指向分支表；REPORT 的表格則是實跑輸出。
+
+## 4. N3：Minor-1 的文案修復沒有守衛（已修）
+
+reviewer 刪掉「可能已經有掛單/持倉」那一行 ⇒ 969 全綠。而且我把 `FAILED_MARK`
+從完整句放寬成 `"Bot 已結束"`，前綴匹配等於允許後半句被改成任何東西（包含改回
+「交易未啟動」那句假話）。
+
+- `FAILED_MARK` 收回整句 `"Bot 已結束（背景 thread 不在運行）"`。
+- 新增 `test_the_failure_message_never_claims_the_exchange_is_clean`：釘住
+  `OPEN_ORDERS_WARNING` 出現、且 `"交易未啟動"` **不得**出現。
+- 反面也釘：thread 還活著的分支不得出現那行提醒。
+
+## Backlog（記錄，不修）
+
+- **Minor-3 只釘住一半。** `test_guard_relies_on_the_rest_gateway_being_single_worker`
+  證明的是「executor 是單 worker」，沒有證明「所有同步 REST 都經 gateway」。
+  reviewer 已掃過第二條目前成立（14 處全走 `gateway.call`；唯一一處直呼在
+  `enhancements.py` 的 funding rate 更新裡，而它本身被 gateway 包裹），但那只靠
+  慣例，沒有機制擋住未來有人繞過 gateway 直呼 `self.exchange.*`。
+- **Minor-4：`_trading_active` 的競態零覆蓋**（維持不修，理由見上一段）。
+- `SLOW_BUT_HEALTHY_RESPONSE_SEC = 2.8` 仍是推測值；拿到實測延遲分布要複核。
+
+## 本輪 Mutation（4/4 紅，皆為斷言紅、無 hang）
+
+| # | Mutation | 紅在哪 |
+|---|---|---|
+| M16 | `HEDGE_MODE_FETCH_TIMEOUT_SEC` 5.0→3.0 | `test_timeout_is_applied…`：`[3000] == [5000]`；`test_the_worst_branch…`：最壞跌破 68.0 下界 |
+| M17 | 最壞路徑第 3 顆改回寫死 `0.05` | `test_the_worst_branch…`：64.05s < 68.0（**舊的 60.0 下界擋不住，這是本輪新增的守衛**） |
+| M18 | 刪掉「交易所上可能已經有掛單/持倉」那行 | `test_the_failure_message_never_claims_the_exchange_is_clean` |
+| M19 | `HEDGE_MODE_VERIFY_DELAY_SEC` 1.0→1.5 | `test_every_branch…` 與 `test_the_worst_branch…`：`70.99s > 70.0`（證明上界餘裕是真的被守著） |
+
+## 測試結果
+
+969 passed / 2 skipped → **970 passed / 2 skipped**（+1，零退步）。
