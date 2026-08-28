@@ -548,15 +548,27 @@ TUI_START_BUDGET_SEC = 20.0        # as_terminal_max.start_trading 兩段 100×0
 
 # 守衛最壞耗時的字面上界（秒）。**不是**「塞得進 TUI 的 20s 預算」——那個保證
 # 從來不成立（預算從 thread.start() 起算，前面還有 load_markets/fetch_markets，
-# 用的是交易所實例原本的逾時）。這個數字承諾的是另一件事：使用者按下啟動之後，
-# 守衛最壞多久會給出一個明確結果。7 顆請求（初查 3 + 切換 POST 1 + 複驗 3）
-# 全部逾時 ≈ 41.5s；沒有 per-request timeout 則是兩分鐘級。
-HEDGE_GUARD_WORST_CASE_LIMIT_SEC = 45.0
+# 用的是交易所實例原本的逾時）。它承諾的是另一件事：使用者按下啟動之後，守衛
+# 最壞多久會給出一個明確結果。
+#
+# 這裡**不寫任何推導出來的數字**，只寫上界本身：這條 branch 的前身就是死在
+# 「散文裡的推導數字沒有被任何斷言接住」。實際的最壞值由分支表跑出來（見
+# HEDGE_GUARD_PATHS 與 test_the_worst_branch…），目前是「初查逾時2次→單向→
+# 切換逾時→複驗全逾時」那條。上界刻意只留約一秒的餘裕：任何會推高最壞值的
+# 改動（per-request timeout、重試次數、重試間隔）都必須重新裁決這個數字，
+# 而不是被一個寬鬆的上界靜默吸收。
+HEDGE_GUARD_WORST_CASE_LIMIT_SEC = 70.0
 
 # 下界錨點：正常但慢的回應不得被守衛自己判成逾時。2.8s 是「幣安 REST 長尾延遲」
 # 的錨點，**推測值**（沒有實測分布；若日後拿到實測，該用實測的 p99.9 取代）。
 # 它的作用是釘住「HEDGE_MODE_FETCH_TIMEOUT_SEC 不得往下調到這條線以下」。
 SLOW_BUT_HEALTHY_RESPONSE_SEC = 2.8
+
+# 「還沒逾時的最慢一顆成功回應」——最壞路徑的**輸入**，不是期望值。
+# 這條路徑上「初查第 3 顆讀到單向」那一顆只需要成功回值，它可以慢到幾乎貼著
+# per-request timeout；寫死一個小數字（原本是 0.05）會讓量到的最大值不是上確界，
+# 那正是「量測了，但輸入不是最壞的輸入」——同一個病灶的第三次。
+SLOWEST_SUCCESSFUL_RESPONSE_SEC = 4.99
 
 
 class VirtualClock:
@@ -683,10 +695,12 @@ HEDGE_GUARD_PATHS = {
     ),
     # 單向 → 切換出去了 → 複驗三顆全逾時
     "單向→切換→複驗全逾時": dict(responses=[(0.05, False), (INF, True)]),
-    # 真正的最壞：初查前兩顆逾時、第三顆才讀到 False，切換 POST 也逾時，
-    # 複驗三顆再全逾時 ⇒ 7 顆請求裡 6 顆吃滿 2T。
+    # 真正的最壞：初查前兩顆逾時、第三顆**慢到快逾時但仍成功**才讀到 False，
+    # 切換 POST 也逾時，複驗三顆再全逾時 ⇒ 6 顆吃滿 2T，另一顆吃滿「還不算
+    # 逾時」的上確界。第三顆不能寫死小值，否則量到的不是上確界。
     "初查逾時2次→單向→切換逾時→複驗全逾時": dict(
-        responses=[(INF, True), (INF, True), (0.05, False), (INF, True)],
+        responses=[(INF, True), (INF, True),
+                   (SLOWEST_SUCCESSFUL_RESPONSE_SEC, False), (INF, True)],
         switch_latency=INF,
     ),
 }
@@ -699,8 +713,8 @@ class TestHedgeGuardRequestTimeout:
         """紅在：沒套用時 fetch 看到的是 ccxt 預設 10000ms。"""
         bot, _ = _timed_bot(monkeypatch, [(0.05, True)])
         bot._check_hedge_mode()
-        assert bot.exchange.seen_timeouts == [3000], \
-            "守衛期間每顆請求的 timeout 必須是 3.0 秒（3000ms）"
+        assert bot.exchange.seen_timeouts == [5000], \
+            "守衛期間每顆請求的 timeout 必須是 5.0 秒（5000ms）"
 
     def test_timeout_is_restored_after_success(self, monkeypatch):
         bot, _ = _timed_bot(monkeypatch, [(0.05, True)])
@@ -708,7 +722,7 @@ class TestHedgeGuardRequestTimeout:
         assert bot.exchange.timeout == PREEXISTING_TIMEOUT_MS
 
     def test_timeout_is_restored_on_the_raise_path(self, monkeypatch):
-        """紅在：拿掉 finally ⇒ 守衛 raise 之後 exchange.timeout 停在 3000。
+        """紅在：拿掉 finally ⇒ 守衛 raise 之後 exchange.timeout 停在 5000。
 
         這不是潔癖：同一個 exchange 實例接著要跑 create_order / cancel_order /
         fetch_positions —— 被守衛順手腰斬的逾時會把「單已送達但回應逾時」變成
@@ -766,10 +780,12 @@ class TestHedgeGuardWorstCaseDuration:
     """最壞耗時用**跑的**量，而且要量**每一條分支**。
 
     上一版是一串推導常數的算術恆等式，mutation 全數存活（常數改 0.0 全綠）。
-    改成實跑之後又犯了另一半的錯：只跑「初查全逾時」一條路徑，於是量到 20.0s
-    並以為那是最大值 —— 真正的最壞是「初查逾時兩次才讀到單向 → 切換 POST 也
-    逾時 → 複驗三顆全逾時」，而且被漏掉的那條（帳戶本來就是單向）正是使用者
-    最可能遇到的。所以這裡對分支全集取 max，不對單一路徑下結論。
+    改成實跑之後又犯了另一半的錯：只跑「初查全逾時」一條路徑，就把它當成最大值
+    —— 真正的最壞是「初查逾時兩次才讀到單向 → 切換 POST 也逾時 → 複驗三顆全
+    逾時」，而且被漏掉的那條（帳戶本來就是單向）正是使用者最可能遇到的。
+    第三次犯的是同一個病灶的第三種型態：路徑跑到了，但**輸入不是最壞的輸入**
+    （那顆「讀到單向」的成功回應被寫死成 0.05s，其實它可以慢到快逾時）。
+    所以這裡對分支全集取 max，每條分支的輸入也各自取它那一側的最壞。
     """
 
     @pytest.mark.parametrize("name", sorted(HEDGE_GUARD_PATHS))
@@ -777,7 +793,8 @@ class TestHedgeGuardWorstCaseDuration:
         """每一條分支都要單獨量到，任何一條被拿掉都不會有人替它兜底。"""
         elapsed, _ = measure_hedge_guard(monkeypatch, **HEDGE_GUARD_PATHS[name])
         assert elapsed <= HEDGE_GUARD_WORST_CASE_LIMIT_SEC, (
-            f"分支「{name}」耗時 {elapsed:.2f}s，超過守衛最壞耗時上界 45 秒")
+            f"分支「{name}」耗時 {elapsed:.2f}s，超過守衛最壞耗時的字面上界 "
+            f"{HEDGE_GUARD_WORST_CASE_LIMIT_SEC}s")
 
     def test_the_worst_branch_is_the_one_that_times_out_everywhere(self, monkeypatch):
         """對分支全集取 max，再比字面上界。
@@ -794,15 +811,17 @@ class TestHedgeGuardWorstCaseDuration:
         worst = measured[worst_name]
 
         assert worst <= HEDGE_GUARD_WORST_CASE_LIMIT_SEC, (
-            f"守衛最壞耗時 {worst:.2f}s（分支「{worst_name}」）超過 45 秒上界；"
+            f"守衛最壞耗時 {worst:.2f}s（分支「{worst_name}」）超過字面上界 "
+            f"{HEDGE_GUARD_WORST_CASE_LIMIT_SEC}s；"
             f"各分支：{ {k: round(v, 2) for k, v in measured.items()} }")
-        assert worst >= 36.0, (
-            "量到的最大值低於「6 顆請求各吃滿 2 × 3.0s」= 36s —— 要嘛最壞那條"
-            "路徑沒有被真的跑到（分支表被刪成只剩短路徑），要嘛 "
-            "HEDGE_MODE_FETCH_TIMEOUT_SEC 被調小了（那要先過下界測試那一關）")
+        assert worst >= 60.0, (
+            "量到的最大值低於「6 顆請求各吃滿 2 × 5.0s」= 60s —— 要嘛最壞那條"
+            "路徑沒有被真的跑到（分支表被刪成只剩短路徑、或它的輸入被改成不是"
+            "最壞的輸入），要嘛 HEDGE_MODE_FETCH_TIMEOUT_SEC 被調小了"
+            "（那要先過下界測試那一關）")
         assert measured["初查全逾時"] < worst, (
             "「初查全逾時」不該是最大值：切換 + 複驗那一段更貴。上一版正是只量"
-            "了這一條就把 20.0s 當成最壞值")
+            "了這一條就把它當成最壞值")
 
     def test_the_common_hard_failure_is_far_below_the_worst_case(self, monkeypatch):
         """最常見的硬失敗（帳戶是單向、切換被 -4068 拒絕）幾秒內就定案。"""

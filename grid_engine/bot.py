@@ -80,18 +80,31 @@ HEDGE_MODE_VERIFY_DELAY_SEC = 1.0
 # 全域設定：實盤下單/撤單/查倉共用同一個 exchange 實例，全域縮短逾時會把「單
 # 已送達但回應逾時」變成常態，等於製造重複掛單。
 #
-# 3.0 的兩側界線（單顆請求的最壞 wall ≈ 2T，因為 requests 的 timeout 是
-# connect 與 read 各一份）：
-#   上界——守衛最壞會送 7 顆請求（初查 3 + 切換 POST 1 + 複驗 3），全部逾時時
-#          約 40s；沒有這個 timeout（用交易所實例原本的逾時）就是兩分鐘級。
-#          最壞耗時由 test_hedge_mode_guard.py 的多路徑量測測試釘住，調大即紅。
-#   下界——必須留在幣安 REST 的長尾延遲之上，否則健康帳戶會被自己的守衛擋在
-#          門外。測試釘的錨點是「2.8 秒才回的正常回應仍須通過」。
-# **不要拿它跟 TUI 的 20s 等待預算比**：那個預算從 thread.start() 起算，前面
-# 還有 _init_exchange 的 load_markets/fetch_markets（用的是交易所實例原本的
-# 逾時，不在本常數管轄範圍內），所以「守衛塞得進 20s」從來不是個成立的保證。
-# TUI 那邊靠的是偵測 thread 已死，不是靠守衛跑得夠快。
-HEDGE_MODE_FETCH_TIMEOUT_SEC = 3.0
+# 為什麼是 5.0（單顆請求的最壞 wall ≈ 2T，因為 requests 的 timeout 是 connect
+# 與 read 各一份）：
+#
+#   下界（真正的約束）——必須留在幣安 REST 的長尾延遲之上，否則健康帳戶會被
+#     自己的守衛擋在門外，而拒絕啟動的代價不只是「bot 沒跑」：sync_service 在
+#     這個 raise 之後才啟動，既有真實持倉會同時失去追蹤止盈與網格管理。
+#     兩個離線可得的生態系錨點都指向「別壓太小」：ccxt binance 的 timeout 預設
+#     10000ms，options['recvWindow'] 預設也是 10000ms —— recvWindow 是幣安
+#     伺服器端對簽名請求的過期窗口，等於幣安自己認為「端到端晚到 5~10 秒仍屬
+#     正常」。測試釘的錨點是「2.8 秒才回的正常回應仍須通過」，5.0 對它有約 79%
+#     餘裕；先前的 3.0 只有 7%。
+#
+#   上界——只是「別讓使用者無限等」，不是安全性約束。成本完全不對稱：太大只是
+#     多等（落在 TUI「仍在初始化、參照已保留」那條安全分支，金錢損失 0），
+#     太小則是拒絕啟動加上上面那筆真實代價。
+#
+# 這個常數曾經是 3.0，唯一理由是「塞進 TUI 那 100 × 0.1s 的等待預算」。那個
+# 理由**站不住也已經被撤銷**：該預算從 thread.start() 起算，前面還有
+# _init_exchange 的 load_markets / fetch_markets（用的是交易所實例原本的逾時，
+# 不在本常數管轄範圍內）。TUI 那邊靠的是偵測 thread 已死，不是靠守衛跑得夠快。
+#
+# 守衛的最壞耗時不寫在這裡：任何寫死的數字都會腐化，而且它取決於路徑組合。
+# test_hedge_mode_guard.py 的分支表把每條路徑實跑一次並對全集取 max，調大這個
+# 常數、調大重試次數或調大重試間隔都會頂破那條測試的字面上界。
+HEDGE_MODE_FETCH_TIMEOUT_SEC = 5.0
 UNKNOWN_PS_LOG_SECONDS = 3600.0  # 非 LONG/SHORT 的 positionSide 事件 log 節流
 EXCHANGE_ERR_CLIP_CHARS = 200    # 例外原文塞進錯誤訊息前的長度上限
 

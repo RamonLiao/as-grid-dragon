@@ -520,9 +520,13 @@ from tests.test_hedge_mode_guard import (  # noqa: E402
     TUI_START_BUDGET_SEC, HEDGE_GUARD_PATHS, VirtualClock, measure_hedge_guard,
 )
 
-FAILED_MARK = "Bot 已結束"
+# 用整句、不用「Bot 已結束」這種放寬過的前綴：前綴匹配等於允許後半句被改成
+# 任何東西（包含被改回「交易未啟動」那句假話）。
+FAILED_MARK = "Bot 已結束（背景 thread 不在運行）"
 STILL_INIT_MARK = "Bot 仍在初始化中"
 STARTED_MARK = "交易已在背景啟動"
+# 這條分支獨有的字面值：thread 已死不代表交易所上乾淨。
+OPEN_ORDERS_WARNING = "交易所上可能已經有掛單/持倉"
 
 
 class ScheduledState:
@@ -612,6 +616,23 @@ class TestStartTradingDetectsDeadThread:
         assert STILL_INIT_MARK not in out, "thread 已死時不得說它還在初始化"
         assert menu.bot is None and menu._trading_active is False
 
+    def test_the_failure_message_never_claims_the_exchange_is_clean(self, monkeypatch):
+        """thread 已死 ≠ 交易所上沒東西。
+
+        有一個窄窗口：bot 已經把 running 設成 True、甚至已經掛了單，然後才崩潰
+        結束 thread —— 0.1s 取樣的輪詢在兩次取樣之間就會錯過那個 True，於是走進
+        這條「已結束」分支。此時說「交易未啟動」是最貴的一種假話：使用者會以為
+        交易所上乾乾淨淨而不去查。
+
+        紅在：刪掉那行提醒、或把文案改回宣稱「交易未啟動」。
+        """
+        _, out, _ = _run_start_trading(monkeypatch, VirtualClock(), dies_at=2.0)
+
+        assert OPEN_ORDERS_WARNING in out, \
+            "失敗文案必須提醒去確認交易所上的掛單/持倉"
+        assert "交易未啟動" not in out, \
+            "TUI 拿不到 bot 是否掛過單，不得斷言「交易未啟動」"
+
     def test_death_inside_the_second_loop_is_reported_at_that_moment(self, monkeypatch):
         """紅在：只在第一段迴圈加偵測、第二段沒加 ⇒ 量到 20.0 不是 14.0。"""
         elapsed, out, menu = _run_start_trading(
@@ -634,6 +655,8 @@ class TestStartTradingDetectsDeadThread:
             f"TUI 的等待預算是 20 秒，實際等了 {elapsed:.1f}s"
         assert STILL_INIT_MARK in out
         assert FAILED_MARK not in out, "thread 還活著時不得宣告失敗"
+        assert OPEN_ORDERS_WARNING not in out, \
+            "還活著時不該叫人去查掛單——那是「已結束」分支專屬的提醒"
         assert menu.bot is not None, "還活著的 bot 不得被放手（會變成停不掉的孤兒）"
 
     def test_success_inside_the_first_loop(self, monkeypatch):
