@@ -212,6 +212,39 @@ class TestOrderUpdatePositionSideGuard:
             await order_bot._handle_order_update(_filled_event("BOTH"))
             await order_bot._handle_order_update(_filled_event("BOTH"))
 
-        hits = [r for r in caplog.records if "單向持倉模式" in r.getMessage()]
+        hits = [r for r in caplog.records if "非 LONG/SHORT" in r.getMessage()]
         assert len(hits) == 1, "同一 symbol 的重複事件不得洗版"
         assert (st.buy_long_orders, st.ws_seq) == (3, 7), "第二筆一樣不得套用"
+
+
+@pytest.fixture
+def fake_guard_clock():
+    """可推進的假守衛時鐘（比照 tests/test_price_staleness_guard.py 的 fake_clock）。
+
+    注入 set_guard_clock 而非 set_clock：節流用的是 clock.guard_now()。
+    """
+    t = {"now": 1_000_000.0}
+    clock.set_guard_clock(lambda: t["now"])
+
+    def advance(seconds):
+        t["now"] += seconds
+    yield advance
+    clock.reset_guard_clock()
+
+
+class TestUnknownPositionSideLogThrottleWindow:
+    @pytest.mark.asyncio
+    async def test_warning_resumes_after_throttle_window(self, order_bot, caplog,
+                                                            fake_guard_clock):
+        """節流窗口過後，告警必須恢復 —— 不是「第一次之後永遠靜音」。
+        只釘「窗口內至多一次」測不出「節流條件被改成永久靜音」這種 mutation
+        （例如把門檻改成一個天文數字）。期望值寫死秒數，不從常數換算，
+        避免常數改了期望值跟著位移、斷言失去意義。
+        """
+        with caplog.at_level("WARNING"):
+            await order_bot._handle_order_update(_filled_event("BOTH"))
+            fake_guard_clock(3601.0)
+            await order_bot._handle_order_update(_filled_event("BOTH"))
+
+        hits = [r for r in caplog.records if "非 LONG/SHORT" in r.getMessage()]
+        assert len(hits) == 2
