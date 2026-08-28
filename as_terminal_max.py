@@ -1317,16 +1317,23 @@ class MainMenu:
 
     @staticmethod
     def _print_startup_failed():
-        """bot thread 已結束且沒開始交易 —— 唯一的真相在日誌與 Telegram。
+        """bot thread 已結束 —— 唯一的真相在日誌與 Telegram。
 
         真正的原因（持倉模式確立失敗、API 權限、網路）由 run() 的初始化 except
         區塊寫進日誌並送 notify_crash("初始化失敗: ...")，TUI 這層拿不到，
         所以只做指路，不猜原因。
+
+        措辭刻意不說「交易未啟動」：還有一個窄窗口是 bot 已經把 running 設成
+        True、甚至已經掛了單，然後才崩潰結束 thread（輪詢在兩次取樣之間就會
+        錯過那個 True）。那個窗口裡「未啟動」是假話，而且是最貴的一種假話——
+        使用者會以為交易所上乾乾淨淨。
         """
-        console.print("[red]Bot 已結束，交易未啟動[/]")
+        console.print("[red]Bot 已結束（背景 thread 不在運行）[/]")
         console.print(
             "[dim]常見成因：帳戶持倉模式（雙向持倉）確立失敗，或網路/限流/API 權限 —— "
             "確切原因看日誌與 Telegram 的「初始化失敗」通知[/]")
+        console.print(
+            "[dim]若它曾短暫啟動過，交易所上可能已經有掛單/持倉，請一併確認[/]")
 
     def _push_config_to_bot(self) -> bool:
         """把最新 config 推給還在運行的 bot；回傳是否推成功。

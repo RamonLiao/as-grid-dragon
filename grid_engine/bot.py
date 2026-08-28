@@ -80,9 +80,17 @@ HEDGE_MODE_VERIFY_DELAY_SEC = 1.0
 # 全域設定：實盤下單/撤單/查倉共用同一個 exchange 實例，全域縮短逾時會把「單
 # 已送達但回應逾時」變成常態，等於製造重複掛單。
 #
-# 3.0 的來源（單顆 GET 的最壞 wall ≈ 2T，因為 requests 的 timeout 是 connect
-# 與 read 各一份）：初查最壞 3 顆 × 2T + 2 次重試間隔 = 20s，正好落在
-# as_terminal_max.py 那個 100 × 0.1s 的 TUI 等待預算上。調大就會超出。
+# 3.0 的兩側界線（單顆請求的最壞 wall ≈ 2T，因為 requests 的 timeout 是
+# connect 與 read 各一份）：
+#   上界——守衛最壞會送 7 顆請求（初查 3 + 切換 POST 1 + 複驗 3），全部逾時時
+#          約 40s；沒有這個 timeout（用交易所實例原本的逾時）就是兩分鐘級。
+#          最壞耗時由 test_hedge_mode_guard.py 的多路徑量測測試釘住，調大即紅。
+#   下界——必須留在幣安 REST 的長尾延遲之上，否則健康帳戶會被自己的守衛擋在
+#          門外。測試釘的錨點是「2.8 秒才回的正常回應仍須通過」。
+# **不要拿它跟 TUI 的 20s 等待預算比**：那個預算從 thread.start() 起算，前面
+# 還有 _init_exchange 的 load_markets/fetch_markets（用的是交易所實例原本的
+# 逾時，不在本常數管轄範圍內），所以「守衛塞得進 20s」從來不是個成立的保證。
+# TUI 那邊靠的是偵測 thread 已死，不是靠守衛跑得夠快。
 HEDGE_MODE_FETCH_TIMEOUT_SEC = 3.0
 UNKNOWN_PS_LOG_SECONDS = 3600.0  # 非 LONG/SHORT 的 positionSide 事件 log 節流
 EXCHANGE_ERR_CLIP_CHARS = 200    # 例外原文塞進錯誤訊息前的長度上限
@@ -340,6 +348,12 @@ class MaxGridBot:
         if sym_config is None:
             return  # 沒有啟用中的 symbol ⇒ 不會下單 ⇒ 這個前提無關緊要
 
+        # 這裡改的是**共用可變狀態**：同一個 exchange 實例，實盤的下單/撤單/查倉
+        # 都用它。之所以安全，靠的是一個必須寫下來的前提——所有同步 REST 都經
+        # RestGateway 卸載到 `max_workers=1` 的單一 worker thread（同步 ccxt
+        # 實例本來就不是 thread-safe），所以守衛執行期間不可能有另一個真實請求
+        # 正在飛。max_workers 一旦 > 1，這段就變成會腰斬別人逾時的競態。
+        # 那個前提由 test_hedge_mode_guard.py 的 RestGateway 單 worker 測試釘住。
         prev_timeout = self.exchange.timeout
         self.exchange.timeout = int(HEDGE_MODE_FETCH_TIMEOUT_SEC * 1000)  # ccxt 用毫秒
         try:

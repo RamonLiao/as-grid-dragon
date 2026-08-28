@@ -511,11 +511,16 @@ class TestOtherScreensSeeOrphan:
 
 import types  # noqa: E402
 
-from tests.test_hedge_mode_guard import (  # noqa: E402,F401  (fixture 靠 import 註冊)
-    TUI_START_BUDGET_SEC, VirtualClock, measure_hedge_guard, _no_real_sleep,
+# 只 import 純 helper，**不 import 對面的 autouse fixture**：`_no_real_sleep`
+# 一旦被帶進本模組的命名空間就會對整個檔案生效，讓每條測試都跑在「全域
+# time.sleep 被換掉」的狀態下 —— 本檔不需要那個，而且它會讓未來任何真的需要
+# sleep 的測試靜默失真。measure_hedge_guard 自己會用 monkeypatch 接管守衛的
+# sleep，不依賴那個 fixture。
+from tests.test_hedge_mode_guard import (  # noqa: E402
+    TUI_START_BUDGET_SEC, HEDGE_GUARD_PATHS, VirtualClock, measure_hedge_guard,
 )
 
-FAILED_MARK = "Bot 已結束，交易未啟動"
+FAILED_MARK = "Bot 已結束"
 STILL_INIT_MARK = "Bot 仍在初始化中"
 STARTED_MARK = "交易已在背景啟動"
 
@@ -659,13 +664,8 @@ class TestStartupFailureIsVisibleQuickly:
     """
 
     def test_common_hard_failure_surfaces_at_the_guard_failure_time(self, monkeypatch):
-        import ccxt
-
         guard_sec, raised = measure_hedge_guard(
-            monkeypatch,
-            [(0.05, False)],
-            switch_error=ccxt.OperationRejected("-4068 position side cannot be changed"),
-        )
+            monkeypatch, **HEDGE_GUARD_PATHS["單向→切換被拒→複驗全False"])
         assert isinstance(raised, RuntimeError), "這條路徑必須是硬失敗"
 
         elapsed, out, menu = _run_start_trading(
