@@ -1288,13 +1288,20 @@ class MainMenu:
                     self._trading_active = True
                     console.print("[bold green]✓ 交易已在背景啟動！[/]\n")
                 elif self._release_bot_if_dead():
-                    console.print("[red]Bot 啟動超時且已結束，請檢查網絡連接[/]")
+                    console.print("[red]Bot 啟動超時且已結束，請檢查日誌與網路連線[/]")
+                    console.print(
+                        "[dim]常見成因：網路/限流，或帳戶持倉模式（雙向持倉）確立失敗 —— "
+                        "詳細原因看日誌與 Telegram 的「初始化失敗」通知[/]")
                 else:
                     # 逾時 ≠ bot 不存在。state.running 是在 _init_exchange /
-                    # _check_hedge_mode / acquire_listen_key 之後才設 True，逾時只代表
-                    # 初始化慢（例如 DNS 掛掉），這個 bot 接下來一定會開始掛單。
+                    # _check_hedge_mode / acquire_listen_key 之後才設 True。
+                    # 注意：_check_hedge_mode 現在是**硬失敗**守衛（確立不了帳戶為
+                    # 雙向持倉模式就 raise、乾淨返回不啟動），所以「逾時只代表初始化
+                    # 慢、接下來一定會開始掛單」**已不再成立**。這個分支只表示
+                    # thread 此刻還活著，不保證它最後會掛單；真正的結果看日誌。
                     logger.warning("[TUI] Bot 啟動逾時但 thread 仍在運行，保留參照以便停止")
                     console.print("[yellow]Bot 仍在初始化中（網路慢？）——參照已保留[/]")
+                    console.print("[dim]也可能正在確立持倉模式；若最終失敗會落在日誌與 Telegram[/]")
                     console.print("[dim]確定不要它時請用「s」停止交易，不要直接再啟動[/]")
             else:
                 console.print("[red]Bot 啟動失敗，請檢查日誌[/]")

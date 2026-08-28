@@ -239,11 +239,15 @@ class MaxGridBot:
           - `hedged is None`：查得到但交易所沒回報 dualSidePosition。
             ccxt 4.5.32 的 `safe_bool` 在欄位缺失時回 None（binance.py:12791），
             所以 `mode['hedged']` 不會 KeyError，但會是三態。
+
+        `err` 回**例外物件本身**而不是 `str(e)`：呼叫端要用型別分辨
+        「網路瞬斷（可重試）」與「交易所/權限錯誤（不可重試）」。
+        放進 f-string 時格式與 `str(e)` 相同，訊息內容不受影響。
         """
         try:
             mode = self.exchange.fetch_position_mode(symbol=ccxt_symbol)
         except Exception as e:
-            return None, str(e)
+            return None, e
         if not isinstance(mode, dict):
             return None, None
         return mode.get('hedged'), None
@@ -264,6 +268,19 @@ class MaxGridBot:
 
         position mode 是帳戶層設定，因此只查一次（取第一個啟用中的 symbol），
         不逐 symbol 重複查。
+
+        兩處「不把一次瞬斷當成確認不了」的容忍（security review F1 / F2），
+        兩者都**不放寬**「確認不了就不啟動」：
+          - 初查對 `ccxt.NetworkError`（RequestTimeout / DDoSProtection /
+            ExchangeNotAvailable 的共同父類）重試；`ccxt.ExchangeError`
+            這類（BadRequest、權限錯誤）不重試，直接 raise。重試耗盡仍 raise。
+            零重試的代價不只是「bot 沒跑」：sync_service 是在這個 raise 之後才
+            啟動的，而 risk_monitor 的追蹤止盈只由它驅動 ⇒ 交易所上的既有持倉
+            會同時失去追蹤止盈與網格管理。
+          - 切換呼叫報錯不立刻 raise，一律落到複驗迴圈，用**最終實際狀態**裁決：
+            幣安的 -4059「No need to change position side」代表本來就已經是目標
+            狀態，「POST 已生效但回應 timeout」也是良性結果，兩者直接判死都是
+            假陽性。複驗仍不過才 raise，訊息帶上切換時的原始錯誤。
         """
         sym_config = next(
             (c for c in self.config.symbols.values() if c.enabled), None
@@ -271,7 +288,18 @@ class MaxGridBot:
         if sym_config is None:
             return  # 沒有啟用中的 symbol ⇒ 不會下單 ⇒ 這個前提無關緊要
 
-        hedged, err = self._fetch_hedged(sym_config.ccxt_symbol)
+        hedged, err = None, None
+        for attempt in range(HEDGE_MODE_VERIFY_ATTEMPTS):
+            if attempt:
+                time.sleep(HEDGE_MODE_VERIFY_DELAY_SEC)
+            hedged, err = self._fetch_hedged(sym_config.ccxt_symbol)
+            if not isinstance(err, ccxt.NetworkError):
+                break  # 成功、或不可重試的錯誤（ExchangeError / 權限）⇒ 不再試
+            logger.warning(
+                f"[MAX] 查詢持倉模式遇到網路類錯誤，重試中"
+                f"（第 {attempt + 1}/{HEDGE_MODE_VERIFY_ATTEMPTS} 次）：{err}"
+            )
+
         if hedged is True:
             return
         if err is not None:
@@ -290,15 +318,18 @@ class MaxGridBot:
             f"[MAX] 偵測到帳戶為單向持倉模式，嘗試切換為雙向持倉模式"
             f"（{sym_config.symbol}）"
         )
+        switch_err = None
         try:
             self.exchange.fapiPrivatePostPositionSideDual(
                 {'dualSidePosition': 'true'}
             )
         except Exception as e:
-            raise RuntimeError(
-                f"[MAX] 切換持倉模式被交易所拒絕，拒絕啟動"
-                f"（帳戶有持倉或掛單時無法切換，需先手動平倉/撤單）：{e}"
-            ) from e
+            # 不在這裡 raise：呼叫回傳不等於帳戶最終狀態（-4059「本來就是雙向」、
+            # 「POST 已生效但回應 timeout」都會走到這裡）。交給下面的複驗裁決。
+            switch_err = e
+            logger.warning(
+                f"[MAX] 切換持倉模式的呼叫回報錯誤，改以複驗實際狀態裁決：{e}"
+            )
 
         last_err = None
         for attempt in range(HEDGE_MODE_VERIFY_ATTEMPTS):
@@ -306,12 +337,28 @@ class MaxGridBot:
                 time.sleep(HEDGE_MODE_VERIFY_DELAY_SEC)
             again, verify_err = self._fetch_hedged(sym_config.ccxt_symbol)
             if again is True:
-                logger.info("[MAX] 已切換為雙向持倉模式並複驗通過")
+                if switch_err is not None:
+                    logger.info(
+                        f"[MAX] 切換呼叫曾回報錯誤但帳戶實際已是雙向持倉模式，"
+                        f"複驗通過，正常啟動（原始錯誤：{switch_err}）"
+                    )
+                else:
+                    logger.info("[MAX] 已切換為雙向持倉模式並複驗通過")
                 return
             if verify_err is not None:
                 last_err = verify_err
 
         detail = f"（最後一次查詢錯誤：{last_err}）" if last_err is not None else ""
+        if switch_err is not None:
+            raise RuntimeError(
+                f"[MAX] 切換持倉模式被交易所拒絕，且複驗 {HEDGE_MODE_VERIFY_ATTEMPTS} "
+                f"次仍非雙向持倉模式，拒絕啟動。"
+                f"交易所原始錯誤：{switch_err}。"
+                f"成因請以上面這段原文為準，不要預設是持倉問題就去平倉："
+                f"可能之一是帳戶有持倉或掛單（-4068，需先手動平倉/撤單），"
+                f"但同樣會走到這裡的還有限流、API 權限不足、網路逾時、交易所維護"
+                f"—— 這些都不該用平倉來處理{detail}"
+            ) from switch_err
         raise RuntimeError(
             f"[MAX] 切換持倉模式後複驗 {HEDGE_MODE_VERIFY_ATTEMPTS} 次仍非"
             f"雙向持倉模式，拒絕啟動（切換呼叫沒報錯但實際未生效）{detail}"
@@ -889,8 +936,15 @@ class MaxGridBot:
                     # 正常情況下這條到不了：_check_hedge_mode 已在啟動時擋掉
                     # 單向模式，且單向模式下網格單根本下不出去（沒有成交就沒有
                     # FILLED 事件）。這是模式在運行期間被外部改掉時的防線。
-                    # 刻意**不**呼叫 adjust_grid：模式錯時重掛網格只會製造更多
-                    # 被拒的單。
+                    #
+                    # 早退避免的是「把這筆成交套用到錯的一側」，**不是**「阻止
+                    # 重掛網格」——後者由 ticker 路徑主導，本守衛管不到：
+                    # _handle_ticker 對每一筆 bookTicker 都無條件呼叫 adjust_grid，
+                    # 而 sync_service._sync_orders 只統計 positionSide 為
+                    # LONG/SHORT 的掛單，單向模式下四個計數會被 REST 寫成 0 ⇒
+                    # _should_adjust_grid 恆為 True ⇒ 每個 tick 照樣重掛。
+                    # 本守衛不提供任何「模式破掉就安靜下來」的保證；真要停單得做
+                    # one-way 偵測與全域停單，那是 spec 的 Non-goal。
                     self._note_unknown_position_side(
                         ccxt_symbol, symbol_raw, position_side)
                     return
