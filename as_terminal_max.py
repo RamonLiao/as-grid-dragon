@@ -1265,9 +1265,15 @@ class MainMenu:
         self.bot_thread = threading.Thread(target=run_bot_thread, daemon=True)
         self.bot_thread.start()
 
+        # 迴圈的終止條件是「running 或 thread 已死」，不是只有 running：
+        # bot.run() 的初始化段是**硬失敗**設計（_init_exchange /
+        # _check_hedge_mode / acquire_listen_key 任何一步 raise ⇒ notify_crash
+        # + gateway.shutdown() + return ⇒ thread 乾淨結束、running 永遠是
+        # False）。只看 running 的話，最常見的失敗（兩秒就 raise）會讓 TUI 在
+        # 原地空轉滿 20 秒，然後印「初始化較慢」——thread 早就死了，那句是假話。
         with console.status("[bold cyan]連接交易所...[/]"):
             for _ in range(100):
-                if self.bot.state.running:
+                if self.bot.state.running or not self._bot_alive():
                     break
                 time.sleep(0.1)
 
@@ -1277,10 +1283,12 @@ class MainMenu:
             console.print("[dim]可以返回主選單管理設定，交易會持續運行[/]")
             console.print("[dim]選擇「1」查看交易面板，「s」停止交易[/]\n")
         else:
-            if self.bot_thread and self.bot_thread.is_alive():
+            if self._bot_alive():
                 console.print("[yellow]初始化較慢，請稍等...[/]")
+                # 同一個終止條件要在兩段迴圈都成立：初始化可能在第 10~20 秒之間
+                # 才 raise，只在第一段偵測等於把「已死」的判定延後滿 10 秒。
                 for _ in range(100):
-                    if self.bot.state.running:
+                    if self.bot.state.running or not self._bot_alive():
                         break
                     time.sleep(0.1)
 
@@ -1288,10 +1296,7 @@ class MainMenu:
                     self._trading_active = True
                     console.print("[bold green]✓ 交易已在背景啟動！[/]\n")
                 elif self._release_bot_if_dead():
-                    console.print("[red]Bot 啟動超時且已結束，請檢查日誌與網路連線[/]")
-                    console.print(
-                        "[dim]常見成因：網路/限流，或帳戶持倉模式（雙向持倉）確立失敗 —— "
-                        "詳細原因看日誌與 Telegram 的「初始化失敗」通知[/]")
+                    self._print_startup_failed()
                 else:
                     # 逾時 ≠ bot 不存在。state.running 是在 _init_exchange /
                     # _check_hedge_mode / acquire_listen_key 之後才設 True。
@@ -1304,10 +1309,24 @@ class MainMenu:
                     console.print("[dim]也可能正在確立持倉模式；若最終失敗會落在日誌與 Telegram[/]")
                     console.print("[dim]確定不要它時請用「s」停止交易，不要直接再啟動[/]")
             else:
-                console.print("[red]Bot 啟動失敗，請檢查日誌[/]")
+                # thread 在等待期間就結束了 ⇒ 初始化硬失敗，不是「還在跑」。
                 self._release_bot_if_dead()
+                self._print_startup_failed()
 
         Prompt.ask("按 Enter 繼續")
+
+    @staticmethod
+    def _print_startup_failed():
+        """bot thread 已結束且沒開始交易 —— 唯一的真相在日誌與 Telegram。
+
+        真正的原因（持倉模式確立失敗、API 權限、網路）由 run() 的初始化 except
+        區塊寫進日誌並送 notify_crash("初始化失敗: ...")，TUI 這層拿不到，
+        所以只做指路，不猜原因。
+        """
+        console.print("[red]Bot 已結束，交易未啟動[/]")
+        console.print(
+            "[dim]常見成因：帳戶持倉模式（雙向持倉）確立失敗，或網路/限流/API 權限 —— "
+            "確切原因看日誌與 Telegram 的「初始化失敗」通知[/]")
 
     def _push_config_to_bot(self) -> bool:
         """把最新 config 推給還在運行的 bot；回傳是否推成功。

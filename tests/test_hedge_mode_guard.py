@@ -533,3 +533,192 @@ class TestStartupWiring:
         assert bot.state.running is False
         bot.notifier.notify_crash.assert_awaited_once()
         assert not bot.tasks, "初始化失敗不得 create_task 任何常駐 task"
+
+
+# ---------------------------------------------------------------------------
+# per-request timeout：只罩守衛期間 + 最壞耗時的「量測式」契約
+# ---------------------------------------------------------------------------
+
+CCXT_DEFAULT_TIMEOUT_MS = 10_000   # ccxt 預設，等於「沒套用守衛逾時」的樣子
+TUI_START_BUDGET_SEC = 20.0        # as_terminal_max.start_trading 兩段 100×0.1s
+
+
+class VirtualClock:
+    """虛擬時鐘：測試不真的睡，但「睡了多久」是被加總量出來的。
+
+    真實量測（`time.monotonic`）在 CI 上要嘛真的睡滿 20 秒，要嘛量到的是機器
+    負載而不是被測邏輯。這裡把**所有**時間來源（呼叫端的 sleep、ccxt 的
+    throttle 等待、每顆請求的 wall）都導到同一條虛擬時間軸上，比例尺 1:1，
+    所以量到的數字就是真實秒數的模型值，不是縮放後的代理值。
+    """
+
+    def __init__(self):
+        self.t = 0.0
+
+    def sleep(self, seconds):
+        self.t += float(seconds)
+
+    def wait_until(self, when):
+        """等到某個時間點（早就過了就不等）——throttle 與呼叫端 sleep 的重疊。"""
+        self.t = max(self.t, when)
+
+
+class TimedExchange:
+    """把守衛會遇到的兩個計時來源建模，讓「最壞要跑多久」可以被實際跑出來。
+
+    1. 每顆請求的 wall：`requests` 的 timeout 是 connect 與 read **各一份**
+       （read 還每個 chunk 重計時），所以逾時一顆最壞燒掉 2 × timeout；
+       伺服器有回應時燒掉的是它自己的延遲，而延遲超過 timeout 就是逾時。
+    2. throttle：binance `rateLimit` 50ms × `positionSide/dual` 這顆 GET 的
+       cost 30 ⇒ 兩顆 GET 之間至少 1.5s。這個等待與呼叫端自己的
+       `sleep(HEDGE_MODE_VERIFY_DELAY_SEC)` 是**重疊**的（取 max 不是相加），
+       所以用「下一顆最早可送出的時間點」建模。
+
+    `timeout` 讀的是實例屬性 —— 守衛套用的就是它，因此「守衛沒套 timeout」
+    這個 mutation 會直接反映成每顆請求貴一倍以上。
+    """
+
+    GET_MIN_INTERVAL_SEC = 1.5
+    POST_LATENCY_SEC = 0.05
+
+    def __init__(self, clock, responses, switch_error=None):
+        self.timeout = CCXT_DEFAULT_TIMEOUT_MS
+        self._clock = clock
+        self._responses = list(responses)
+        self._next_get_at = 0.0
+        self._switch_error = switch_error
+        self.seen_timeouts = []
+        self.post_calls = 0
+
+    def _next_response(self):
+        if len(self._responses) > 1:
+            return self._responses.pop(0)
+        return self._responses[0]
+
+    def fetch_position_mode(self, symbol=None, **kw):
+        self._clock.wait_until(self._next_get_at)
+        self._next_get_at = self._clock.t + self.GET_MIN_INTERVAL_SEC
+        self.seen_timeouts.append(self.timeout)
+        latency, value = self._next_response()
+        if latency > self.timeout / 1000.0:
+            self._clock.sleep(2 * self.timeout / 1000.0)
+            raise ccxt.RequestTimeout("virtual read timeout")
+        self._clock.sleep(latency)
+        if isinstance(value, Exception):
+            raise value
+        return {"info": {}, "hedged": value}
+
+    def fapiPrivatePostPositionSideDual(self, params=None):
+        self.post_calls += 1
+        self._clock.sleep(self.POST_LATENCY_SEC)   # POST cost=1 ⇒ throttle 可忽略
+        if self._switch_error is not None:
+            raise self._switch_error
+        return {}
+
+
+def _timed_bot(monkeypatch, responses, switch_error=None):
+    """裝好虛擬時鐘的 bot：呼叫端的 sleep 也走同一條時間軸。"""
+    clock_ = VirtualClock()
+    monkeypatch.setattr("grid_engine.bot.time.sleep", clock_.sleep)
+    bot = _make_bot()
+    bot.exchange = TimedExchange(clock_, responses, switch_error=switch_error)
+    return bot, clock_
+
+
+def measure_hedge_guard(monkeypatch, responses, switch_error=None):
+    """實際跑一次 `_check_hedge_mode`，回 `(耗時秒數, 例外或 None)`。"""
+    bot, clock_ = _timed_bot(monkeypatch, responses, switch_error=switch_error)
+    raised = None
+    try:
+        bot._check_hedge_mode()
+    except Exception as e:      # noqa: BLE001 - 量測失敗路徑本身就是目的
+        raised = e
+    return clock_.t, raised
+
+
+class TestHedgeGuardRequestTimeout:
+    """守衛期間縮短 per-request timeout —— 而且只在守衛期間。"""
+
+    def test_timeout_is_applied_to_guard_requests(self, monkeypatch):
+        """紅在：沒套用時 fetch 看到的是 ccxt 預設 10000ms。"""
+        bot, _ = _timed_bot(monkeypatch, [(0.05, True)])
+        bot._check_hedge_mode()
+        assert bot.exchange.seen_timeouts == [3000], \
+            "守衛期間每顆請求的 timeout 必須是 3.0 秒（3000ms）"
+
+    def test_timeout_is_restored_after_success(self, monkeypatch):
+        bot, _ = _timed_bot(monkeypatch, [(0.05, True)])
+        bot._check_hedge_mode()
+        assert bot.exchange.timeout == CCXT_DEFAULT_TIMEOUT_MS
+
+    def test_timeout_is_restored_on_the_raise_path(self, monkeypatch):
+        """紅在：拿掉 finally ⇒ 守衛 raise 之後 exchange.timeout 停在 3000。
+
+        這不是潔癖：同一個 exchange 實例接著要跑 create_order / cancel_order /
+        fetch_positions —— 被守衛順手腰斬的逾時會把「單已送達但回應逾時」變成
+        常態，事後重掛就是重複掛單。
+        """
+        bot, _ = _timed_bot(monkeypatch, [(0.05, None)])
+        with pytest.raises(RuntimeError, match="未回報持倉模式"):
+            bot._check_hedge_mode()
+        assert bot.exchange.timeout == CCXT_DEFAULT_TIMEOUT_MS, \
+            "守衛 raise 之後 timeout 必須還原，否則會外洩到實盤下單路徑"
+
+    def test_timeout_does_not_leak_when_no_symbol_enabled(self, monkeypatch):
+        """沒有啟用中的 symbol ⇒ 提早 return，也不該碰 timeout。"""
+        clock_ = VirtualClock()
+        monkeypatch.setattr("grid_engine.bot.time.sleep", clock_.sleep)
+        bot = _make_bot(enabled=False)
+        bot.exchange = TimedExchange(clock_, [(0.05, True)])
+        bot._check_hedge_mode()
+        assert bot.exchange.timeout == CCXT_DEFAULT_TIMEOUT_MS
+        assert bot.exchange.seen_timeouts == []
+
+    def test_a_slow_but_answering_exchange_still_passes(self, monkeypatch):
+        """逾時不得被調到「正常但慢的回應」之下。
+
+        紅在：把 HEDGE_MODE_FETCH_TIMEOUT_SEC 調到 2.0 以下 ⇒ 這顆 2 秒才回
+        的請求變成逾時，帳戶明明是 hedge 卻拒絕啟動。
+        """
+        bot, _ = _timed_bot(monkeypatch, [(2.0, True)])
+        bot._check_hedge_mode()   # 不得 raise
+        assert bot.exchange.post_calls == 0
+
+
+class TestHedgeGuardWorstCaseDuration:
+    """最壞耗時用**跑的**量，不用算的。
+
+    上一版是一串推導常數的算術恆等式，mutation 全數存活（常數改 0.0 全綠）。
+    這裡實際呼叫 `_check_hedge_mode`，把虛擬時鐘上的耗時量出來再比字面預算。
+    """
+
+    def test_all_requests_timing_out_stays_within_the_tui_budget(self, monkeypatch):
+        """最壞情境：交易所全程不回應，三顆 GET 全部逾時。
+
+        紅在：per-request timeout 沒套用（每顆 20s ⇒ 62s）、
+        HEDGE_MODE_FETCH_TIMEOUT_SEC 被調大、HEDGE_MODE_VERIFY_ATTEMPTS 被調大。
+        """
+        elapsed, raised = measure_hedge_guard(
+            monkeypatch, [(float("inf"), True)])
+        assert isinstance(raised, RuntimeError), "全程逾時必須拒絕啟動"
+        assert elapsed <= TUI_START_BUDGET_SEC, (
+            f"守衛最壞耗時 {elapsed:.2f}s 已超過 TUI 的 20 秒等待預算")
+        assert elapsed >= 6.0, (
+            "量到的耗時小於單顆請求的最壞 wall —— 這條測試沒有真的跑到重試路徑")
+
+    def test_the_common_hard_failure_is_far_below_the_budget(self, monkeypatch):
+        """最常見的硬失敗（帳戶是單向、切換被 -4068 拒絕）幾秒內就定案。"""
+        elapsed, raised = measure_hedge_guard(
+            monkeypatch,
+            [(0.05, False)],
+            switch_error=ccxt.OperationRejected("-4068 position side cannot be changed"),
+        )
+        assert isinstance(raised, RuntimeError)
+        assert elapsed < 6.0, f"最常見的硬失敗不該跑到 {elapsed:.2f}s"
+
+    def test_a_non_retryable_fetch_error_fails_immediately(self, monkeypatch):
+        """權限/簽章這類 ExchangeError 不重試 ⇒ 一顆請求就定案。"""
+        elapsed, raised = measure_hedge_guard(
+            monkeypatch, [(0.05, ccxt.PermissionDenied("no permission"))])
+        assert isinstance(raised, RuntimeError)
+        assert elapsed < 1.0, f"不可重試的錯誤不該花 {elapsed:.2f}s"
