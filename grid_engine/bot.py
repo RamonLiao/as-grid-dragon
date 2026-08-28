@@ -64,6 +64,7 @@ STALE_QUOTE_LOG_SECONDS = 3600.0  # 價格過期 log 節流間隔（秒），不
 # 切換 dualSidePosition 後交易所端非同步生效，立刻複驗可能讀到舊值
 HEDGE_MODE_VERIFY_ATTEMPTS = 3
 HEDGE_MODE_VERIFY_DELAY_SEC = 1.0
+UNKNOWN_PS_LOG_SECONDS = 3600.0  # 非 LONG/SHORT 的 positionSide 事件 log 節流
 
 
 class MaxGridBot:
@@ -153,6 +154,9 @@ class MaxGridBot:
         # 「最近一次 X 小時前」——與 stale_quote_counts 並列維護，每次過期
         # 事件都更新（不受 log 節流影響），見 _note_stale_quote。
         self._last_stale_at: Dict[str, float] = {}
+
+        # 非 LONG/SHORT 的 positionSide 事件 log 節流（比照 _last_stale_log_at）
+        self._last_unknown_ps_log_at: Dict[str, float] = {}
 
         # MAX 增強模組
         self.glft_controller = GLFTController()
@@ -834,6 +838,23 @@ class MaxGridBot:
         except Exception as e:
             logger.error(f"[userData] ACCOUNT_UPDATE 處理失敗: {e}")
 
+    def _note_unknown_position_side(self, ccxt_symbol: str, symbol_raw: str,
+                                    position_side: str):
+        """節流記錄「收到非 LONG/SHORT 的 positionSide」。
+
+        只影響 log，不影響呼叫端的早退 —— 節流跟行為綁在一起就會變成
+        「第二筆之後靜默套用」，那正是這道守衛要擋的事。
+        """
+        now = clock.guard_now()
+        if now - self._last_unknown_ps_log_at.get(ccxt_symbol, 0.0) < UNKNOWN_PS_LOG_SECONDS:
+            return
+        self._last_unknown_ps_log_at[ccxt_symbol] = now
+        logger.warning(
+            f"[userData] {symbol_raw} positionSide={position_side!r} 非 LONG/SHORT，"
+            f"本筆成交不套用（分側狀態無對應）—— 帳戶可能已被改成單向持倉模式，"
+            f"此模式下網格單會被交易所整批拒絕"
+        )
+
     async def _handle_order_update(self, data: dict):
         """處理 ORDER_TRADE_UPDATE 事件"""
         try:
@@ -857,6 +878,23 @@ class MaxGridBot:
             sym_state = self.state.symbols[ccxt_symbol]
 
             if order_status == 'FILLED':
+                if position_side not in ('LONG', 'SHORT'):
+                    # ps='BOTH'（帳戶處在單向持倉模式）或未知值：本 bot 的狀態
+                    # 是分側的（long/short_position、四個掛單計數、分側 dead
+                    # mode），BOTH 沒有正確映射 —— 套用會把成交記到錯的一側
+                    # （bandit）並重置錯的掛單計數。比照 _handle_account_update
+                    # 對未知 ps 的處理（見「P 陣列是**增量**」附近的註解），
+                    # 本筆不套用。
+                    #
+                    # 正常情況下這條到不了：_check_hedge_mode 已在啟動時擋掉
+                    # 單向模式，且單向模式下網格單根本下不出去（沒有成交就沒有
+                    # FILLED 事件）。這是模式在運行期間被外部改掉時的防線。
+                    # 刻意**不**呼叫 adjust_grid：模式錯時重掛網格只會製造更多
+                    # 被拒的單。
+                    self._note_unknown_position_side(
+                        ccxt_symbol, symbol_raw, position_side)
+                    return
+
                 # total_trades / total_profit 的 writer 已改為 sync_service._sync_trade_stats()
                 # （REST）。這裡再寫一次會在 userData 復活時造成計數翻倍。
 

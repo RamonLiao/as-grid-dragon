@@ -131,3 +131,87 @@ class TestCheckHedgeMode:
         with pytest.raises(RuntimeError, match="未回報持倉模式"):
             bot._check_hedge_mode()
         bot.exchange.fapiPrivatePostPositionSideDual.assert_not_called()
+
+
+def _filled_event(position_side, side="BUY", realized_pnl="1.5"):
+    return {"o": {
+        "s": "XRPUSDC", "X": "FILLED", "S": side,
+        "ps": position_side, "rp": realized_pnl,
+        "p": "0.5", "q": "10",
+    }}
+
+
+@pytest.fixture
+def order_bot():
+    """掛單計數初值刻意設成非 0：若設 0，「沒重置」與「重置了」不可分辨
+    （lessons 通則 3.3：fixture 不得把待測維度壓成退化值）。"""
+    bot = _make_bot()
+    bot.adjust_grid = AsyncMock()
+    bot.bandit_optimizer.record_trade = MagicMock()
+    st = bot.state.symbols[SYMBOL]
+    st.buy_long_orders = 3
+    st.sell_long_orders = 4
+    st.buy_short_orders = 5
+    st.sell_short_orders = 6
+    st.ws_seq = 7
+    return bot
+
+
+class TestOrderUpdatePositionSideGuard:
+    @pytest.mark.asyncio
+    async def test_both_position_side_is_not_applied(self, order_bot):
+        """ps='BOTH' ⇒ 帳戶在單向持倉模式，分側狀態沒有正確映射。
+        套用會把成交記到錯的一側、重置錯的掛單計數。"""
+        st = order_bot.state.symbols[SYMBOL]
+        await order_bot._handle_order_update(_filled_event("BOTH"))
+
+        assert (st.buy_long_orders, st.sell_long_orders) == (3, 4)
+        assert (st.buy_short_orders, st.sell_short_orders) == (5, 6)
+        assert st.ws_seq == 7, "早退必須發生在 ws_seq 遞增之前"
+        order_bot.bandit_optimizer.record_trade.assert_not_called()
+        order_bot.adjust_grid.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_both_is_not_recorded_as_short_in_bandit(self, order_bot):
+        """改動前 `trade_side = 'long' if ps == 'LONG' else 'short'` 會把
+        BOTH 靜默記成 short，汙染 bandit 的分側統計。"""
+        await order_bot._handle_order_update(_filled_event("BOTH"))
+        order_bot.bandit_optimizer.record_trade.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unknown_position_side_is_not_applied(self, order_bot):
+        st = order_bot.state.symbols[SYMBOL]
+        await order_bot._handle_order_update(_filled_event("SIDEWAYS"))
+        assert (st.buy_long_orders, st.ws_seq) == (3, 7)
+        order_bot.adjust_grid.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_long_still_applied_after_guard(self, order_bot):
+        """守衛不得誤傷正常路徑。"""
+        st = order_bot.state.symbols[SYMBOL]
+        await order_bot._handle_order_update(_filled_event("LONG", side="BUY"))
+        assert st.buy_long_orders == 0
+        assert st.sell_long_orders == 4, "只該重置本次成交的那一格"
+        assert st.ws_seq == 8
+        order_bot.bandit_optimizer.record_trade.assert_called_once_with(1.5, 'long')
+        order_bot.adjust_grid.assert_awaited_once_with(SYMBOL)
+
+    @pytest.mark.asyncio
+    async def test_short_still_applied_after_guard(self, order_bot):
+        st = order_bot.state.symbols[SYMBOL]
+        await order_bot._handle_order_update(_filled_event("SHORT", side="SELL"))
+        assert st.sell_short_orders == 0
+        assert st.buy_short_orders == 5
+        order_bot.bandit_optimizer.record_trade.assert_called_once_with(1.5, 'short')
+
+    @pytest.mark.asyncio
+    async def test_warning_is_throttled_but_guard_is_not(self, order_bot, caplog):
+        """節流只准影響 log，不准影響早退 —— 第二筆事件一樣不得被套用。"""
+        st = order_bot.state.symbols[SYMBOL]
+        with caplog.at_level("WARNING"):
+            await order_bot._handle_order_update(_filled_event("BOTH"))
+            await order_bot._handle_order_update(_filled_event("BOTH"))
+
+        hits = [r for r in caplog.records if "單向持倉模式" in r.getMessage()]
+        assert len(hits) == 1, "同一 symbol 的重複事件不得洗版"
+        assert (st.buy_long_orders, st.ws_seq) == (3, 7), "第二筆一樣不得套用"
