@@ -13,37 +13,22 @@
   「只有明確的 False 才切換，其餘一律 raise 且不送 POST」。
 """
 import asyncio
-import math
+
+import asyncio
 
 import ccxt
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from grid_engine import clock
-from grid_engine.bot import MaxGridBot
-from grid_engine.config import GlobalConfig, SymbolConfig
 
-SYMBOL = "XRP/USDC:USDC"
-SYMBOL2 = "BNB/USDC:USDC"
-
-
-def _make_bot(extra_symbol=False):
-    cfg = GlobalConfig()
-    cfg.symbols = {SYMBOL: SymbolConfig(
-        symbol="XRPUSDC", ccxt_symbol=SYMBOL, enabled=True,
-        take_profit_spacing=0.003, grid_spacing=0.003, initial_quantity=0.02,
-        limit_multiplier=5.0, threshold_multiplier=20.0,
-    )}
-    if extra_symbol:
-        cfg.symbols[SYMBOL2] = SymbolConfig(
-            symbol="BNBUSDC", ccxt_symbol=SYMBOL2, enabled=True,
-            take_profit_spacing=0.003, grid_spacing=0.003, initial_quantity=0.02,
-            limit_multiplier=5.0, threshold_multiplier=20.0,
-        )
-    cfg.bandit.enabled = False
-    bot = MaxGridBot(cfg)
-    bot.order_executor.place_order = AsyncMock()
-    return bot
+# helper / fixture 的單一出處是 tests/test_hedge_mode_guard.py；這裡直接 import。
+# pytest 會把 import 進本模組命名空間的 fixture 一併註冊，_no_real_sleep 的
+# autouse 也照樣生效。（先前兩檔各有一份逐字重複的副本並已開始分歧。）
+from tests.test_hedge_mode_guard import (  # noqa: F401  (fixture 靠 import 註冊)
+    SYMBOL, SYMBOL2, _filled_event, _make_bot, _snapshot,
+    _no_real_sleep, fake_guard_clock, order_bot,
+)
 
 
 def _exchange_returning(value, switch_error=None, switch_return=None):
@@ -55,42 +40,6 @@ def _exchange_returning(value, switch_error=None, switch_return=None):
     elif switch_return is not None:
         ex.fapiPrivatePostPositionSideDual.return_value = switch_return
     return ex
-
-
-@pytest.fixture(autouse=True)
-def _no_real_sleep(monkeypatch):
-    calls = []
-    monkeypatch.setattr("grid_engine.bot.time.sleep", lambda s: calls.append(s))
-    yield calls
-    clock.reset_clock()
-    clock.reset_guard_clock()
-
-
-@pytest.fixture
-def order_bot():
-    """掛單計數初值非 0（lessons 通則 3.3：不得把待測維度壓成退化值）。"""
-    bot = _make_bot(extra_symbol=True)
-    bot.adjust_grid = AsyncMock()
-    bot.bandit_optimizer.record_trade = MagicMock()
-    for sym in (SYMBOL, SYMBOL2):
-        st = bot.state.symbols[sym]
-        st.buy_long_orders, st.sell_long_orders = 3, 4
-        st.buy_short_orders, st.sell_short_orders = 5, 6
-        st.ws_seq = 7
-    return bot
-
-
-def _snapshot(st):
-    return (st.buy_long_orders, st.sell_long_orders,
-            st.buy_short_orders, st.sell_short_orders, st.ws_seq)
-
-
-def _filled_event(position_side, side="BUY", realized_pnl="1.5", symbol="XRPUSDC"):
-    return {"o": {
-        "s": symbol, "X": "FILLED", "S": side,
-        "ps": position_side, "rp": realized_pnl,
-        "p": "0.5", "q": "10",
-    }}
 
 
 # --------------------------------------------------------------------------
@@ -348,8 +297,3 @@ class TestThrottleAndConcurrencyUnderStress:
         assert st.ws_seq == 8
         order_bot.bandit_optimizer.record_trade.assert_called_once_with(1.5, 'long')
         order_bot.adjust_grid.assert_awaited_once_with(SYMBOL)
-
-
-def test_math_isnan_import_is_used():
-    """保險絲：確保上面的 NaN 案例真的產生 NaN（`float("NaN")` 行為若變了要知道）。"""
-    assert math.isnan(float("NaN"))

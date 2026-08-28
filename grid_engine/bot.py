@@ -65,6 +65,17 @@ STALE_QUOTE_LOG_SECONDS = 3600.0  # 價格過期 log 節流間隔（秒），不
 HEDGE_MODE_VERIFY_ATTEMPTS = 3
 HEDGE_MODE_VERIFY_DELAY_SEC = 1.0
 UNKNOWN_PS_LOG_SECONDS = 3600.0  # 非 LONG/SHORT 的 positionSide 事件 log 節流
+EXCHANGE_ERR_CLIP_CHARS = 200    # 例外原文塞進錯誤訊息前的長度上限
+
+
+def _clip(err, limit: int = EXCHANGE_ERR_CLIP_CHARS) -> str:
+    """交易所例外原文的長度上限。
+
+    ccxt 在交易所維護/5xx 時會把整包 HTML body 塞進例外訊息，而
+    `notify_crash` 只送前 500 字 —— 不截斷的話，排在原文後面的東西全會消失。
+    """
+    text = str(err)
+    return text if len(text) <= limit else text[:limit] + "…（原文已截斷）"
 
 
 class MaxGridBot:
@@ -241,7 +252,7 @@ class MaxGridBot:
             所以 `mode['hedged']` 不會 KeyError，但會是三態。
 
         `err` 回**例外物件本身**而不是 `str(e)`：呼叫端要用型別分辨
-        「網路瞬斷（可重試）」與「交易所/權限錯誤（不可重試）」。
+        「暫時性失敗（可重試）」與「交易所/權限錯誤（不可重試）」。
         放進 f-string 時格式與 `str(e)` 相同，訊息內容不受影響。
         """
         try:
@@ -251,6 +262,31 @@ class MaxGridBot:
         if not isinstance(mode, dict):
             return None, None
         return mode.get('hedged'), None
+
+    @staticmethod
+    def _is_retryable_fetch_error(err) -> bool:
+        """初查持倉模式的錯誤該不該重試。
+
+        分界線是 ccxt 4.5.32 的 `OperationFailed`（「請求沒完成，狀態未知」）
+        vs `ExchangeError`（「請求完成了，交易所說不行」）。**注意 `NetworkError`
+        是 `OperationFailed` 的子類，不是父類** —— 只判 `NetworkError` 會漏掉
+        直接掛在 `OperationFailed` 底下的 `-1000 UNKNOWN` / `-1001 DISCONNECTED`
+        / `-1006 UNEXPECTED_RESP`，而幣安官方文件正是說這幾個該重試。
+
+        `OperationFailed` 涵蓋（實際列舉幣安的映射表）：直接綁的
+        -1000/-1001/-1006/-1010/-1112、`RequestTimeout`(-1007)、
+        `RateLimitExceeded`(-1003/-1015)、`InvalidNonce`(-1021)、
+        `DDoSProtection`、`ExchangeNotAvailable`/`OnMaintenance`、
+        `BadResponse`/`NullResponse`。全部是「這一次沒成功，下一次可能成功」，
+        而重試的對象是一個**唯讀 GET**、上限 3 次 × 1s ⇒ 就算註定失敗（維護中、
+        IP 被限流、時鐘偏移）也只是多兩個請求、多兩秒，然後照樣 raise。
+
+        不重試的是 `ExchangeError` 家族（`AuthenticationError`/`PermissionDenied`、
+        `BadRequest`、`OperationRejected` 含 -4059/-4068、`NotSupported`）與任何
+        非 ccxt 例外：這些重試三次的結果必然相同，只是多送兩次注定失敗的簽名
+        請求並讓啟動多卡 2 秒。
+        """
+        return isinstance(err, ccxt.OperationFailed)
 
     def _check_hedge_mode(self):
         """啟動守衛：確立帳戶處於 hedge（雙向持倉）模式，確立不了就 raise。
@@ -269,18 +305,14 @@ class MaxGridBot:
         position mode 是帳戶層設定，因此只查一次（取第一個啟用中的 symbol），
         不逐 symbol 重複查。
 
-        兩處「不把一次瞬斷當成確認不了」的容忍（security review F1 / F2），
-        兩者都**不放寬**「確認不了就不啟動」：
-          - 初查對 `ccxt.NetworkError`（RequestTimeout / DDoSProtection /
-            ExchangeNotAvailable 的共同父類）重試；`ccxt.ExchangeError`
-            這類（BadRequest、權限錯誤）不重試，直接 raise。重試耗盡仍 raise。
-            零重試的代價不只是「bot 沒跑」：sync_service 是在這個 raise 之後才
-            啟動的，而 risk_monitor 的追蹤止盈只由它驅動 ⇒ 交易所上的既有持倉
+        兩處容忍，都**不放寬**「確認不了就不啟動」（重試/複驗耗盡一律 raise）：
+          - 初查只對 `_is_retryable_fetch_error` 認定的例外重試。零重試會把一次
+            瞬斷變成不啟動，而不啟動的代價不只是「bot 沒跑」：`sync_service`
+            在這個 raise 之後才啟動，追蹤止盈只由它驅動 ⇒ 交易所上的既有持倉
             會同時失去追蹤止盈與網格管理。
           - 切換呼叫報錯不立刻 raise，一律落到複驗迴圈，用**最終實際狀態**裁決：
-            幣安的 -4059「No need to change position side」代表本來就已經是目標
-            狀態，「POST 已生效但回應 timeout」也是良性結果，兩者直接判死都是
-            假陽性。複驗仍不過才 raise，訊息帶上切換時的原始錯誤。
+            -4059「No need to change position side」代表帳戶本來就是目標狀態，
+            「POST 已生效但回應 timeout」也是良性結果，直接判死都是假陽性。
         """
         sym_config = next(
             (c for c in self.config.symbols.values() if c.enabled), None
@@ -293,12 +325,15 @@ class MaxGridBot:
             if attempt:
                 time.sleep(HEDGE_MODE_VERIFY_DELAY_SEC)
             hedged, err = self._fetch_hedged(sym_config.ccxt_symbol)
-            if not isinstance(err, ccxt.NetworkError):
+            if not self._is_retryable_fetch_error(err):
                 break  # 成功、或不可重試的錯誤（ExchangeError / 權限）⇒ 不再試
-            logger.warning(
-                f"[MAX] 查詢持倉模式遇到網路類錯誤，重試中"
-                f"（第 {attempt + 1}/{HEDGE_MODE_VERIFY_ATTEMPTS} 次）：{err}"
-            )
+            if attempt + 1 < HEDGE_MODE_VERIFY_ATTEMPTS:
+                # 只在「還會再試」時才說重試中；最後一次失敗由下面的 raise 說話，
+                # 否則日誌會出現「重試中（第 3/3 次）」這種不會發生的下一次。
+                logger.warning(
+                    f"[MAX] 查詢持倉模式失敗（第 {attempt + 1}/{HEDGE_MODE_VERIFY_ATTEMPTS} "
+                    f"次），{HEDGE_MODE_VERIFY_DELAY_SEC} 秒後重試：{err}"
+                )
 
         if hedged is True:
             return
@@ -355,16 +390,21 @@ class MaxGridBot:
             if verify_err is not None:
                 last_err = verify_err
 
-        detail = f"（最後一次查詢錯誤：{last_err}）" if last_err is not None else ""
+        detail = (f"｜最後一次查詢錯誤：{_clip(last_err)}"
+                  if last_err is not None else "")
         if switch_err is not None:
+            # 給人的指引一律排在**最前面**，交易所原文排最後並截斷：notify_crash
+            # 只送前 500 字（notifier 的既有行為，不改它），而交易所維護/5xx 會讓
+            # ccxt 把整包 HTML body 塞進例外訊息。指引排在原文後面就會被截掉，
+            # 只剩「可能是持倉問題」——操作員照字面去手動平倉的是真錢。
             raise RuntimeError(
                 f"[MAX] 切換持倉模式被交易所拒絕，且複驗 {HEDGE_MODE_VERIFY_ATTEMPTS} "
                 f"次仍非雙向持倉模式，拒絕啟動。"
-                f"交易所原始錯誤：{switch_err}。"
-                f"成因請以上面這段原文為準，不要預設是持倉問題就去平倉："
-                f"可能之一是帳戶有持倉或掛單（-4068，需先手動平倉/撤單），"
-                f"但同樣會走到這裡的還有限流、API 權限不足、網路逾時、交易所維護"
-                f"—— 這些都不該用平倉來處理{detail}"
+                f"⚠️ 請先讀完下方交易所原始錯誤再決定動作，不要預設是持倉問題就去平倉："
+                f"成因之一是帳戶有持倉或掛單（-4068，需先手動平倉/撤單），"
+                f"但限流、API 權限不足、網路逾時、交易所維護同樣會走到這裡，"
+                f"那些都不該用平倉來處理。"
+                f"交易所原始錯誤：{_clip(switch_err)}{detail}"
             ) from switch_err
         raise RuntimeError(
             f"[MAX] 切換持倉模式後複驗 {HEDGE_MODE_VERIFY_ATTEMPTS} 次仍非"
@@ -900,11 +940,14 @@ class MaxGridBot:
         「第二筆之後靜默套用」，那正是這道守衛要擋的事。
 
         `0.0 <= delta` 這一半是給時鐘倒退用的（NTP 校正、休眠喚醒、guard clock
-        被替換）：只寫 `delta < 窗口` 的話，倒退會讓差值變負而**恆為真**，
-        告警就靜音到時鐘追回來為止（倒退量 + 一個窗口）。這道告警是「帳戶模式
-        已被外部改掉」的唯一運行期通知，寧可多印也不能靜音，所以倒退時直接放行
-        並把錨點重設到新的 now。（monkey testing 抓到；security review 原本記成
-        「倒退只會多印（fail open）」，方向剛好相反。）
+        被替換）：只寫 `delta < 窗口` 的話，倒退會讓差值變負而**恆為真**，告警
+        就靜音到時鐘追回來為止（倒退量 + 一個窗口）。節流存在的目的是「不洗版」，
+        不是「靜音」；差值變負時窗口語意根本不成立，此時沉默等於讓一個時鐘故障
+        關掉一個帳戶故障的告警。所以倒退直接放行並把錨點重設到新的 now
+        —— 代價只是多印幾行。同檔的 `_note_stale_quote` 早就有同樣的倒退保護
+        （`if last > now: last = 0.0`），這裡是抄漏了那一半。
+        （monkey testing 抓到；security review 原本記成「倒退只會多印（fail
+        open）」，方向剛好相反。）
         """
         now = clock.guard_now()
         delta = now - self._last_unknown_ps_log_at.get(ccxt_symbol, 0.0)
@@ -944,9 +987,21 @@ class MaxGridBot:
                     # ps='BOTH'（帳戶處在單向持倉模式）或未知值：本 bot 的狀態
                     # 是分側的（long/short_position、四個掛單計數、分側 dead
                     # mode），BOTH 沒有正確映射 —— 套用會把成交記到錯的一側
-                    # （bandit）並重置錯的掛單計數。比照 _handle_account_update
-                    # 對未知 ps 的處理（見「P 陣列是**增量**」附近的註解），
-                    # 本筆不套用。
+                    # （bandit）並重置錯的掛單計數，所以本筆不套用。
+                    #
+                    # 與 _handle_account_update 的待遇**不一致，而且是刻意的**：
+                    # 那邊收到 ps=BOTH 會依淨倉正負**映射**到 long/short 其中一側
+                    # （淨倉可以無損映射），只有真正未知的 ps 才丟棄；這裡沒有
+                    # 對應的映射 —— 一筆成交無法判斷該記到哪一側，猜錯就污染
+                    # bandit 的分側統計。兩者只在「未知值 → warning + 不套用」
+                    # 這一點上一致，不要當成同一套處理。
+                    #
+                    # 早退連帶跳過的東西（都是刻意的）：leading_indicator
+                    # .record_trade 的 OFI 記錄、dgt_manager.accumulated_profits
+                    # 累積、realized_pnl 的 info log、adjust_grid。前三者本身是
+                    # side-agnostic，丟掉沒有正確性損失；能收到 ps=BOTH 就代表
+                    # 帳戶模式前提已破，這些訊號只會餵給一組下不出去的網格。
+                    # 換來的是「這條路徑上一行副作用都沒有」這個好推理的性質。
                     #
                     # 正常情況下這條到不了：_check_hedge_mode 已在啟動時擋掉
                     # 單向模式，且單向模式下網格單根本下不出去（沒有成交就沒有
@@ -957,7 +1012,8 @@ class MaxGridBot:
                     # _handle_ticker 對每一筆 bookTicker 都無條件呼叫 adjust_grid，
                     # 而 sync_service._sync_orders 只統計 positionSide 為
                     # LONG/SHORT 的掛單，單向模式下四個計數會被 REST 寫成 0 ⇒
-                    # _should_adjust_grid 恆為 True ⇒ 每個 tick 照樣重掛。
+                    # _should_adjust_grid 這一側的條件恆為 True ⇒ 每個 tick 都
+                    # 可能重掛（實際是否送單還要看 need_long/need_short 的其餘條件）。
                     # 本守衛不提供任何「模式破掉就安靜下來」的保證；真要停單得做
                     # one-way 偵測與全域停單，那是 spec 的 Non-goal。
                     self._note_unknown_position_side(

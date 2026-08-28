@@ -22,19 +22,35 @@ from grid_engine.bot import MaxGridBot
 from grid_engine.config import GlobalConfig, SymbolConfig
 
 SYMBOL = "XRP/USDC:USDC"
+SYMBOL2 = "BNB/USDC:USDC"
+
+# 本檔是這組 helper/fixture 的單一出處；tests/test_hedge_mode_guard_monkey.py
+# 直接 import 它們（曾經兩邊各有一份逐字重複的副本，而且已經開始分歧）。
 
 
-def _make_bot(enabled=True):
-    cfg = GlobalConfig()
-    cfg.symbols = {SYMBOL: SymbolConfig(
-        symbol="XRPUSDC", ccxt_symbol=SYMBOL, enabled=enabled,
+def _sym(raw, ccxt_symbol, enabled=True):
+    return SymbolConfig(
+        symbol=raw, ccxt_symbol=ccxt_symbol, enabled=enabled,
         take_profit_spacing=0.003, grid_spacing=0.003, initial_quantity=0.02,
         limit_multiplier=5.0, threshold_multiplier=20.0,
-    )}
+    )
+
+
+def _make_bot(enabled=True, extra_symbol=False):
+    cfg = GlobalConfig()
+    cfg.symbols = {SYMBOL: _sym("XRPUSDC", SYMBOL, enabled)}
+    if extra_symbol:
+        cfg.symbols[SYMBOL2] = _sym("BNBUSDC", SYMBOL2, enabled)
     cfg.bandit.enabled = False
     bot = MaxGridBot(cfg)
     bot.order_executor.place_order = AsyncMock()
     return bot
+
+
+def _snapshot(st):
+    """四個掛單計數 + ws_seq。早退路徑對 sym_state 零寫入 ⇒ 必須逐位元不變。"""
+    return (st.buy_long_orders, st.sell_long_orders,
+            st.buy_short_orders, st.sell_short_orders, st.ws_seq)
 
 
 def _exchange(mode_results, switch_error=None):
@@ -104,11 +120,58 @@ class TestCheckHedgeMode:
              成因，而不是被寫死的「去平倉」結論牽著走（I-3）。
         """
         bot = _make_bot()
-        bot.exchange = _exchange([False], switch_error=RuntimeError("-4068"))
+        # 哨兵：斷言字面值必須是「原始錯誤真的被插進訊息」才會出現的東西。
+        # 先前這裡斷言的是 "-4068"，但 -4068 同時被寫死在訊息模板裡 ⇒
+        # 把整段 {switch_err} 拿掉，測試照樣綠（外部 review 實測）。
+        bot.exchange = _exchange(
+            [False], switch_error=RuntimeError("-4068 QK7X-SWITCH-ORIGINAL-ERR"))
         with pytest.raises(RuntimeError, match="切換持倉模式被交易所拒絕") as ei:
             bot._check_hedge_mode()
-        assert "-4068" in str(ei.value), "訊息必須帶交易所原始錯誤原文"
+        assert "QK7X-SWITCH-ORIGINAL-ERR" in str(ei.value), \
+            "訊息必須帶交易所原始錯誤原文，不能只有模板裡寫死的 -4068"
         assert bot.exchange.fetch_position_mode.call_count == 4
+
+    def test_operator_guidance_survives_a_giant_exchange_error(self):
+        """給人的指引必須排在交易所原文**之前**，且原文要截斷。
+
+        `notify_crash` 只送前 500 字（notifier 的既有行為，不改它），而交易所
+        維護/5xx 會讓 ccxt 把整包 HTML body 塞進例外訊息。指引排在原文後面就會
+        被截掉，操作員只讀到「可能是持倉問題」⇒ 拿真錢去手動平倉。
+        """
+        bot = _make_bot()
+        huge = "<html>" + "B" * 50_000 + "</html>"
+        bot.exchange = _exchange([False], switch_error=RuntimeError(huge))
+        with pytest.raises(RuntimeError) as ei:
+            bot._check_hedge_mode()
+        msg = str(ei.value)
+        head = msg[:500]  # notify_crash 實際會送出去的那一段
+        assert "不要預設是持倉問題就去平倉" in head, "指引不得被交易所原文擠出截斷線"
+        assert "那些都不該用平倉來處理" in head
+        assert "原文已截斷" in msg
+        assert len(msg) < 1000, "整條訊息不得被 5 萬字的 HTML body 撐爆"
+
+    def test_verification_accepts_only_the_exact_true(self):
+        """複驗和初查一樣，只有**明確的 True** 才算確認。
+
+        `if again:` 這種寫法會讓字串 'true'、數字 1 這類 truthy 值矇混過關 ⇒
+        bot 帶著沒被證實的模式假設啟動，正是這道守衛要擋的事。
+        """
+        bot = _make_bot()
+        bot.exchange = _exchange([False, 'true'])  # 複驗永遠回 truthy 但非 True
+        with pytest.raises(RuntimeError, match="切換呼叫沒報錯但實際未生效"):
+            bot._check_hedge_mode()
+        assert bot.exchange.fetch_position_mode.call_count == 4
+
+    def test_last_verify_error_is_carried_into_the_final_message(self):
+        """複驗過程的查詢錯誤必須被記住並帶進最終訊息 —— 否則操作員看到的是
+        「複驗仍非雙向持倉模式」，完全不知道其實是三次複驗都根本沒查成功。"""
+        bot = _make_bot()
+        bot.exchange = _exchange(
+            [False, ccxt.RequestTimeout("VF3Q-VERIFY-ORIGINAL-ERR")])
+        with pytest.raises(RuntimeError) as ei:
+            bot._check_hedge_mode()
+        assert "最後一次查詢錯誤" in str(ei.value)
+        assert "VF3Q-VERIFY-ORIGINAL-ERR" in str(ei.value)
 
     def test_switch_error_but_verify_confirms_hedged_starts_normally(self):
         """幣安 -4059「No need to change position side」＝帳戶本來就已經是目標
@@ -148,11 +211,51 @@ class TestCheckHedgeMode:
         assert _no_real_sleep == [1.0, 1.0]
         bot.exchange.fapiPrivatePostPositionSideDual.assert_not_called()
 
-    def test_initial_fetch_non_network_error_does_not_retry(self, _no_real_sleep):
-        """權限不足、參數錯誤（ccxt.ExchangeError 家族，含 BadRequest）重試三次
-        只會多送兩次注定失敗的簽名請求並多花 2 秒 —— 這類必須第一次就 raise。"""
+    @pytest.mark.parametrize("exc_factory", [
+        lambda: ccxt.OperationFailed("-1001 DISCONNECTED"),
+        lambda: ccxt.OperationFailed("-1000 UNKNOWN"),
+        lambda: ccxt.RequestTimeout("-1007 TIMEOUT"),
+        lambda: ccxt.RateLimitExceeded("-1003 TOO_MANY_REQUESTS"),
+        lambda: ccxt.ExchangeNotAvailable("System is under maintenance."),
+        lambda: ccxt.InvalidNonce("-1021 recvWindow"),
+        lambda: ccxt.DDoSProtection("418"),
+        lambda: ccxt.BadResponse("malformed json"),
+    ], ids=["OperationFailed-1001", "OperationFailed-1000", "RequestTimeout",
+            "RateLimitExceeded", "ExchangeNotAvailable", "InvalidNonce",
+            "DDoSProtection", "BadResponse"])
+    def test_transient_failures_are_retried(self, _no_real_sleep, exc_factory):
+        """「請求沒完成、狀態未知」的一整族都必須重試。
+
+        分界線是 ccxt 的 `OperationFailed`，**不是** `NetworkError` ——
+        後者是前者的**子類**（實測 `issubclass(NetworkError, OperationFailed)`
+        為 True，反向為 False）。只判 `NetworkError` 會漏掉直接掛在
+        `OperationFailed` 底下的 -1000 UNKNOWN / -1001 DISCONNECTED /
+        -1006 UNEXPECTED_RESP，而幣安官方文件正是說這幾個該重試 ⇒ 一次瞬斷
+        就擋下啟動，既有持倉同時失去追蹤止盈與網格管理。
+
+        類別名寫死，不從 except 的參數反推。
+        """
         bot = _make_bot()
-        bot.exchange = _exchange([ccxt.BadRequest("-1022 Signature not valid")])
+        bot.exchange = _exchange([exc_factory()])
+        with pytest.raises(RuntimeError, match="查詢持倉模式失敗"):
+            bot._check_hedge_mode()
+        assert bot.exchange.fetch_position_mode.call_count == 3
+        assert _no_real_sleep == [1.0, 1.0]
+
+    @pytest.mark.parametrize("exc_factory", [
+        lambda: ccxt.BadRequest("-1022 Signature not valid"),
+        lambda: ccxt.AuthenticationError("-2015 Invalid API-key"),
+        lambda: ccxt.PermissionDenied("no futures permission"),
+        lambda: ccxt.OperationRejected("-4068 position side cannot be changed"),
+        lambda: ccxt.NotSupported("testnet disabled"),
+        lambda: RuntimeError("not a ccxt error at all"),
+    ], ids=["BadRequest", "AuthenticationError", "PermissionDenied",
+            "OperationRejected", "NotSupported", "plain-RuntimeError"])
+    def test_definitive_failures_are_not_retried(self, _no_real_sleep, exc_factory):
+        """「請求完成了，交易所說不行」重試三次結果必然相同 —— 只會多送兩次
+        注定失敗的簽名請求並讓啟動多卡 2 秒。這族必須第一次就 raise。"""
+        bot = _make_bot()
+        bot.exchange = _exchange([exc_factory()])
         with pytest.raises(RuntimeError, match="查詢持倉模式失敗"):
             bot._check_hedge_mode()
         assert bot.exchange.fetch_position_mode.call_count == 1
@@ -201,9 +304,9 @@ class TestCheckHedgeMode:
         bot.exchange.fapiPrivatePostPositionSideDual.assert_not_called()
 
 
-def _filled_event(position_side, side="BUY", realized_pnl="1.5"):
+def _filled_event(position_side, side="BUY", realized_pnl="1.5", symbol="XRPUSDC"):
     return {"o": {
-        "s": "XRPUSDC", "X": "FILLED", "S": side,
+        "s": symbol, "X": "FILLED", "S": side,
         "ps": position_side, "rp": realized_pnl,
         "p": "0.5", "q": "10",
     }}
@@ -212,16 +315,20 @@ def _filled_event(position_side, side="BUY", realized_pnl="1.5"):
 @pytest.fixture
 def order_bot():
     """掛單計數初值刻意設成非 0：若設 0，「沒重置」與「重置了」不可分辨
-    （lessons 通則 3.3：fixture 不得把待測維度壓成退化值）。"""
-    bot = _make_bot()
+    （lessons 通則 3.3：fixture 不得把待測維度壓成退化值）。
+
+    配兩個 symbol：節流以 symbol 為 key，單 symbol 的 fixture 測不出
+    「A 的告警把 B 壓住了」，也測不出訊息裡印的是哪個 symbol。"""
+    bot = _make_bot(extra_symbol=True)
     bot.adjust_grid = AsyncMock()
     bot.bandit_optimizer.record_trade = MagicMock()
-    st = bot.state.symbols[SYMBOL]
-    st.buy_long_orders = 3
-    st.sell_long_orders = 4
-    st.buy_short_orders = 5
-    st.sell_short_orders = 6
-    st.ws_seq = 7
+    for sym in (SYMBOL, SYMBOL2):
+        st = bot.state.symbols[sym]
+        st.buy_long_orders = 3
+        st.sell_long_orders = 4
+        st.buy_short_orders = 5
+        st.sell_short_orders = 6
+        st.ws_seq = 7
     return bot
 
 
@@ -347,6 +454,23 @@ class TestUnknownPositionSideLogThrottleWindow:
 
         hits = [r for r in caplog.records if "非 LONG/SHORT" in r.getMessage()]
         assert len(hits) == 2
+
+    @pytest.mark.asyncio
+    async def test_warning_stays_silent_up_to_the_window_edge(self, order_bot, caplog,
+                                                              fake_guard_clock):
+        """窗口的**下界**：距離上一則 3599 秒仍不得再印。
+
+        上面那條只證明「窗口過了會再 log」，把窗口從 3600 改成 1.0 秒它照樣綠
+        （外部 review 實測 mutation 存活）—— 節流等於沒有上限也測不出來。
+        期望值寫死秒數，不從常數換算。
+        """
+        with caplog.at_level("WARNING"):
+            await order_bot._handle_order_update(_filled_event("BOTH"))
+            fake_guard_clock(3599.0)
+            await order_bot._handle_order_update(_filled_event("BOTH"))
+
+        hits = [r for r in caplog.records if "非 LONG/SHORT" in r.getMessage()]
+        assert len(hits) == 1, "窗口未過就再印 ⇒ 節流窗口被縮短或失效"
 
 
 class TestStartupWiring:
