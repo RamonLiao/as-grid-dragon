@@ -797,8 +797,9 @@ class TestHedgeGuardWorstCaseDuration:
             f"守衛最壞耗時 {worst:.2f}s（分支「{worst_name}」）超過 45 秒上界；"
             f"各分支：{ {k: round(v, 2) for k, v in measured.items()} }")
         assert worst >= 36.0, (
-            "量到的最大值低於「6 顆請求各吃滿 2 × 3.0s」——最壞的那條路徑沒有被"
-            "真的跑到（分支表被刪成只剩短路徑？）")
+            "量到的最大值低於「6 顆請求各吃滿 2 × 3.0s」= 36s —— 要嘛最壞那條"
+            "路徑沒有被真的跑到（分支表被刪成只剩短路徑），要嘛 "
+            "HEDGE_MODE_FETCH_TIMEOUT_SEC 被調小了（那要先過下界測試那一關）")
         assert measured["初查全逾時"] < worst, (
             "「初查全逾時」不該是最大值：切換 + 複驗那一段更貴。上一版正是只量"
             "了這一條就把 20.0s 當成最壞值")

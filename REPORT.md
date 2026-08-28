@@ -173,3 +173,140 @@ Bot 已結束，交易未啟動
 ## 測試結果
 
 基線 948 passed / 2 skipped → **962 passed / 2 skipped**（+14，零退步）。
+
+---
+
+# 外部 review 修復（Ship with follow-ups → 全數處理）
+
+commit `5bb0900`（+ 本段的訊息微調）
+
+## I-1 我犯了自己批評上一版的毛病（必修，已修）
+
+上一版的 REPORT 宣稱守衛最壞耗時 **20.00s**。那是錯的：`test_all_requests_timing_out…`
+只量了「初查三顆全逾時就 raise」**一條分支**，而守衛還有「初查讀到明確 False →
+POST 切換 → 複驗迴圈再三顆 GET」那一整段沒被量到。**而漏掉的那條正是使用者
+最可能遇到的**（帳戶本來就是單向持倉）。
+
+換句話說：上一條 branch 死於「推導常數沒被接上實際程式碼」，我改成真跑量測是
+對的方向，但只跑一條路徑等於量了一個假的最大值 —— 同一個毛病換了個外衣。
+
+### 修法：對分支全集取 max
+
+`HEDGE_GUARD_PATHS` 列出六條分支，每條**各自**有一條參數化測試單獨量，另有一條
+測試對全集取 max 再比字面上界。實測（虛擬時鐘，T=3.0）：
+
+| 分支 | 耗時 |
+|---|---|
+| 初查逾時 2 次 → 單向 → 切換 POST 逾時 → 複驗全逾時 | **40.05s** ← 真正最壞 |
+| 單向 → 切換 → 複驗全逾時 | 21.50s |
+| 初查全逾時（上一版誤當成最大值） | 20.00s |
+| 單向 → 切換被 -4068 拒絕 → 複驗全 False | 4.55s |
+| 單向 → 切換 → 複驗通過 | 1.55s |
+| 初查即通過 | 0.05s |
+
+**max = 40.05s**，上界斷言 `<= 45.0`（字面值）。
+
+模型同時補上了 reviewer 沒點名但同源的一個漏洞：**切換 POST 走的是同一個
+exchange 實例、同一份 timeout，所以它也會逾時**。原本 POST 被寫死成 0.05s，
+等於把最壞路徑上的一顆請求當成免費的。加上之後最壞從 35.50s 變成 40.05s。
+
+### 「貼齊 TUI 20s 預算」這個框架已拿掉
+
+reviewer 是對的：TUI 的 20s 從 `thread.start()` 起算，前面還有 `_init_exchange`
+的 `load_markets` / `fetch_markets`，用的是交易所實例**原本**的逾時，不在
+`HEDGE_MODE_FETCH_TIMEOUT_SEC` 管轄範圍內 ⇒「守衛塞得進 20s」從來不是個成立的
+保證。所有引用 20.00s / 該框架的地方（常數註解、測試 docstring、上界的意義）
+全部改寫。
+
+**這不是要去改 `_init_exchange` 或加全域 timeout —— 禁令不變**，只是不再宣稱一個
+站不住的保證。45s 這個上界承諾的是另一件事：使用者按下啟動後，守衛最壞多久會
+給出一個明確結果（沒有 per-request timeout 時是 97.37s，兩分鐘級）。
+
+而守衛可以合法地跑超過 20s 這件事之所以不再是問題，正是本次根因修復本身：
+TUI 在 `min(thread 死亡時刻, 20s)` 定案，兩種結果都說實話。
+
+## I-2 下界守衛沒守到（已修）
+
+原本錨點是 2.0s，常數改成 2.5 時它不會紅（真正殺掉那個 mutation 的是
+`seen_timeouts == [3000]` 那條字面斷言）。錨點改成
+`SLOW_BUT_HEALTHY_RESPONSE_SEC = 2.8`。
+
+依據：這條線釘的是「`HEDGE_MODE_FETCH_TIMEOUT_SEC` 不得調到幣安 REST 的長尾
+延遲以下」，因為守衛自己判逾時的代價不只是「bot 沒跑」——`sync_service` 在
+raise 之後才啟動，既有持倉會同時失去追蹤止盈與網格管理。**2.8s 是推測值**
+（我沒有實測的延遲分布，測試 docstring 已標註）；它的角色是錨點而不是預測，
+日後若拿到實測 p99.9 應該用實測值取代。
+
+已驗證：常數改 2.5 時 `test_a_slow_but_answering_exchange_still_passes` **自己**
+紅（見下方 M12）。
+
+## Minor-2 / M11 mutation 存活（已修）
+
+fixture 的 `exchange.timeout` 初值原本就是 ccxt 預設的 `10000`，於是「還原成
+`prev_timeout`」與「還原成寫死的 `10000`」不可分辨 —— 正是本 repo lessons 通則
+3 第 4 條（測試值 == 欄位預設值 ⇒ 套套邏輯）。改成 `PREEXISTING_TIMEOUT_MS = 7777`，
+一個沒有任何一段程式碼可能猜到的值。M11 現在紅（`assert 10000 == 7777`）。
+
+## Minor-3 共享可變狀態的前提（已修）
+
+`exchange.timeout` 的安全性完全靠「所有同步 REST 都經 `RestGateway` 卸載到
+`max_workers=1` 的單一 worker thread」這個前提（同步 ccxt 實例不是 thread-safe）。
+原本註解火力全放在「不要改全域」，剛好漏掉這一面。
+
+- `_check_hedge_mode` 的註解點名這個依賴。
+- 新增 `test_guard_relies_on_the_rest_gateway_being_single_worker` 釘住
+  `max_workers == 1`。`max_workers` 改成 2 ⇒ 紅。
+
+## Minor-5 跨檔 import autouse fixture（已修）
+
+`from tests.test_hedge_mode_guard import _no_real_sleep` 會讓那個 **autouse**
+fixture 對整個 `test_tui_bot_lifecycle.py` 生效，使全檔跑在「全域 `time.sleep`
+被換掉」的狀態下 —— 本檔不需要，而且會讓未來任何真的需要 sleep 的測試靜默失真。
+已移除該 import（`measure_hedge_guard` 自己用 monkeypatch 接管守衛的 sleep，
+不依賴那個 fixture；`grid_engine.clock` 的全域狀態在守衛路徑上沒有被碰）。
+
+沒有新增 `conftest.py`：不需要 —— 需要的只是**不要**把 autouse 帶過來。
+
+## Minor-6 公式與數字對不起來（已修）
+
+`6T + 2×max(1.0, 1.5)` 代進去是 21 不是 20（那條錯公式正是 I-1 的來源之一）。
+「初查全逾時」那條的正確結構是 `3 × 2T + 2 × max(sleep 1.0, throttle 1.5)`，
+但 throttle 的等待與請求本身的 wall 也重疊 ⇒ 實際是 20.00s。REPORT 不再放
+簡化公式，改放**實測表格**：任何公式都可能再錯一次，量測不會。
+
+## Minor-1 文案在窄窗口說假話（已修）
+
+`bot` 可能已經把 `running` 設成 True、甚至已經掛了單，然後才崩潰結束 thread
+（輪詢在兩次取樣之間就會錯過那個 True）。那個窗口裡「交易未啟動」是假話，而且
+是最貴的一種 —— 使用者會以為交易所上乾乾淨淨。改成：
+
+```
+Bot 已結束（背景 thread 不在運行）
+常見成因：帳戶持倉模式（雙向持倉）確立失敗，或網路/限流/API 權限 ——
+確切原因看日誌與 Telegram 的「初始化失敗」通知
+若它曾短暫啟動過，交易所上可能已經有掛單/持倉，請一併確認
+```
+
+## Backlog（記錄，本次不修）
+
+- **Minor-4：`_trading_active` 的競態零覆蓋。** TUI 測試把 `run_bot_thread`
+  整個換掉（改用虛擬時鐘的 `ScheduledThread`），所以「bot thread 的 finally 把
+  `_trading_active` 設 False」與主執行緒的讀取之間的競態沒有被覆蓋。要真的覆蓋
+  得動測試架構（真 thread + 真時間 ⇒ 慢且不決定性，或引入可注入的排程器），
+  成本高於價值。取捨記在這裡，不是遺漏。
+- `SLOW_BUT_HEALTHY_RESPONSE_SEC = 2.8` 是推測值，等實測延遲分布出來要複核。
+
+## 本輪 Mutation（5/5 紅，皆為斷言紅、無 hang）
+
+| # | Mutation | 紅在哪 |
+|---|---|---|
+| M11 | `finally` 還原成寫死 `10000` | `test_timeout_is_restored_on_the_raise_path` / `…after_success`：`assert 10000 == 7777` |
+| M12 | `HEDGE_MODE_FETCH_TIMEOUT_SEC` 3.0→2.5 | **`test_a_slow_but_answering_exchange_still_passes`（下界測試自己紅）**，另加字面斷言與最壞耗時測試 |
+| M13 | 3.0→5.0 | `test_the_worst_branch…`：`64.05s（分支「初查逾時2次→單向→切換逾時→複驗全逾時」）` 超過 45s，訊息附全六條分支的數字；參數化測試也各自紅 |
+| M14 | 分支表刪掉最壞那條路徑的量測 | `test_the_worst_branch…`：`assert 21.5 >= 36.0` |
+| M15 | `RestGateway` `max_workers` 1→2 | `test_guard_relies_on_the_rest_gateway_being_single_worker` |
+| M5 重跑 | 拿掉 per-request timeout 的套用（fixture 原值改 7777 之後） | 最壞 `97.37s > 45.0`，四條分支測試同時紅 |
+
+## 測試結果
+
+962 passed / 2 skipped → **969 passed / 2 skipped**（+7，零退步）。
