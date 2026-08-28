@@ -70,12 +70,41 @@ STALE_QUOTE_LOG_SECONDS = 3600.0  # 價格過期 log 節流間隔（秒），不
 #   3. `-1003 RateLimitExceeded` 留在重試白名單的划算性（**不會紅**）——
 #      見 `_is_retryable_fetch_error`。目前「重試限流錯誤」可接受，是因為代價
 #      有界：唯讀 GET、最多 3 次。次數變大就是在對交易所加壓，那個取捨要重估。
-#   4. 啟動路徑的最壞延遲（**不會紅**）：初查 (n-1) 次 sleep + 複驗 (n-1) 次
-#      sleep，n=3 時約 4s，加上 ccxt 自身的逾時後最壞約 32s —— 已經超過
-#      as_terminal_max.py 那個 100 × 0.1s 的 TUI 等待預算，再調大會更常走進
-#      「啟動逾時」分支。
+#   4. 啟動路徑的最壞延遲（**現在會紅**）：初查 (n-1) 次 sleep + 複驗 (n-1) 次
+#      sleep，加上每顆請求的最壞 wall（見 HEDGE_MODE_FETCH_TIMEOUT_SEC）。
+#      test_hedge_mode_guard.py 的最壞耗時測試會真的跑一次並量它，調大即紅。
 HEDGE_MODE_VERIFY_ATTEMPTS = 3
 HEDGE_MODE_VERIFY_DELAY_SEC = 1.0
+# 守衛期間的 per-request timeout（秒）。**只在 _check_hedge_mode 內套用**，
+# 用完 finally 還原 —— 絕對不要拿去改 _init_exchange 的 exchange_config 或任何
+# 全域設定：實盤下單/撤單/查倉共用同一個 exchange 實例，全域縮短逾時會把「單
+# 已送達但回應逾時」變成常態，等於製造重複掛單。
+#
+# 為什麼是 5.0（單顆請求的最壞 wall ≈ 2T，因為 requests 的 timeout 是 connect
+# 與 read 各一份）：
+#
+#   下界（真正的約束）——必須留在幣安 REST 的長尾延遲之上，否則健康帳戶會被
+#     自己的守衛擋在門外，而拒絕啟動的代價不只是「bot 沒跑」：sync_service 在
+#     這個 raise 之後才啟動，既有真實持倉會同時失去追蹤止盈與網格管理。
+#     兩個離線可得的生態系錨點都指向「別壓太小」：ccxt binance 的 timeout 預設
+#     10000ms，options['recvWindow'] 預設也是 10000ms —— recvWindow 是幣安
+#     伺服器端對簽名請求的過期窗口，等於幣安自己認為「端到端晚到 5~10 秒仍屬
+#     正常」。測試釘的錨點是「2.8 秒才回的正常回應仍須通過」，5.0 對它有約 79%
+#     餘裕；先前的 3.0 只有 7%。
+#
+#   上界——只是「別讓使用者無限等」，不是安全性約束。成本完全不對稱：太大只是
+#     多等（落在 TUI「仍在初始化、參照已保留」那條安全分支，金錢損失 0），
+#     太小則是拒絕啟動加上上面那筆真實代價。
+#
+# 這個常數曾經是 3.0，唯一理由是「塞進 TUI 那 100 × 0.1s 的等待預算」。那個
+# 理由**站不住也已經被撤銷**：該預算從 thread.start() 起算，前面還有
+# _init_exchange 的 load_markets / fetch_markets（用的是交易所實例原本的逾時，
+# 不在本常數管轄範圍內）。TUI 那邊靠的是偵測 thread 已死，不是靠守衛跑得夠快。
+#
+# 守衛的最壞耗時不寫在這裡：任何寫死的數字都會腐化，而且它取決於路徑組合。
+# test_hedge_mode_guard.py 的分支表把每條路徑實跑一次並對全集取 max，調大這個
+# 常數、調大重試次數或調大重試間隔都會頂破那條測試的字面上界。
+HEDGE_MODE_FETCH_TIMEOUT_SEC = 5.0
 UNKNOWN_PS_LOG_SECONDS = 3600.0  # 非 LONG/SHORT 的 positionSide 事件 log 節流
 EXCHANGE_ERR_CLIP_CHARS = 200    # 例外原文塞進錯誤訊息前的長度上限
 
@@ -332,6 +361,30 @@ class MaxGridBot:
         if sym_config is None:
             return  # 沒有啟用中的 symbol ⇒ 不會下單 ⇒ 這個前提無關緊要
 
+        # 這裡改的是**共用可變狀態**：同一個 exchange 實例，實盤的下單/撤單/查倉
+        # 都用它。之所以安全，靠的是一個必須寫下來的前提——所有同步 REST 都經
+        # RestGateway 卸載到 `max_workers=1` 的單一 worker thread（同步 ccxt
+        # 實例本來就不是 thread-safe），所以守衛執行期間不可能有另一個真實請求
+        # 正在飛。max_workers 一旦 > 1，這段就變成會腰斬別人逾時的競態。
+        # 那個前提由 test_hedge_mode_guard.py 的 RestGateway 單 worker 測試釘住。
+        prev_timeout = self.exchange.timeout
+        self.exchange.timeout = int(HEDGE_MODE_FETCH_TIMEOUT_SEC * 1000)  # ccxt 用毫秒
+        try:
+            self._resolve_hedge_mode(sym_config)
+        finally:
+            # 還原是硬性的，且只能靠 finally：這個較短的逾時只該罩住守衛期間。
+            # create_order / cancel_order / fetch_positions / fetch_balance 共用
+            # 同一個 exchange 實例，逾時被縮短會把「單其實已送達交易所、只是回應
+            # 逾時」變成常態 —— 那條路徑接的是下單失敗計數與斷路器，事後重掛
+            # 等於重複掛單。守衛 raise 的路徑同樣要還原，所以不能寫在 return 前。
+            self.exchange.timeout = prev_timeout
+
+    def _resolve_hedge_mode(self, sym_config: SymbolConfig):
+        """`_check_hedge_mode` 的本體：查 → 必要時切換 → 複驗，確立不了就 raise。
+
+        拆成獨立方法只是為了讓上一層的 per-request timeout 能用 try/finally
+        完整罩住（含所有 raise 路徑）；行為與拆分前逐字相同。
+        """
         hedged, err = None, None
         for attempt in range(HEDGE_MODE_VERIFY_ATTEMPTS):
             if attempt:

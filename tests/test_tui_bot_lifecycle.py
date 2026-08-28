@@ -503,3 +503,200 @@ class TestOtherScreensSeeOrphan:
         menu.config.symbols = {"BNB/USDC:USDC": types.SimpleNamespace(enabled=True)}
         menu.toggle_symbol()
         assert not any("需要重啟交易才能生效" in line for line in printed)
+
+
+# ---------------------------------------------------------------------------
+# 「thread 已死就別再等」的量測式契約
+# ---------------------------------------------------------------------------
+
+import types  # noqa: E402
+
+# 只 import 純 helper，**不 import 對面的 autouse fixture**：`_no_real_sleep`
+# 一旦被帶進本模組的命名空間就會對整個檔案生效，讓每條測試都跑在「全域
+# time.sleep 被換掉」的狀態下 —— 本檔不需要那個，而且它會讓未來任何真的需要
+# sleep 的測試靜默失真。measure_hedge_guard 自己會用 monkeypatch 接管守衛的
+# sleep，不依賴那個 fixture。
+from tests.test_hedge_mode_guard import (  # noqa: E402
+    TUI_START_BUDGET_SEC, HEDGE_GUARD_PATHS, VirtualClock, measure_hedge_guard,
+)
+
+# 用整句、不用「Bot 已結束」這種放寬過的前綴：前綴匹配等於允許後半句被改成
+# 任何東西（包含被改回「交易未啟動」那句假話）。
+FAILED_MARK = "Bot 已結束（背景 thread 不在運行）"
+STILL_INIT_MARK = "Bot 仍在初始化中"
+STARTED_MARK = "交易已在背景啟動"
+# 這條分支獨有的字面值：thread 已死不代表交易所上乾淨。
+OPEN_ORDERS_WARNING = "交易所上可能已經有掛單/持倉"
+
+
+class ScheduledState:
+    """`running` 在虛擬時間 `running_at` 之後才變 True（None = 永遠不會）。"""
+
+    def __init__(self, clock, running_at):
+        self._clock = clock
+        self._running_at = running_at
+
+    @property
+    def running(self):
+        return self._running_at is not None and self._clock.t >= self._running_at
+
+
+class ScheduledBot:
+    def __init__(self, clock, running_at):
+        self.state = ScheduledState(clock, running_at)
+
+    async def stop(self):
+        pass
+
+
+class ScheduledThread:
+    """在虛擬時間 `dies_at` 之後 `is_alive()` 變 False（None = 一直活著）。
+
+    刻意不開真的 thread：整條時間軸由 TUI 自己的 `time.sleep` 推進，
+    所以測試是決定性的，且 mutation 的結果一定是「量到錯的數字」而不是 hang
+    ——`for _ in range(100)` 的上界與被測條件無關，迴圈一定會結束。
+    """
+
+    def __init__(self, clock, dies_at):
+        self._clock = clock
+        self._dies_at = dies_at
+
+    def start(self):
+        pass
+
+    def is_alive(self):
+        return self._dies_at is None or self._clock.t < self._dies_at
+
+    def join(self, timeout=None):
+        pass
+
+
+def _run_start_trading(monkeypatch, clock, running_at=None, dies_at=None):
+    """實際跑 `start_trading`，回 `(定案時的虛擬秒數, 印出來的全部文字)`。"""
+    printed = []
+    bot_box = {}
+
+    def fake_bot_factory(config):
+        bot_box["bot"] = ScheduledBot(clock, running_at)
+        return bot_box["bot"]
+
+    def fake_thread(target=None, daemon=None):
+        return ScheduledThread(clock, dies_at)
+
+    monkeypatch.setattr(tm, "MaxGridBot", fake_bot_factory)
+    monkeypatch.setattr(tm.threading, "Thread", fake_thread)
+    monkeypatch.setattr(tm.time, "sleep", clock.sleep)
+    monkeypatch.setattr(tm.console, "print",
+                        lambda *a, **k: printed.append(str(a[0]) if a else ""))
+
+    sym = types.SimpleNamespace(enabled=True)
+    menu = make_menu()
+    menu.config = types.SimpleNamespace(api_key="k",
+                                        symbols={"BNB/USDC:USDC": sym})
+    menu.start_trading()
+    return clock.t, "\n".join(printed), menu
+
+
+class TestStartTradingDetectsDeadThread:
+    """TUI 的等待必須在 thread 死掉的那一刻停，而不是空轉滿預算。
+
+    `bot.run()` 的初始化段是硬失敗設計：任一步 raise ⇒ notify_crash +
+    gateway.shutdown() + return ⇒ thread 乾淨結束、`state.running` 永遠是
+    False。只看 `running` 的舊碼會在原地等滿 20 秒才印「初始化較慢」。
+    """
+
+    def test_fast_death_is_reported_at_the_moment_it_dies(self, monkeypatch):
+        """紅在：第一段迴圈沒有 is_alive() 偵測 ⇒ 量到的是 20.0 不是 2.0。"""
+        elapsed, out, menu = _run_start_trading(
+            monkeypatch, VirtualClock(), dies_at=2.0)
+
+        assert elapsed == pytest.approx(2.0, abs=0.15), \
+            f"thread 2 秒就死了，TUI 卻等了 {elapsed:.1f}s"
+        assert FAILED_MARK in out
+        assert STILL_INIT_MARK not in out, "thread 已死時不得說它還在初始化"
+        assert menu.bot is None and menu._trading_active is False
+
+    def test_the_failure_message_never_claims_the_exchange_is_clean(self, monkeypatch):
+        """thread 已死 ≠ 交易所上沒東西。
+
+        有一個窄窗口：bot 已經把 running 設成 True、甚至已經掛了單，然後才崩潰
+        結束 thread —— 0.1s 取樣的輪詢在兩次取樣之間就會錯過那個 True，於是走進
+        這條「已結束」分支。此時說「交易未啟動」是最貴的一種假話：使用者會以為
+        交易所上乾乾淨淨而不去查。
+
+        紅在：刪掉那行提醒、或把文案改回宣稱「交易未啟動」。
+        """
+        _, out, _ = _run_start_trading(monkeypatch, VirtualClock(), dies_at=2.0)
+
+        assert OPEN_ORDERS_WARNING in out, \
+            "失敗文案必須提醒去確認交易所上的掛單/持倉"
+        assert "交易未啟動" not in out, \
+            "TUI 拿不到 bot 是否掛過單，不得斷言「交易未啟動」"
+
+    def test_death_inside_the_second_loop_is_reported_at_that_moment(self, monkeypatch):
+        """紅在：只在第一段迴圈加偵測、第二段沒加 ⇒ 量到 20.0 不是 14.0。"""
+        elapsed, out, menu = _run_start_trading(
+            monkeypatch, VirtualClock(), dies_at=14.0)
+
+        assert elapsed == pytest.approx(14.0, abs=0.15), \
+            f"thread 在第 14 秒死掉，TUI 卻等到 {elapsed:.1f}s"
+        assert FAILED_MARK in out
+        assert menu.bot is None
+
+    def test_a_thread_still_alive_at_the_budget_keeps_the_honest_message(self, monkeypatch):
+        """還活著就是還活著：等滿預算後說「仍在初始化」是實話，參照要留著。
+
+        紅在：預算被改大（量到 25.0）、兩段迴圈被刪（量到 0.0）。
+        """
+        elapsed, out, menu = _run_start_trading(
+            monkeypatch, VirtualClock(), dies_at=25.0)
+
+        assert elapsed == pytest.approx(TUI_START_BUDGET_SEC, abs=0.15), \
+            f"TUI 的等待預算是 20 秒，實際等了 {elapsed:.1f}s"
+        assert STILL_INIT_MARK in out
+        assert FAILED_MARK not in out, "thread 還活著時不得宣告失敗"
+        assert OPEN_ORDERS_WARNING not in out, \
+            "還活著時不該叫人去查掛單——那是「已結束」分支專屬的提醒"
+        assert menu.bot is not None, "還活著的 bot 不得被放手（會變成停不掉的孤兒）"
+
+    def test_success_inside_the_first_loop(self, monkeypatch):
+        elapsed, out, menu = _run_start_trading(
+            monkeypatch, VirtualClock(), running_at=5.0)
+
+        assert elapsed == pytest.approx(5.0, abs=0.15)
+        assert STARTED_MARK in out
+        assert menu._trading_active is True
+
+    def test_success_inside_the_second_loop(self, monkeypatch):
+        """紅在：第二段輪詢迴圈被整段刪掉 ⇒ 12 秒才就緒的 bot 會被當成沒啟動。"""
+        elapsed, out, menu = _run_start_trading(
+            monkeypatch, VirtualClock(), running_at=12.0)
+
+        assert elapsed == pytest.approx(12.0, abs=0.15), \
+            f"bot 在第 12 秒就緒，TUI 卻在 {elapsed:.1f}s 才定案"
+        assert STARTED_MARK in out
+        assert menu._trading_active is True
+
+
+class TestStartupFailureIsVisibleQuickly:
+    """端到端（量測 → 量測）：守衛硬失敗的實際耗時，餵給 TUI 的實際等待。
+
+    兩段都是真的跑出來的：前半跑 `MaxGridBot._check_hedge_mode`（真實守衛 +
+    虛擬時鐘的 fake exchange），量到它 raise 的時間；後半把那個時間當成 bot
+    thread 的死亡時刻，跑真實的 `start_trading`，量使用者看到定案訊息的時間。
+    """
+
+    def test_common_hard_failure_surfaces_at_the_guard_failure_time(self, monkeypatch):
+        guard_sec, raised = measure_hedge_guard(
+            monkeypatch, **HEDGE_GUARD_PATHS["單向→切換被拒→複驗全False"])
+        assert isinstance(raised, RuntimeError), "這條路徑必須是硬失敗"
+
+        elapsed, out, menu = _run_start_trading(
+            monkeypatch, VirtualClock(), dies_at=guard_sec)
+
+        assert elapsed == pytest.approx(guard_sec, abs=0.15), (
+            f"守衛在 {guard_sec:.2f}s 就 raise，使用者卻等到 {elapsed:.1f}s")
+        assert elapsed < TUI_START_BUDGET_SEC / 2, \
+            "最常見的硬失敗必須遠早於 20 秒預算就顯示"
+        assert FAILED_MARK in out
+        assert menu.bot is None
